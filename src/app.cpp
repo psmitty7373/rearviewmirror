@@ -167,8 +167,9 @@ void App::ShowTrayMenu() {
                 return;
             }
             if (!SetMirrorEnabled(*m, !m->Enabled())) {
-                ShowBalloon(L"Could not switch that mirror back on: its source "
-                            L"window is not open.");
+                ShowBalloon(m->IsDesktop()
+                    ? L"Could not switch that mirror back on: the desktop could not be captured."
+                    : L"Could not switch that mirror back on: its source window is not open.");
             }
         }
         return;
@@ -203,7 +204,12 @@ void App::NewMirror() {
     selecting_ = true;
     struct Reset { bool& flag; ~Reset() { flag = false; } } reset{ selecting_ };
 
-    HWND target = PickWindow();
+    const PickResult pick = PickSource();
+    if (pick.desktop) {
+        NewDesktopMirror();
+        return;
+    }
+    HWND target = pick.window;
     if (!target) return;
 
     const SIZE captureSize = CaptureItemSize(target);
@@ -231,6 +237,37 @@ void App::NewMirror() {
     mirrors_.push_back(std::move(mirror));
     MarkDirty();
     manager_.Refresh();
+}
+
+// The whole desktop, or a region of it. Made without a window on screen: it
+// is almost always there to be streamed, and a full-screen always-on-top copy
+// of the screen would be in the way. The manager can show it.
+void App::NewDesktopMirror() {
+    const RECT bounds = DesktopCapture::Bounds();
+    const SIZE size{ RectW(bounds), RectH(bounds) };
+    RECT crop{};
+    if (!SelectScreenRegion(bounds, size, RECT{}, crop)) return;
+
+    MirrorState state;
+    state.source   = SourceKind::Desktop;
+    state.crop     = crop;
+    state.baseSize = size;
+    state.hidden   = true;
+    state.group    = NewGroup();
+
+    auto mirror = std::make_unique<Mirror>(nextId_++);
+    if (!mirror->Create(state, nullptr, hwnd_)) {
+        MessageBoxW(nullptr, L"Could not start capturing the desktop.", kAppName,
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    AttachStream(*mirror);
+    mirrors_.push_back(std::move(mirror));
+    MarkDirty();
+    manager_.Refresh();
+    ShowBalloon(server_.Running()
+        ? L"The desktop is ready to stream. It has no window here; the manager can show one."
+        : L"Desktop mirror added, without a window here. Turn on Streaming to share it.");
 }
 
 // The streaming tee. The sink outlives every mirror: server_ is destroyed with
@@ -443,8 +480,12 @@ HWND App::TargetOfGroup(uint32_t group, const Mirror* except) const {
 // otherwise a fresh, unused group number.
 uint32_t App::GroupForWindow(HWND target) const {
     for (const auto& m : mirrors_) {
-        if (m->Target() == target && m->Group() != 0) return m->Group();
+        if (target && m->Target() == target && m->Group() != 0) return m->Group();
     }
+    return NewGroup();
+}
+
+uint32_t App::NewGroup() const {
     std::random_device random;
     for (;;) {
         const uint32_t g = random();
@@ -505,7 +546,7 @@ int App::TryRestorePending() {
     int restored = 0;
     for (auto it = pending_.begin(); it != pending_.end();) {
         HWND target = nullptr;
-        if (it->enabled) {
+        if (it->enabled && it->source == SourceKind::Window) {
             // A group member already showing the window takes it straight
             // away; otherwise search, never among other groups' windows.
             target = TargetOfGroup(it->group, nullptr);
@@ -558,6 +599,23 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RVM_NEW_MIRROR:
         NewMirror();
         return 0;
+
+    case WM_DISPLAYCHANGE: {
+        // Monitors came, went or changed resolution: desktop mirrors start
+        // over on the new layout.
+        bool any = false;
+        for (auto& m : mirrors_) {
+            if (m->IsDesktop()) {
+                m->RestartDesktop();
+                any = true;
+            }
+        }
+        if (any) {
+            PushMirrorList();
+            manager_.Refresh();
+        }
+        break;
+    }
 
     case WM_RVM_MIRROR_CLOSED:
         CloseMirror(static_cast<uint32_t>(wp));

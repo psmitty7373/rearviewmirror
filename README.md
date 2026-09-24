@@ -13,6 +13,18 @@ mirrors live to other PCs. Windows 10 (1903) or newer.
 The mirror appears top-right. The app lives in the notification area and
 restores your mirrors on the next launch.
 
+## Desktop
+
+To mirror the whole desktop, point at the wallpaper or the taskbar while
+picking, so every screen lights up, and click. Pressing `D` while picking does
+the same. Then **click** for every monitor, or **drag** a rectangle for one
+monitor or part of the screen.
+
+A desktop mirror streams all of it, pointer included, but has no window of its
+own. To see one here, turn off *Hide* on its manager card. After you add,
+remove or resize a monitor, it picks up the new layout by itself. Over several
+monitors, the stream is scaled to at most 4096 pixels wide.
+
 ## Mirror window
 
 | Action | Result |

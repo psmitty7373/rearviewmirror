@@ -5,7 +5,8 @@
 
 namespace rvm {
 
-// One floating always-on-top view of a rectangular slice of another window.
+// One floating always-on-top view of a rectangular slice of another window,
+// or of the whole desktop.
 class Mirror : public WindowHost {
 public:
     explicit Mirror(uint32_t id) : id_(id) {}
@@ -56,7 +57,14 @@ public:
     void ReselectRegion();
 
     float Opacity() const { return state_.opacity; }
-    const std::wstring& SourceName() const { return state_.exeName; }
+    // The application a window mirror watches, or "Desktop".
+    std::wstring SourceName() const { return IsDesktop() ? L"Desktop" : state_.exeName; }
+    bool IsDesktop() const { return state_.source == SourceKind::Desktop; }
+
+    // Monitors were added, removed or changed resolution: a desktop mirror
+    // starts over on the new layout. False if that failed; it then waits and
+    // retries like an orphan.
+    bool RestartDesktop();
     SIZE NativeSize() const;
     float CurrentScale() const;
 
@@ -67,6 +75,8 @@ public:
 
 private:
     bool StartCapture();
+    void StopCapture();
+    SIZE ContentSize() const;
     void ShowContextMenu(POINT screenPt);
     void ApplyClickThroughStyle();
     void UpdateVisibility();   // Shown only when on, bound and not hidden.
@@ -76,6 +86,7 @@ private:
     void ConstrainSizing(WPARAM edge, RECT* rect);
 
     WindowCapture  capture_;
+    DesktopCapture desktop_;   // Used instead of capture_ for a desktop mirror.
     MirrorRenderer renderer_;
     MirrorState    state_;
 

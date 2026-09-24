@@ -1,6 +1,7 @@
 // Headless checks for the streaming stack: encryption, replay protection,
 // packetisation with loss and recovery, and a full GPU encode -> decode round
 // trip through Media Foundation.
+#include "capture.h"
 #include "net/channel.h"
 #include "net/codec.h"
 #include "net/converter.h"
@@ -338,6 +339,9 @@ static void TestEncoderSizes() {
     const UINT sizes[][2] = {
         { 640, 360 }, { 1198, 712 }, { 1200, 720 }, { 1196, 712 }, { 1194, 712 },
         { 1000, 700 }, { 998, 600 }, { 336, 848 }, { 302, 848 }, { 256, 256 }, { 258, 300 },
+        // Whole desktops: one 1080p or 4K screen, and wide multi-monitor layouts
+        // as EncodeSize brings them within the 4096 ceiling.
+        { 1920, 1080 }, { 3840, 2160 }, { 4096, 1152 }, { 4096, 768 },
     };
     bool allInit = true;
     for (const auto& sz : sizes) {
@@ -361,6 +365,46 @@ static void TestEncoderSizes() {
         if (!init || !encoded) allInit = false;
     }
     Check(allInit, "every size at or above the 256 px floor can be encoded");
+}
+
+// The whole desktop as one texture the size of the virtual screen. Capture
+// sends every monitor's current picture as soon as it starts, so frames come
+// without anything on screen changing. Only frames are counted; no pixel is
+// ever read back.
+template <class Pred>
+static bool WaitFor(Pred pred, int timeoutMs);
+
+static void TestDesktopCapture() {
+    printf("desktop capture\n");
+    if (!CaptureSupported()) {
+        printf("  SKIP  screen capture not supported here\n");
+        return;
+    }
+    const RECT bounds = DesktopCapture::Bounds();
+    std::atomic<int> frames{ 0 };
+    std::atomic<bool> sizeOk{ true };
+    DesktopCapture capture;
+    const bool started = capture.Start([&](ID3D11Texture2D* texture, UINT w, UINT h) {
+        D3D11_TEXTURE2D_DESC d{};
+        texture->GetDesc(&d);
+        if (w != static_cast<UINT>(RectW(bounds)) || h != static_cast<UINT>(RectH(bounds)) ||
+            d.Width != w || d.Height != h) {
+            sizeOk = false;
+        }
+        ++frames;
+    });
+    Check(started, "desktop capture starts");
+    if (!started) return;
+    Check(WaitFor([&] { return frames.load() >= 1; }, 3000), "a desktop frame arrives");
+    Check(sizeOk.load(), "desktop frames span the whole virtual screen");
+    const SIZE content = capture.ContentSize();
+    Check(content.cx == RectW(bounds) && content.cy == RectH(bounds), "content size is the virtual screen");
+    printf("  %ldx%ld virtual screen, %d frame(s) so far\n", RectW(bounds), RectH(bounds),
+           frames.load());
+    capture.Stop();
+    const int stopped = frames.load();
+    Sleep(250);
+    Check(frames.load() == stopped, "no frames after Stop");
 }
 
 // The mirror renderer hands the server its cache texture, which is bound as a
@@ -1199,6 +1243,7 @@ int main(int argc, char** argv) {
         TestCodec();
         TestEncoderSizes();
         TestConverterSources();
+        TestDesktopCapture();
         TestLoopback();
         TestWelcomeBinding();
         TestHostileClients();

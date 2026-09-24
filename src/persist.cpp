@@ -302,6 +302,8 @@ std::vector<MirrorState> LoadMirrorStates() {
         const std::wstring section = L"Mirror" + std::to_wstring(i);
 
         MirrorState s;
+        s.source = _wcsicmp(ReadStr(section, L"Source", path).c_str(), L"desktop") == 0
+                       ? SourceKind::Desktop : SourceKind::Window;
         s.exeName   = ReadStr(section, L"Exe", path);
         s.className = ReadStr(section, L"Class", path);
         s.title     = ReadStr(section, L"Title", path);
@@ -344,6 +346,7 @@ bool SaveMirrorStates(const std::vector<MirrorState>& states) {
     for (int i = 0; i < count; ++i) {
         const MirrorState& s = states[static_cast<size_t>(i)];
         text += L"[Mirror" + std::to_wstring(i) + L"]\r\n";
+        if (s.source == SourceKind::Desktop) Line(text, L"Source", std::wstring(L"desktop"));
         Line(text, L"Exe", s.exeName);
         Line(text, L"Class", s.className);
         Line(text, L"Title", s.title);

@@ -137,6 +137,10 @@ void Mirror::PlaceInitially() {
 }
 
 bool Mirror::StartCapture() {
+    if (IsDesktop()) {
+        return desktop_.Start(
+            [this](ID3D11Texture2D* tex, UINT w, UINT h) { renderer_.SubmitFrame(tex, w, h); });
+    }
     HWND self = hwnd_;
     return capture_.Start(
         target_,
@@ -144,16 +148,32 @@ bool Mirror::StartCapture() {
         [self] { PostMessageW(self, WM_RVM_TARGET_LOST, 0, 0); });
 }
 
+void Mirror::StopCapture() {
+    capture_.Stop();
+    desktop_.Stop();
+}
+
+SIZE Mirror::ContentSize() const {
+    return IsDesktop() ? desktop_.ContentSize() : capture_.ContentSize();
+}
+
 bool Mirror::Create(const MirrorState& state, HWND target, HWND notify) {
     RegisterMirrorClass();
 
     state_  = state;
-    target_ = target;
+    target_ = IsDesktop() ? nullptr : target;
     notify_ = notify;
 
-    if (!target && state_.enabled) return false;   // Only a disabled mirror may start unbound.
-    if (target && (state_.baseSize.cx <= 0 || state_.baseSize.cy <= 0)) {
-        state_.baseSize = CaptureItemSize(target);
+    if (IsDesktop()) {
+        if (state_.baseSize.cx <= 0 || state_.baseSize.cy <= 0) {
+            const RECT desk = DesktopCapture::Bounds();
+            state_.baseSize = SIZE{ RectW(desk), RectH(desk) };
+        }
+    } else {
+        if (!target && state_.enabled) return false;   // Only a disabled mirror may start unbound.
+        if (target && (state_.baseSize.cx <= 0 || state_.baseSize.cy <= 0)) {
+            state_.baseSize = CaptureItemSize(target);
+        }
     }
 
     const DWORD ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP |
@@ -163,6 +183,12 @@ bool Mirror::Create(const MirrorState& state, HWND target, HWND notify) {
                             ClampExtent(RectH(state_.crop), kMinHeight),
                             nullptr, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return false;
+
+    // A desktop mirror on screen would otherwise capture itself, and itself
+    // inside that, down a hall of mirrors.
+    if (IsDesktop() && !SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE)) {
+        Log(L"mirror: could not exclude the desktop mirror from capture (%lu)", GetLastError());
+    }
 
     if (RectW(state_.placement) >= kMinWidth && RectH(state_.placement) >= kMinHeight) {
         const RECT p = ClampToVisibleMonitor(state_.placement);
@@ -210,7 +236,7 @@ bool Mirror::SetEnabled(bool enabled, const std::vector<HWND>& exclude, HWND pre
     if (state_.enabled == enabled) return true;
 
     if (!enabled) {
-        capture_.Stop();
+        StopCapture();
         state_.enabled = false;
         orphaned_ = false;   // Off is a deliberate state; nothing to wait for.
         UpdateVisibility();
@@ -220,7 +246,7 @@ bool Mirror::SetEnabled(bool enabled, const std::vector<HWND>& exclude, HWND pre
 
     // The source may have closed or restarted while we were off. Another
     // mirror of the same window already knows where it is now.
-    if (!IsWindow(target_)) {
+    if (!IsDesktop() && !IsWindow(target_)) {
         HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude);
         if (!found) return false;
         target_ = found;
@@ -245,14 +271,37 @@ void Mirror::SetHidden(bool hidden) {
 }
 
 void Mirror::Orphan() {
-    capture_.Stop();
+    StopCapture();
     target_ = nullptr;
     orphaned_ = true;
     UpdateVisibility();
 }
 
+bool Mirror::RestartDesktop() {
+    if (!hwnd_ || !IsDesktop() || !state_.enabled) return true;
+    StopCapture();
+    if (StartCapture()) {
+        orphaned_ = false;
+        UpdateVisibility();
+        return true;
+    }
+    // Mid-reconfiguration the monitors can refuse for a moment: wait and
+    // retry on the same timer as a mirror whose window has gone.
+    orphaned_ = true;
+    UpdateVisibility();
+    if (notify_) PostMessageW(notify_, WM_RVM_MIRROR_ORPHANED, id_, 0);
+    return false;
+}
+
 bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred) {
     if (!hwnd_ || !orphaned_) return false;
+
+    if (IsDesktop()) {
+        if (!StartCapture()) return false;
+        orphaned_ = false;
+        UpdateVisibility();
+        return true;
+    }
 
     HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude);
     if (!found) return false;
@@ -272,6 +321,12 @@ bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred) {
 }
 
 std::wstring Mirror::DisplayName() const {
+    if (IsDesktop()) {
+        const bool whole = state_.crop.left <= 0 && state_.crop.top <= 0 &&
+                           state_.crop.right >= state_.baseSize.cx &&
+                           state_.crop.bottom >= state_.baseSize.cy;
+        return whole ? L"Entire desktop" : L"Desktop region";
+    }
     std::wstring name = IsWindow(target_) ? WindowTitle(target_) : state_.title;
     if (name.empty()) name = state_.exeName;
     if (name.empty()) name = L"Untitled window";
@@ -279,7 +334,7 @@ std::wstring Mirror::DisplayName() const {
 }
 
 void Mirror::Destroy() {
-    capture_.Stop();
+    StopCapture();
     renderer_.Shutdown();
     if (hwnd_) {
         HWND h = hwnd_;
@@ -370,14 +425,16 @@ void Mirror::SetZoom(float factor, bool persist) {
 }
 
 void Mirror::ReselectRegion() {
-    if (!IsWindow(target_)) return;
-    const SIZE content = capture_.ContentSize();
+    if (!IsDesktop() && !IsWindow(target_)) return;
+    const SIZE content = ContentSize();
     if (content.cx <= 0 || content.cy <= 0) return;
 
     // Get out of the way so the source is fully visible.
     ShowWindow(hwnd_, SW_HIDE);
     RECT picked{};
-    const bool ok = SelectRegion(target_, content, renderer_.EffectiveCrop(), picked);
+    const bool ok = IsDesktop()
+        ? SelectScreenRegion(DesktopCapture::Bounds(), content, renderer_.EffectiveCrop(), picked)
+        : SelectRegion(target_, content, renderer_.EffectiveCrop(), picked);
     if (!hwnd_) return;   // Retired while the selector was up.
     UpdateVisibility();
     if (!ok) return;

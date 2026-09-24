@@ -8,7 +8,7 @@ How Rear View Mirror works inside, and why. For using and building it, see
 | File | Role |
 | --- | --- |
 | `src/gfx.*` | Shared D3D11/D2D/DWrite device, composition surface, logging |
-| `src/capture.*` | Windows Graphics Capture session, frames as GPU textures |
+| `src/capture.*` | Windows Graphics Capture of a window, or of every monitor as one desktop |
 | `src/renderer.*` | Crop, mip, shade and present a mirror; the streaming tee |
 | `src/mirror.*` | The floating always-on-top window and its menu |
 | `src/manager.*` | The manager window: cards, sliders, switches, buttons |
@@ -47,11 +47,28 @@ There is no render loop. Capture delivers a frame only when the source changes,
 so a static mirror costs nothing. The process is per-monitor-DPI-aware v2, so
 capture textures, window rects and overlays all use physical pixels.
 
+**Desktop mirrors** use the same pipeline with a different source.
+`DesktopCapture` captures every monitor separately, pointer included. Each
+monitor's frame is copied into one texture the size of the virtual screen, at
+that monitor's place in it, and the whole texture is passed on. Monitors take
+turns under one lock, so each picture passed on includes every copy before it.
+Gaps between monitors of different sizes stay black. WGC can't follow a change
+of monitors, so `WM_DISPLAYCHANGE` restarts desktop capture. If a restart fails
+mid-change, the mirror waits and retries like a mirror whose window has gone.
+The mirror's own window is excluded from capture with
+`WDA_EXCLUDEFROMCAPTURE`, or showing it would capture itself over and over.
+The source kind is saved as `Source=desktop`. A desktop mirror needs no window
+matching, so it restores at once.
+
 The picker and region selector are Direct2D windows on the same device. The
 picker uses low-level mouse and keyboard hooks so the choosing click never
 reaches the target application. The hooks only record what happened and wake
 the picker's loop; finding the window under the cursor happens there, because
 a low-level hook stalls every mouse event on the desktop until it returns.
+Pointing at the wallpaper (`Progman`, `WorkerW`) or a taskbar
+(`Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) highlights the whole virtual
+screen instead and picks the desktop, with the labels kept on the monitor
+under the pointer so they never straddle two screens.
 
 ## Threading
 
@@ -218,6 +235,11 @@ user is told to enter it again. Key fields are masked, with a *Show* box.
   alone still lets hit-testing land on the window. Layering a
   `WS_EX_NOREDIRECTIONBITMAP` window doesn't blank its composition content, but
   `SetLayeredWindowAttributes` must still be called or it can appear empty.
+- `WindowFromPoint` asks windows on the calling thread with `WM_NCHITTEST`
+  instead of going by `WS_EX_TRANSPARENT`. The picker's click-through
+  highlight answers `HTTRANSPARENT`, or the lookup finds the highlight itself
+  rather than what is under it. Over the desktop, that made it hide and
+  reappear on every mouse move, and the taskbar re-laid itself out each time.
 - The video processor can't read a texture bound only as a shader resource, so
   the renderer's cache is also bound as a render target (and the converter
   copies through a scratch texture otherwise).
@@ -243,8 +265,9 @@ with a warning. Nothing is stored in the repository.
 ## Tests
 
 `build\rvmnet_test.exe` runs headlessly: crypto, replay protection,
-packetisation with loss, GPU encode/decode round trips, encoder size limits, a
-full server-to-client loopback, reconnects, hostile-client limits, the
+packetisation with loss, GPU encode/decode round trips, encoder size limits
+(including whole-desktop sizes), desktop capture (frames counted, never read
+back), a full server-to-client loopback, reconnects, hostile-client limits, the
 frame-rate cap and a 120 fps end-to-end stream. It logs to `test.log` beside the
 app's logs. Timing checks leave room for a busy machine; servers bind port 0
 so a running copy of the app doesn't get in the way.

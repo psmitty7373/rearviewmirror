@@ -4,7 +4,15 @@
 namespace rvm {
 
 // Everything needed to bring a mirror back after a restart.
+// What a mirror shows.
+enum class SourceKind {
+    Window,    // One application window, found again by its identity.
+    Desktop,   // Every monitor, as one picture; always available.
+};
+
 struct MirrorState {
+    SourceKind source = SourceKind::Window;
+
     // Window handles are not stable across runs, so a mirror is re-bound by
     // matching this identity against the live windows at startup.
     std::wstring exeName;

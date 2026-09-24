@@ -41,6 +41,7 @@ private:
     void ShowBalloon(const std::wstring& text);
 
     void NewMirror();
+    void NewDesktopMirror();
     void ConfirmCloseMirror(uint32_t id);
     void CloseAll();
     void ConfirmCloseAll();
@@ -62,6 +63,7 @@ private:
     std::vector<HWND> TargetsOfOtherGroups(uint32_t group) const;
     HWND TargetOfGroup(uint32_t group, const Mirror* except) const;
     uint32_t GroupForWindow(HWND target) const;
+    uint32_t NewGroup() const;
 
     bool ApplyStreamSettings();
     void PushMirrorList();

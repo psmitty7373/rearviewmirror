@@ -157,7 +157,8 @@ void ManagerWindow::PrepareDraw() {
             card.subtitle += std::to_wstring(native.cx) + L" × " + std::to_wstring(native.cy);
         }
         if (!card.enabled)        card.subtitle += L"  ·  off";
-        else if (m->Orphaned())   card.subtitle += L"  ·  waiting for its window";
+        else if (m->Orphaned())   card.subtitle += m->IsDesktop() ? L"  ·  waiting for the monitors"
+                                                          : L"  ·  waiting for its window";
         else if (card.hidden)     card.subtitle += L"  ·  hidden, still capturing";
         cards_.push_back(std::move(card));
     }
@@ -437,8 +438,11 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
                 if (Mirror* m = app_->FindMirror(hit.id)) {
                     if (!app_->SetMirrorEnabled(*m, !m->Enabled())) {
                         MessageBoxW(Hwnd(),
-                                    L"That mirror's source window is not open, so it "
-                                    L"cannot be switched on yet.",
+                                    m->IsDesktop()
+                                        ? L"The desktop could not be captured, so that mirror "
+                                          L"cannot be switched on."
+                                        : L"That mirror's source window is not open, so it "
+                                          L"cannot be switched on yet.",
                                     kAppName, MB_OK | MB_ICONINFORMATION);
                     }
                 }

@@ -17,6 +17,8 @@ public:
     bool  done = false;
     bool  cancelled = false;
     float scaleX = 1.0f, scaleY = 1.0f;   // Overlay pixels -> capture pixels.
+    std::wstring hint;                    // Instructions, top centre of `hintAt`.
+    RECT hintAt{};                        // Overlay pixels; empty means all of it.
     ULONGLONG shownAt = 0;
 
     RECT WholeWindow() const {
@@ -136,11 +138,17 @@ protected:
         }
 
         if (!dragging) {
-            DrawChip(dc, L"Click for the whole window   ·   Drag to choose a region   ·   Esc to cancel",
-                     w * 0.5f, 20.0f, 1, 0);
+            const bool whole = RectW(hintAt) <= 0 || RectH(hintAt) <= 0;
+            const float x = whole ? w * 0.5f : (hintAt.left + hintAt.right) * 0.5f;
+            const float y = (whole ? 0.0f : static_cast<float>(hintAt.top)) + 20.0f;
+            DrawChip(dc, hint, x, y, 1, 0);
         }
     }
 };
+
+// Shows the overlay over `bounds` and runs it; `out` in capture pixels.
+bool RunSelection(RECT bounds, SIZE captureSize, RECT initial, const wchar_t* hint, RECT hintAt,
+                  RECT& out);
 
 // A minimised window reports the off-screen -32000 rect, which would put the
 // overlay somewhere the user can never see. Restore it and wait for DWM.
@@ -167,7 +175,35 @@ bool SelectRegion(HWND target, SIZE captureSize, RECT initial, RECT& out) {
     const RECT bounds = ExtendedFrameBounds(target);
     if (RectW(bounds) <= 0 || RectH(bounds) <= 0 || bounds.left <= -30000) return false;
 
+    return RunSelection(bounds, captureSize, initial,
+                        L"Click for the whole window   ·   Drag to choose a region   ·   Esc to cancel",
+                        RECT{}, out);
+}
+
+bool SelectScreenRegion(RECT bounds, SIZE captureSize, RECT initial, RECT& out) {
+    if (RectW(bounds) <= 0 || RectH(bounds) <= 0 || captureSize.cx <= 0 || captureSize.cy <= 0) {
+        return false;
+    }
+    // Spanning several monitors, the instructions go where the eye is: the
+    // top of the primary monitor, not the middle of the combined width.
+    MONITORINFO mi{ sizeof(mi) };
+    RECT hintAt{};
+    if (GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+        hintAt = mi.rcMonitor;
+        OffsetRect(&hintAt, -bounds.left, -bounds.top);
+    }
+    return RunSelection(bounds, captureSize, initial,
+                        L"Click for the whole desktop   ·   Drag to choose a region   ·   Esc to cancel",
+                        hintAt, out);
+}
+
+namespace {
+
+bool RunSelection(RECT bounds, SIZE captureSize, RECT initial, const wchar_t* hint, RECT hintAt,
+                  RECT& out) {
     RegionOverlay overlay;
+    overlay.hint = hint;
+    overlay.hintAt = hintAt;
     if (!overlay.Create(L"RvmRegionOverlay", bounds, /*clickThrough=*/false)) return false;
 
     overlay.scaleX = static_cast<float>(captureSize.cx) / static_cast<float>(RectW(bounds));
@@ -217,5 +253,7 @@ bool SelectRegion(HWND target, SIZE captureSize, RECT initial, RECT& out) {
     out = mapped;
     return true;
 }
+
+}  // namespace
 
 }  // namespace rvm

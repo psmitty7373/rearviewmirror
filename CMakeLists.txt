@@ -102,5 +102,5 @@ set_target_properties(rvmclient PROPERTIES OUTPUT_NAME "RearViewMirrorClient")
 rvm_sign(rvmclient)
 
 # Headless tests for the parts that can be exercised without a screen.
-add_executable(rvmnet_test tests/net_test.cpp)
+add_executable(rvmnet_test tests/net_test.cpp src/capture.cpp)
 target_link_libraries(rvmnet_test PRIVATE rvmnet)
