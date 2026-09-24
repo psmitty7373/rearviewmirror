@@ -113,6 +113,20 @@ HICON LoadAppIcon(int size) {
                                          size, size, LR_DEFAULTCOLOR));
 }
 
+void ApplyTitleBarTheme(HWND hwnd) {
+    if (!hwnd) return;
+    // Windows' "app mode" setting: 0 is dark. Missing means light.
+    DWORD light = 1, size = sizeof(light);
+    RegGetValueW(HKEY_CURRENT_USER,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+    const BOOL dark = light == 0 ? TRUE : FALSE;
+    // DWMWA_USE_IMMERSIVE_DARK_MODE; Windows 10 builds before 20H1 used 19.
+    if (FAILED(DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark)))) {
+        DwmSetWindowAttribute(hwnd, 19, &dark, sizeof(dark));
+    }
+}
+
 bool PumpNestedMessage() {
     MSG msg;
     const BOOL got = GetMessageW(&msg, nullptr, 0, 0);

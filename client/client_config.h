@@ -36,6 +36,11 @@ struct ClientConfig {
     std::vector<ConnectSettings> servers;
     std::vector<TileLayout>      tiles;
     bool sidebarHidden = false;
+
+    // The client window's restored rect (as GetWindowPlacement reports it)
+    // and whether it was maximized. Empty means "centre it".
+    RECT window{};
+    bool windowMaximized = false;
 };
 
 ClientConfig LoadClientConfig();

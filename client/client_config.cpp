@@ -83,6 +83,16 @@ ClientConfig LoadClientConfig() {
     ClientConfig config;
     config.sidebarHidden = ReadInt(L"Client", L"SidebarHidden", 0, path) != 0;
 
+    const int ww = ClampI(ReadInt(L"Client", L"WindowW", 0, path), 0, kMaxExtent);
+    const int wh = ClampI(ReadInt(L"Client", L"WindowH", 0, path), 0, kMaxExtent);
+    if (ww >= 320 && wh >= 240) {
+        config.window.left   = ClampI(ReadInt(L"Client", L"WindowX", 0, path), -kMaxExtent, kMaxExtent);
+        config.window.top    = ClampI(ReadInt(L"Client", L"WindowY", 0, path), -kMaxExtent, kMaxExtent);
+        config.window.right  = config.window.left + ww;
+        config.window.bottom = config.window.top + wh;
+        config.windowMaximized = ReadInt(L"Client", L"WindowMax", 0, path) != 0;
+    }
+
     const int servers = ClampI(ReadInt(L"Client", L"Servers", -1, path), -1,
                                static_cast<int>(kMaxSavedServers));
     if (servers < 0) {
@@ -112,6 +122,13 @@ bool SaveClientConfig(const ClientConfig& config) {
 
     std::wstring text = L"[Client]\r\n";
     Line(text, L"SidebarHidden", config.sidebarHidden ? 1 : 0);
+    if (RectW(config.window) > 0 && RectH(config.window) > 0) {
+        Line(text, L"WindowX", config.window.left);
+        Line(text, L"WindowY", config.window.top);
+        Line(text, L"WindowW", RectW(config.window));
+        Line(text, L"WindowH", RectH(config.window));
+        Line(text, L"WindowMax", config.windowMaximized ? 1 : 0);
+    }
     Line(text, L"Servers", static_cast<int>(servers));
     Line(text, L"Tiles", static_cast<int>(tiles));
     Line(text, L"TileUnits", std::wstring(L"dip"));

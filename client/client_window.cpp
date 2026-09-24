@@ -74,6 +74,7 @@ bool ClientWindow::Create() {
     }
 
     dpiScale_ = static_cast<float>(GetDpiForWindow(Hwnd())) / 96.0f;
+    ApplyTitleBarTheme(Hwnd());
     EnsureFonts();
 
     ClientConfig config = LoadClientConfig();
@@ -81,7 +82,16 @@ bool ClientWindow::Create() {
     pendingTiles_ = std::move(config.tiles);   // Adopted as each server's list arrives.
     for (const auto& s : config.servers) AddServer(s);
 
-    ShowWindow(Hwnd(), SW_SHOW);
+    if (RectW(config.window) > 0 && RectH(config.window) > 0) {
+        // Where it was last time. SetWindowPlacement moves a rect that is no
+        // longer on any monitor back onto one.
+        WINDOWPLACEMENT wp{ sizeof(wp) };
+        wp.rcNormalPosition = config.window;
+        wp.showCmd = config.windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        SetWindowPlacement(Hwnd(), &wp);
+    } else {
+        ShowWindow(Hwnd(), SW_SHOW);
+    }
     Render();
 
     // Nothing remembered: straight into adding the first server.
@@ -184,6 +194,15 @@ void ClientWindow::SaveConfig() const {
     config.sidebarHidden = sidebarHidden_;
     for (const auto& t : tiles_) config.tiles.push_back(ToLayout(t));
     for (const auto& p : pendingTiles_) config.tiles.push_back(p);
+
+    // The restored rect, even while maximized or minimized, in the same
+    // coordinates SetWindowPlacement takes back at the next launch.
+    WINDOWPLACEMENT wp{ sizeof(wp) };
+    if (Hwnd() && GetWindowPlacement(Hwnd(), &wp)) {
+        config.window = wp.rcNormalPosition;
+        config.windowMaximized = wp.showCmd == SW_SHOWMAXIMIZED ||
+                                 (wp.showCmd == SW_SHOWMINIMIZED && (wp.flags & WPF_RESTORETOMAXIMIZED));
+    }
     SaveClientConfig(config);
 }
 
@@ -222,8 +241,9 @@ void ClientWindow::PlaceTile(Tile& tile) {
     for (float y = 0; y + tile.h <= ch; y += step) {
         for (float x = 0; x + tile.w <= cw; x += step) {
             const bool free = std::none_of(tiles_.begin(), tiles_.end(), [&](const Tile& o) {
-                return o.key != tile.key &&
-                       Overlaps(x, y, tile.w + gap, tile.h + gap, o.x, o.y, o.w + gap, o.h + gap);
+                if (o.key == tile.key) return false;
+                const Box b = Shown(o);
+                return Overlaps(x, y, tile.w + gap, tile.h + gap, b.x, b.y, b.w + gap, b.h + gap);
             });
             if (free) {
                 tile.x = x;
@@ -388,6 +408,9 @@ void ClientWindow::FitToStream(Tile& tile) {
     // One stream pixel per screen pixel, scaled down evenly if the canvas is
     // smaller than that.
     const float cw = CanvasW(), ch = CanvasH();
+    const Box seen = Shown(tile);
+    tile.x = seen.x;   // Grow from where the box is seen, not a place off-canvas.
+    tile.y = seen.y;
     float bw = w / dpiScale_, bh = h / dpiScale_;
     const float fit = (std::min)(1.0f, (std::min)(cw / bw, ch / bh));
     bw *= fit;
@@ -492,23 +515,21 @@ float ClientWindow::CanvasH() const {
     return (std::max)(c.bottom - c.top, 1.0f) / dpiScale_;
 }
 
-// When the window shrinks, boxes are pulled in, and shrunk only if they no
-// longer fit at all, so none is stranded off the canvas.
-void ClientWindow::KeepTilesOnCanvas() {
+ClientWindow::Box ClientWindow::Shown(const Tile& tile) const {
     const float cw = CanvasW(), ch = CanvasH();
-    for (auto& t : tiles_) {
-        t.w = Clampf(t.w, (std::min)(static_cast<float>(kMinBoxW), cw), cw);
-        t.h = Clampf(t.h, (std::min)(static_cast<float>(kMinBoxH), ch), ch);
-        t.x = Clampf(t.x, 0.0f, cw - t.w);
-        t.y = Clampf(t.y, 0.0f, ch - t.h);
-    }
+    Box b;
+    b.w = Clampf(tile.w, (std::min)(static_cast<float>(kMinBoxW), cw), cw);
+    b.h = Clampf(tile.h, (std::min)(static_cast<float>(kMinBoxH), ch), ch);
+    b.x = Clampf(tile.x, 0.0f, cw - b.w);
+    b.y = Clampf(tile.y, 0.0f, ch - b.h);
+    return b;
 }
 
 D2D1_RECT_F ClientWindow::TileRect(const Tile& tile) const {
     const D2D1_RECT_F c = CanvasRect();
     if (focused_ == tile.key) return c;
-    return D2D1::RectF(c.left + S(tile.x), c.top + S(tile.y), c.left + S(tile.x + tile.w),
-                       c.top + S(tile.y + tile.h));
+    const Box b = Shown(tile);
+    return D2D1::RectF(c.left + S(b.x), c.top + S(b.y), c.left + S(b.x + b.w), c.top + S(b.y + b.h));
 }
 
 // Candidates are the canvas edges and every other box's edges, plus those
@@ -531,8 +552,9 @@ float ClientWindow::Snap(float edge, bool vertical, const TileKey& self,
     consider(vertical ? CanvasW() : CanvasH(), vertical ? CanvasW() : CanvasH());
     for (const auto& o : tiles_) {
         if (o.key == self || o.popout) continue;
-        const float lo = vertical ? o.x : o.y;
-        const float hi = lo + (vertical ? o.w : o.h);
+        const Box b = Shown(o);   // Line up with where boxes are seen.
+        const float lo = vertical ? b.x : b.y;
+        const float hi = lo + (vertical ? b.w : b.h);
         consider(lo, lo);
         consider(hi, hi);
         consider(lo - kTileGap, lo);
@@ -632,6 +654,9 @@ void ClientWindow::UpdateDrag(POINT pt) {
         EndDrag(false);
         return;
     }
+    // Windows sends a move right after a press even when nothing moved; that
+    // must not turn a pulled-in box's drawn place into its saved one.
+    if (!drag_.moved && pt.x == drag_.start.x && pt.y == drag_.start.y) return;
     const float cw = CanvasW(), ch = CanvasH();
     const float dx = (pt.x - drag_.start.x) / dpiScale_;
     const float dy = (pt.y - drag_.start.y) / dpiScale_;
@@ -760,14 +785,13 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const UINT w = LOWORD(lp), h = HIWORD(lp);
         if (w > 0 && h > 0) {
             ResizeSurface(w, h);
-            KeepTilesOnCanvas();
             Render();
         }
         return 0;
     }
 
     case WM_EXITSIZEMOVE:
-        SaveConfig();   // Boxes may have been pulled in by a smaller canvas.
+        SaveConfig();   // The window's own place and size.
         return 0;
 
     case WM_GETMINMAXINFO: {
@@ -776,6 +800,13 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = static_cast<LONG>(S(400.0f));
         return 0;
     }
+
+    case WM_SETTINGCHANGE:
+        // Sent with "ImmersiveColorSet" when the Windows theme changes.
+        if (lp && lstrcmpiW(reinterpret_cast<LPCWSTR>(lp), L"ImmersiveColorSet") == 0) {
+            ApplyTitleBarTheme(Hwnd());
+        }
+        break;
 
     case WM_DPICHANGED: {
         dpiScale_ = static_cast<float>(HIWORD(wp)) / 96.0f;
@@ -875,7 +906,10 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             drag_.key = pressed_.Key();
             drag_.edges = pressed_.edges;
             drag_.start = pt;
-            drag_.x0 = t->x; drag_.y0 = t->y; drag_.w0 = t->w; drag_.h0 = t->h;
+            // Start from where the box is seen: a box pulled in by a small
+            // window moves from there, and only then takes that place.
+            const Box seen = Shown(*t);
+            drag_.x0 = seen.x; drag_.y0 = seen.y; drag_.w0 = seen.w; drag_.h0 = seen.h;
             SetCapture(Hwnd());
             Render();
         }

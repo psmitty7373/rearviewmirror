@@ -97,6 +97,7 @@ void ManagerWindow::Open(App* app) {
     }
 
     dpiScale_ = static_cast<float>(GetDpiForWindow(Hwnd())) / 96.0f;
+    ApplyTitleBarTheme(Hwnd());
     EnsureFonts();
 
     ShowWindow(Hwnd(), SW_SHOW);
@@ -326,6 +327,13 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         mmi->ptMinTrackSize.y = static_cast<LONG>(S(260.0f));
         return 0;
     }
+
+    case WM_SETTINGCHANGE:
+        // Sent with "ImmersiveColorSet" when the Windows theme changes.
+        if (lp && lstrcmpiW(reinterpret_cast<LPCWSTR>(lp), L"ImmersiveColorSet") == 0) {
+            ApplyTitleBarTheme(Hwnd());
+        }
+        break;
 
     case WM_DPICHANGED: {
         dpiScale_ = static_cast<float>(HIWORD(wp)) / 96.0f;

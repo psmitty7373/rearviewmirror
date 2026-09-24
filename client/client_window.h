@@ -129,7 +129,11 @@ private:
     // The canvas's size in device-independent pixels.
     float CanvasW() const;
     float CanvasH() const;
-    void  KeepTilesOnCanvas();
+    // Where a box is drawn: its saved place, pulled in (and shrunk only if it
+    // must) when the canvas is too small for it. The saved place itself is
+    // never changed by a window resize, so growing the window puts it back.
+    struct Box { float x, y, w, h; };
+    Box Shown(const Tile& tile) const;
     // The nearest canvas or box edge within snapping range of `edge`, or
     // `edge` itself. `vertical` edges are x positions.
     float Snap(float edge, bool vertical, const TileKey& self, std::vector<float>& guides) const;

@@ -96,6 +96,10 @@ RECT WorkAreaFor(HWND hwnd);
 
 HICON LoadAppIcon(int size);
 
+// Gives a framed window a dark or light title bar to match the Windows app
+// theme. Call after creation and again on WM_SETTINGCHANGE.
+void ApplyTitleBarTheme(HWND hwnd);
+
 // Diagnostic log at %APPDATA%\RearViewMirror\<name>.log, truncated on open.
 // Lines carry a millisecond tick and thread id. No-op until LogOpen is called.
 void LogOpen(const wchar_t* name);
