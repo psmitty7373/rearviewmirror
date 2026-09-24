@@ -1,0 +1,47 @@
+#include <windows.h>
+#include "resource.h"
+
+IDI_APPICON ICON "../src/icon.ico"
+
+IDD_CONNECT DIALOGEX 0, 0, 260, 118
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Connect"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "Host or address:", -1, 12, 14, 70, 10
+    EDITTEXT        IDC_CONNECT_HOST, 86, 11, 162, 14, ES_AUTOHSCROLL
+    LTEXT           "UDP port:", -1, 12, 34, 70, 10
+    EDITTEXT        IDC_CONNECT_PORT, 86, 31, 60, 14, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Shared key:", -1, 12, 54, 70, 10
+    EDITTEXT        IDC_CONNECT_KEY, 86, 51, 162, 14, ES_AUTOHSCROLL
+    LTEXT           "The key must match the one set under Streaming on the other machine.", -1, 12, 74, 236, 18
+    DEFPUSHBUTTON   "Connect", IDOK, 146, 96, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 200, 96, 48, 14
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,2,0,0
+PRODUCTVERSION  1,2,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Rear View Mirror Client"
+            VALUE "FileVersion",     "1.2.0.0"
+            VALUE "InternalName",    "RearViewMirrorClient"
+            VALUE "OriginalFilename","RearViewMirrorClient.exe"
+            VALUE "ProductName",     "Rear View Mirror"
+            VALUE "ProductVersion",  "1.2.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

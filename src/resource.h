@@ -1,0 +1,19 @@
+#pragma once
+
+#define IDI_APPICON 101
+
+#define IDD_STREAM          200
+#define IDC_STREAM_PORT     202
+#define IDC_STREAM_KEY      203
+#define IDC_STREAM_BITRATE  204
+#define IDC_STREAM_ENCODER  205
+#define IDC_STREAM_STATUS   206
+#define IDC_STREAM_GENERATE 207
+#define IDC_STREAM_FPS      208
+#define IDC_STREAM_TOGGLE   209
+#define IDC_STREAM_HELP     210
+
+#define IDD_CONNECT         300
+#define IDC_CONNECT_HOST    301
+#define IDC_CONNECT_PORT    302
+#define IDC_CONNECT_KEY     303

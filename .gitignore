@@ -1,0 +1,41 @@
+# Build output
+build/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.ninja
+.ninja_*
+*.exe
+*.dll
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.res
+*.idb
+*.ipch
+
+# Editors
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Signing certificates and keys: the code-signing certificate lives in the
+# Windows certificate store and must never be exported into the repository.
+*.pfx
+*.p12
+*.cer
+*.crt
+*.pvk
+*.spc
+*.key
+*.pem
+
+# Runtime settings, stream keys and logs live in %APPDATA%\RearViewMirror;
+# copies of them never belong here.
+*.ini
+*.log
