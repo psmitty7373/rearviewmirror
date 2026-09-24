@@ -72,7 +72,7 @@ bool ReadFields(HWND dlg, const StreamSettings& base, bool needKey, StreamSettin
     out.port = static_cast<uint16_t>(port);
     out.bitrateKbps = mbps * 1000;
     out.fps = fps;
-    out.key = GetText(dlg, IDC_STREAM_KEY);
+    out.key = GetSecretText(dlg, IDC_STREAM_KEY);
     if (needKey && out.key.size() < 8) {
         MessageBoxW(dlg, L"The shared key needs at least 8 characters. Generate one, or type your own.",
                     kAppName, MB_OK | MB_ICONWARNING);
@@ -109,8 +109,11 @@ INT_PTR CALLBACK StreamDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
                         encoder.empty() ? L"No hardware H.264 encoder found: streaming is unavailable."
                                         : (L"Encoder: " + encoder).c_str());
         SetDlgItemTextW(dlg, IDC_STREAM_HELP,
-                        L"Forward the UDP port on your router to this PC and enter the same key in "
-                        L"the client. Allow the app through Windows Firewall when asked.");
+                        s.key.empty() && !s.lockedKey.empty()
+                            ? L"The saved key could not be decrypted by this Windows account. "
+                              L"Enter it again, or generate a new one."
+                            : L"Forward the UDP port on your router to this PC and enter the same key "
+                              L"in the client. Allow the app through Windows Firewall when asked.");
         RefreshStatus(dlg, *state);
         SetTimer(dlg, kStatusTimer, 1000, nullptr);   // Client count, live.
         return TRUE;
@@ -122,8 +125,17 @@ INT_PTR CALLBACK StreamDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDC_STREAM_GENERATE:
+        case IDC_STREAM_GENERATE: {
             SetDlgItemTextW(dlg, IDC_STREAM_KEY, RandomKey().c_str());
+            // A new key has to be read to be typed on the other machine.
+            CheckDlgButton(dlg, IDC_STREAM_SHOWKEY, BST_CHECKED);
+            RevealEditText(GetDlgItem(dlg, IDC_STREAM_KEY), true);
+            return TRUE;
+        }
+
+        case IDC_STREAM_SHOWKEY:
+            RevealEditText(GetDlgItem(dlg, IDC_STREAM_KEY),
+                           IsDlgButtonChecked(dlg, IDC_STREAM_SHOWKEY) == BST_CHECKED);
             return TRUE;
 
         case IDC_STREAM_TOGGLE:
@@ -187,13 +199,19 @@ StreamSettings LoadStreamSettings() {
     s.fps         = static_cast<UINT>(ClampI(ReadInt(L"Fps", 60, path), static_cast<int>(kMinStreamFps),
                                                    static_cast<int>(kMaxStreamFps)));
 
+    const std::vector<uint8_t> blob = net::FromHex(ReadStr(L"KeyBlob", path));
     std::wstring secret;
-    if (net::UnprotectSecret(net::FromHex(ReadStr(L"KeyBlob", path)), secret)) s.key = secret;
+    if (net::UnprotectSecret(blob, secret)) {
+        s.key = std::move(secret);
+    } else if (!blob.empty()) {
+        s.lockedKey = blob;
+        Log(L"stream: the saved key could not be decrypted by this Windows account");
+    }
     return s;
 }
 
 bool SaveStreamSettings(const StreamSettings& s) {
-    std::vector<uint8_t> blob;
+    std::vector<uint8_t> blob = s.lockedKey;
     if (!s.key.empty() && !net::ProtectSecret(s.key, blob)) return false;
 
     std::wstring text = L"[Stream]\r\n";

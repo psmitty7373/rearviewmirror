@@ -23,6 +23,19 @@ struct Gfx {
     // atomic: a mirror frame landing inside a D2D BeginDraw/EndDraw pair still
     // clobbers its state. Hold this across a whole draw, but never across Present.
     std::mutex deviceMutex;
+
+    // A GPU reset, driver update or GPU switch removes the device, and every
+    // texture, swapchain, capture pool and codec made on it with it. Nothing
+    // is rebuilt piecemeal: pass any failing GPU result here, and on the first
+    // sign of removal the handler (set by the app) runs once, from whatever
+    // thread saw it. The apps save and relaunch themselves.
+    void CheckDevice(HRESULT hr);
+    void SetDeviceLostHandler(std::function<void()> handler);
+
+private:
+    std::mutex lostMutex_;
+    std::function<void()> onLost_;
+    std::atomic<bool> lost_{ false };
 };
 
 // A DirectComposition-backed presentation surface for a borderless window with

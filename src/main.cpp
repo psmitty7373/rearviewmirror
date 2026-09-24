@@ -6,6 +6,9 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
 
     winrt::init_apartment(winrt::apartment_type::single_threaded);
 
+    // A relaunch after a lost graphics device waits for the old process to go.
+    const bool relaunched = rvm::WaitForPreviousInstance();
+
     // Only one instance: a second launch just asks the first for a new mirror.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\RearViewMirror.Instance");
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -19,7 +22,7 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     int result = 1;
     try {
         rvm::App app;
-        result = app.Run();
+        result = app.Run(relaunched);
     } catch (const winrt::hresult_error& e) {
         MessageBoxW(nullptr, e.message().c_str(), rvm::kAppName, MB_OK | MB_ICONERROR);
     } catch (...) {

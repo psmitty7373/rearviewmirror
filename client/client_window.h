@@ -9,14 +9,21 @@
 
 namespace rvm {
 
+constexpr wchar_t kClientClass[] = L"RvmClientWindow";
+
 // The client's one window: a sidebar listing each connected server and its
-// mirrors, and a canvas where the chosen mirrors sit as boxes on a cell grid,
+// mirrors, and a canvas where the chosen mirrors sit as free-form boxes,
 // each one movable and resizable, or popped out into its own window. The
 // sidebar collapses to a thin handle. Custom-drawn in Direct2D.
 class ClientWindow : public D2DOverlay {
 public:
-    bool Create();
+    // relaunched: this process replaced one whose graphics device was lost.
+    bool Create(bool relaunched = false);
     LRESULT OnMessage(UINT msg, WPARAM wp, LPARAM lp) override;
+
+    // Frees pop-outs retired during the last message. Call from the outermost
+    // message loop only, never from inside a nested one.
+    void FreeRetired();
 
 protected:
     void PrepareDraw() override;
@@ -107,11 +114,18 @@ private:
     TileLayout ToLayout(const Tile& tile) const;
     void  PopOut(Tile& tile);
     void  Dock(Tile& tile);
+    void  Retire(std::unique_ptr<PopoutWindow> popout);
     void  FeedPopouts(uint32_t serverTag);
     void  FitToStream(Tile& tile);
+    // The size to present a stream at: the decoded picture, reshaped to the
+    // mirror's true proportions where the encoder had to pad or squeeze it.
+    // Falls back to the listed crop before the first frame. False if neither.
+    bool  ShownSize(TileKey key, UINT& w, UINT& h) const;
     void  ShowTileMenu(TileKey key, POINT screenPt);
     const StreamView*   ViewFor(TileKey key) const;
     const RemoteMirror* MirrorFor(TileKey key) const;
+    // A box's key travels in an LPARAM: both halves need a 64-bit build.
+    static_assert(sizeof(LPARAM) == 8, "TokenOf packs two 32-bit ids into an LPARAM");
     static LPARAM TokenOf(TileKey key) {
         return static_cast<LPARAM>((static_cast<uint64_t>(key.server) << 32) | key.id);
     }
@@ -167,6 +181,7 @@ private:
     float    scroll_ = 0.0f;   // Sidebar scroll offset in pixels.
 
     std::vector<Tile>       tiles_;
+    std::vector<std::unique_ptr<PopoutWindow>> retiredPopouts_;   // See Retire().
     std::vector<TileLayout> pendingTiles_;   // Saved boxes whose mirror is not listed yet.
     TileKey focused_{};                      // Double-clicked box shown alone, or server 0.
     Drag    drag_;
@@ -181,6 +196,11 @@ private:
     winrt::com_ptr<IDWriteTextFormat> bodyFont_;
     winrt::com_ptr<IDWriteTextFormat> smallFont_;
 
+    bool restoringPlacement_ = false;
+    bool relaunched_ = false;
+    bool deviceLostHandled_ = false;
+    uint64_t startedMs_ = 0;
+    void OnDeviceLost();
     float dpiScale_ = 1.0f;
     Hit hot_{};
     Hit pressed_{};

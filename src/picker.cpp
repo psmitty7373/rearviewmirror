@@ -72,7 +72,8 @@ protected:
 struct PickSession {
     Highlight highlight;
     HWND  hovered = nullptr;
-    HWND  result  = nullptr;
+    POINT clickPoint{};
+    bool  clicked = false;   // Else cancelled.
     bool  done    = false;
     bool  pressed = false;
     bool  hoverQueued = false;
@@ -122,9 +123,12 @@ void QueueHover() {
     PostMessageW(g_session->highlight.Hwnd(), WM_RVM_HOVER, 0, 0);
 }
 
-void Finish(HWND result) {
+// Only records the outcome: the window under a click is looked up once the
+// loop wakes, outside the hook.
+void Finish(bool clicked, POINT pt = {}) {
     if (!g_session) return;
-    g_session->result = result;
+    g_session->clicked = clicked;
+    g_session->clickPoint = pt;
     g_session->done = true;
     PostMessageW(g_session->highlight.Hwnd(), WM_NULL, 0, 0);   // Wake the loop.
 }
@@ -142,14 +146,14 @@ LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONUP:
             if (g_session->pressed) {
                 g_session->pressed = false;
-                Finish(WindowAtPoint(info->pt));
+                Finish(true, info->pt);
                 return 1;
             }
             break;
         case WM_RBUTTONDOWN:
             return 1;
         case WM_RBUTTONUP:
-            Finish(nullptr);
+            Finish(false);
             return 1;
         default:
             break;
@@ -162,7 +166,7 @@ LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && g_session && !g_session->done &&
         (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
         if (reinterpret_cast<KBDLLHOOKSTRUCT*>(lp)->vkCode == VK_ESCAPE) {
-            Finish(nullptr);
+            Finish(false);
             return 1;
         }
     }
@@ -190,7 +194,7 @@ HWND PickWindow() {
     session.keyHook   = SetWindowsHookExW(WH_KEYBOARD_LL, &KeyHook, GetModuleHandleW(nullptr), 0);
 
     while (!session.done && PumpNestedMessage()) {}
-    return session.done ? session.result : nullptr;
+    return session.done && session.clicked ? WindowAtPoint(session.clickPoint) : nullptr;
 }
 
 }  // namespace rvm

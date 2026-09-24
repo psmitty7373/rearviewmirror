@@ -7,6 +7,9 @@ struct ConnectSettings {
     std::wstring host;
     uint16_t     port = 5901;
     std::wstring key;
+    // A saved key this Windows account could not decrypt (the file came from
+    // another user or PC). Kept as is, so saving does not erase it.
+    std::vector<uint8_t> lockedKey;
 };
 
 // Where one mirror sits on the canvas, in device-independent pixels, and how

@@ -96,6 +96,7 @@ private:
     Hit  hot_{};
     Hit  active_{};      // Button being pressed or slider being dragged.
     bool dragging_ = false;
+    void EndSliderDrag();
     bool mouseTracked_ = false;
 };
 

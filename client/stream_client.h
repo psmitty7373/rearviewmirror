@@ -76,7 +76,8 @@ private:
     void DropSession(std::wstring status);
     void Send(const std::vector<uint8_t>& plain);
     void SendHello();
-    void HandleDatagram(const uint8_t* data, size_t len, uint64_t nowMs);
+    bool HandleDatagram(const uint8_t* data, size_t len, uint64_t nowMs);
+    void RequestList(uint64_t nowMs);
     void HandleMessage(net::Reader& r, uint64_t nowMs);
     void PollStreams(uint64_t nowMs);
     void SetStatus(std::wstring status);
@@ -98,7 +99,14 @@ private:
 
     std::mutex sendMutex_;
     net::SecureChannel channel_;
+    net::SecureChannel master_;   // Net thread: seals HELLOs, opens WELCOMEs.
     net::Key masterKey_{};
+    std::atomic<uint64_t> session_{ 0 };   // Bumped by every new handshake.
+
+    // Net thread only.
+    bool     listPending_ = false;
+    uint64_t lastListReqMs_ = 0;
+    std::map<uint32_t, uint64_t> unwantedMs_;
     uint32_t clientSession_ = 0;
     uint8_t  clientRandom_[net::kRandomBytes]{};
 

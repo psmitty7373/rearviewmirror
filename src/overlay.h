@@ -13,8 +13,10 @@ public:
     bool Create(const wchar_t* className, RECT bounds, bool clickThrough);
 
     // The same surface, but as an ordinary framed window.
+    // `classStyle` adds to the window class, e.g. CS_DBLCLKS for windows that
+    // handle double-clicks (Windows only sends them to classes that ask).
     bool CreateStyled(const wchar_t* className, const wchar_t* title, RECT bounds,
-                      DWORD style, DWORD exStyle);
+                      DWORD style, DWORD exStyle, UINT classStyle = 0);
 
     void Destroy();
 
@@ -43,6 +45,10 @@ protected:
     D2D1_SIZE_F MeasureText(const std::wstring& text);
 
     void ResizeSurface(UINT width, UINT height);
+
+    // Re-reads the window's DPI for chips; call on WM_DPICHANGED.
+    bool UpdateChipScale();
+    float chipScale_ = 1.0f;
 
     winrt::com_ptr<ID2D1DeviceContext> dc_;
     winrt::com_ptr<IDWriteTextFormat>  font_;

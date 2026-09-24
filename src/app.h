@@ -8,7 +8,7 @@ namespace rvm {
 // Owns the tray presence, the hotkeys, the saved-mirror file and every mirror.
 class App : public WindowHost {
 public:
-    int Run();
+    int Run(bool relaunched = false);
 
     // Used by the manager window to drive the mirrors it lists.
     size_t  MirrorCount() const { return mirrors_.size(); }
@@ -28,6 +28,9 @@ public:
     size_t StreamClients() const { return server_.ClientCount(); }
     void   ShowStreamSettings();
 
+    // Switching a mirror on binds it under the same rules as a restore.
+    bool   SetMirrorEnabled(Mirror& mirror, bool on);
+
     LRESULT WndProc(UINT msg, WPARAM wp, LPARAM lp);
 
 private:
@@ -40,6 +43,8 @@ private:
     void NewMirror();
     void ConfirmCloseMirror(uint32_t id);
     void CloseAll();
+    void ConfirmCloseAll();
+    void OnDeviceLost();
     void RetireMirror(size_t index);
 
     // Saves are coalesced: a hotkey that touches every mirror would otherwise
@@ -53,7 +58,10 @@ private:
     int  RunRestorePass();
     bool AnythingWaiting() const;
     void EnsureRestoreTimer();
-    std::vector<HWND> BoundTargets() const;
+    // Mirrors of one window share a group (see MirrorState::group).
+    std::vector<HWND> TargetsOfOtherGroups(uint32_t group) const;
+    HWND TargetOfGroup(uint32_t group, const Mirror* except) const;
+    uint32_t GroupForWindow(HWND target) const;
 
     bool ApplyStreamSettings();
     void PushMirrorList();
@@ -93,6 +101,10 @@ private:
     HICON iconSmall_ = nullptr;
     bool  trayAdded_ = false;
     bool  dirty_ = false;
+    bool  relaunched_ = false;          // Started to replace a process whose device was lost.
+    bool  deviceLostHandled_ = false;
+    bool  selecting_ = false;           // A pick or region selection is running.
+    ULONGLONG startedMs_ = 0;
 };
 
 }  // namespace rvm

@@ -3,6 +3,7 @@
 #include "resource.h"
 
 #include <cstdarg>
+#include <shellscalingapi.h>
 
 namespace rvm {
 
@@ -40,7 +41,10 @@ void Log(const wchar_t* fmt, ...) {
                                     GetCurrentThreadId());
     va_list args;
     va_start(args, fmt);
-    _vsnwprintf_s(line + prefix, ARRAYSIZE(line) - prefix, _TRUNCATE, fmt, args);
+    // Room is kept for the line ending: wcscat_s on a full buffer would
+    // invoke the invalid-parameter handler and end the process.
+    const size_t room = ARRAYSIZE(line) - static_cast<size_t>((std::max)(prefix, 0)) - 2;
+    _vsnwprintf_s(line + (std::max)(prefix, 0), room, _TRUNCATE, fmt, args);
     va_end(args);
     wcscat_s(line, L"\r\n");
 
@@ -108,9 +112,41 @@ RECT WorkAreaFor(HWND hwnd) {
 }
 
 HICON LoadAppIcon(int size) {
-    return static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),
-                                         MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
-                                         size, size, LR_DEFAULTCOLOR));
+    // One icon per size for the life of the process: windows and the tray
+    // hold on to these handles, so they are never destroyed.
+    static std::mutex lock;
+    static std::vector<std::pair<int, HICON>> cache;
+    std::lock_guard<std::mutex> guard(lock);
+    for (const auto& [s, icon] : cache) {
+        if (s == size) return icon;
+    }
+    HICON icon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),
+                                               MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                               size, size, LR_DEFAULTCOLOR));
+    if (icon) cache.emplace_back(size, icon);
+    return icon;
+}
+
+float DpiScaleFor(HMONITOR monitor) {
+    UINT dpiX = 96, dpiY = 96;
+    if (!monitor || FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) {
+        return static_cast<float>(GetDpiForSystem()) / 96.0f;
+    }
+    return static_cast<float>(dpiX) / 96.0f;
+}
+
+std::wstring GetSecretText(HWND dlg, int id) {
+    wchar_t buffer[512]{};
+    GetDlgItemTextW(dlg, id, buffer, ARRAYSIZE(buffer));
+    std::wstring text = buffer;
+    SecureZeroMemory(buffer, sizeof(buffer));
+    return text;
+}
+
+void RevealEditText(HWND edit, bool reveal) {
+    // U+25CF is the mask the version 6 edit control uses by default.
+    SendMessageW(edit, EM_SETPASSWORDCHAR, reveal ? 0 : 0x25CF, 0);
+    InvalidateRect(edit, nullptr, TRUE);
 }
 
 void ApplyTitleBarTheme(HWND hwnd) {
@@ -177,20 +213,31 @@ void Gfx::Init() {
     if (d3d) return;
 
     // VIDEO_SUPPORT enables the video processor and DXVA that streaming uses.
-    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    // Some drivers (and remote sessions) refuse it; mirrors work without it,
+    // so a device without it beats none.
+    constexpr UINT kBase = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    constexpr UINT kVideo = kBase | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
     };
 
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-                                   d3d.put(), nullptr, ctx.put());
-    if (FAILED(hr)) {
-        HR(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
-                             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-                             d3d.put(), nullptr, ctx.put()));
+    auto create = [&](D3D_DRIVER_TYPE type, UINT flags) {
+        d3d = nullptr;
+        ctx = nullptr;
+        return D3D11CreateDevice(nullptr, type, nullptr, flags, levels, ARRAYSIZE(levels),
+                                 D3D11_SDK_VERSION, d3d.put(), nullptr, ctx.put());
+    };
+    HRESULT hr = S_OK;
+    for (const D3D_DRIVER_TYPE type : { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP }) {
+        hr = create(type, kVideo);
+        if (FAILED(hr)) {
+            hr = create(type, kBase);
+            if (SUCCEEDED(hr)) Log(L"gfx: device has no video support; streaming will not work");
+        }
+        if (SUCCEEDED(hr)) break;
     }
+    HR(hr);
 
     if (auto mt = ctx.try_as<ID3D11Multithread>()) mt->SetMultithreadProtected(TRUE);
 
@@ -256,7 +303,61 @@ bool CompSurface::Resize(UINT width, UINT height) {
 }
 
 void CompSurface::Present(UINT syncInterval) {
-    if (swap_) swap_->Present(syncInterval, 0);
+    if (swap_) Gfx::Get().CheckDevice(swap_->Present(syncInterval, 0));
+}
+
+bool RelaunchSelf() {
+    wchar_t exe[MAX_PATH * 4]{};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+    if (n == 0 || n >= ARRAYSIZE(exe)) return false;
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" " + kRestartArg + L" " +
+                       std::to_wstring(GetCurrentProcessId());
+    STARTUPINFOW si{ sizeof(si) };
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+bool WaitForPreviousInstance() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return false;
+    DWORD pid = 0;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (lstrcmpiW(argv[i], kRestartArg) == 0) pid = wcstoul(argv[i + 1], nullptr, 10);
+    }
+    LocalFree(argv);
+    if (pid == 0) return false;
+    if (HANDLE previous = OpenProcess(SYNCHRONIZE, FALSE, pid)) {
+        WaitForSingleObject(previous, 15000);
+        CloseHandle(previous);
+    }
+    return true;
+}
+
+void Gfx::SetDeviceLostHandler(std::function<void()> handler) {
+    std::lock_guard lock(lostMutex_);
+    onLost_ = std::move(handler);
+}
+
+void Gfx::CheckDevice(HRESULT hr) {
+    if (SUCCEEDED(hr) || lost_.load()) return;
+    const bool removed = hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+                         hr == DXGI_ERROR_DEVICE_HUNG || (d3d && FAILED(d3d->GetDeviceRemovedReason()));
+    if (!removed || lost_.exchange(true)) return;
+
+    Log(L"gfx: graphics device lost (0x%08X, reason 0x%08X)", static_cast<unsigned>(hr),
+        static_cast<unsigned>(d3d ? d3d->GetDeviceRemovedReason() : S_OK));
+    std::function<void()> handler;
+    {
+        std::lock_guard lock(lostMutex_);
+        handler = onLost_;
+    }
+    if (handler) handler();
 }
 
 }  // namespace rvm

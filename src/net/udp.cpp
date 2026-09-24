@@ -80,6 +80,14 @@ bool UdpSocket::Open(uint16_t bindPort) {
     return true;
 }
 
+uint16_t UdpSocket::LocalPort() const {
+    if (sock_ == INVALID_SOCKET) return 0;
+    sockaddr_in6 local{};
+    int len = sizeof(local);
+    if (getsockname(sock_, reinterpret_cast<sockaddr*>(&local), &len) != 0) return 0;
+    return ntohs(local.sin6_port);
+}
+
 void UdpSocket::Close() {
     if (sock_ != INVALID_SOCKET) {
         closesocket(sock_);

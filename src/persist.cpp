@@ -1,5 +1,7 @@
 #include "persist.h"
 
+#include <shlobj.h>
+
 namespace rvm {
 
 namespace {
@@ -48,21 +50,28 @@ int ReadExtent(const std::wstring& section, const std::wstring& key,
     return ClampI(ReadInt(section, key, 0, path), 0, kMaxExtent);
 }
 
+// String values are quoted: GetPrivateProfileString strips one pair of quotes,
+// but trims unquoted leading and trailing spaces, which would alter a title.
 void Line(std::wstring& out, const wchar_t* key, const std::wstring& value) {
     out += key;
-    out += L'=';
+    out += L"=\"";
     out += SanitizeValue(value);
-    out += L"\r\n";
+    out += L"\"\r\n";
 }
 
 void Line(std::wstring& out, const wchar_t* key, int value) {
-    Line(out, key, std::to_wstring(value));
+    out += key;
+    out += L'=';
+    out += std::to_wstring(value);
+    out += L"\r\n";
 }
 
 }  // namespace
 
 bool WriteTextAtomically(const std::wstring& path, const std::wstring& text) {
-    const std::wstring tmp = path + L".tmp";
+    // Unique per process and thread, so two writers cannot trample one temp file.
+    const std::wstring tmp = path + L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
+                             std::to_wstring(GetCurrentThreadId()) + L".tmp";
     HANDLE file = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
@@ -80,8 +89,11 @@ bool WriteTextAtomically(const std::wstring& path, const std::wstring& text) {
         DeleteFileW(tmp.c_str());
         return false;
     }
-    return MoveFileExW(tmp.c_str(), path.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 namespace {
@@ -96,15 +108,37 @@ std::wstring ExeNameForPid(DWORD pid) {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process) return {};
 
-    wchar_t path[MAX_PATH]{};
-    DWORD length = ARRAYSIZE(path);
-    const bool ok = QueryFullProcessImageNameW(process, 0, path, &length) != FALSE;
+    // Long-path installs exceed MAX_PATH; the NT limit is 32767 characters.
+    std::wstring path(32768, L'\0');
+    DWORD length = static_cast<DWORD>(path.size());
+    const bool ok = QueryFullProcessImageNameW(process, 0, path.data(), &length) != FALSE;
     CloseHandle(process);
     if (!ok) return {};
 
-    std::wstring full(path, length);
-    const size_t slash = full.find_last_of(L'\\');
-    return (slash == std::wstring::npos) ? full : full.substr(slash + 1);
+    path.resize(length);
+    const size_t slash = path.find_last_of(L'\\');
+    return (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+}
+
+// Titles carry volatile prefixes: a dirty marker ("*", "●") or an unread
+// count ("(3) "). They are ignored when titles are compared.
+std::wstring TitleCore(const std::wstring& title) {
+    size_t i = 0;
+    const auto skipSpace = [&] { while (i < title.size() && iswspace(title[i])) ++i; };
+    skipSpace();
+    while (i < title.size() && (title[i] == L'*' || title[i] == L'\x25CF' || title[i] == L'\x2022')) {
+        ++i;
+        skipSpace();
+    }
+    if (i < title.size() && title[i] == L'(') {
+        size_t j = i + 1;
+        while (j < title.size() && iswdigit(title[j])) ++j;
+        if (j > i + 1 && j < title.size() && title[j] == L')') {
+            i = j + 1;
+            skipSpace();
+        }
+    }
+    return title.substr(i);
 }
 
 struct MatchState {
@@ -113,6 +147,8 @@ struct MatchState {
     std::vector<std::pair<DWORD, std::wstring>> exeByPid;   // One lookup per process.
     HWND best  = nullptr;
     int  score = 0;
+    bool bestHasTitle = false;
+    int  tiedWithoutTitle = 0;   // Windows at the best score with no title evidence.
 
     const std::wstring& ExeFor(HWND hwnd) {
         DWORD pid = 0;
@@ -136,23 +172,37 @@ BOOL CALLBACK MatchProc(HWND hwnd, LPARAM lp) {
     int score = 1;
     if (!want.className.empty() && want.className == WindowClassName(hwnd)) score += 2;
 
+    bool titled = false;
     if (!want.title.empty()) {
-        const std::wstring title = WindowTitle(hwnd);
-        if (title == want.title) {
+        const std::wstring title = TitleCore(WindowTitle(hwnd));
+        const std::wstring wanted = TitleCore(want.title);
+        if (!wanted.empty() && title == wanted) {
             score += 8;
+            titled = true;
         } else {
-            // Titles carry volatile prefixes (dirty markers, unread counts), so
-            // a shared leading run still counts for something.
-            const size_t shared = (std::min)(title.size(), want.title.size());
+            // A long shared beginning still counts, but only a substantial
+            // one: a common app-name prefix alone is not evidence.
+            const size_t shared = (std::min)(title.size(), wanted.size());
             size_t common = 0;
-            while (common < shared && title[common] == want.title[common]) ++common;
-            if (common >= 8) score += 3;
+            while (common < shared && title[common] == wanted[common]) ++common;
+            if (common >= 8 && common * 2 >= wanted.size()) {
+                score += 3;
+                titled = true;
+            }
         }
     }
 
-    if (score >= kMinMatchScore && score > st->score) {
+    // Without a saved executable, nothing but the title can tell apps apart.
+    if (want.exeName.empty() && !titled) return TRUE;
+    if (score < kMinMatchScore) return TRUE;
+
+    if (score > st->score) {
         st->score = score;
-        st->best  = hwnd;
+        st->best = hwnd;
+        st->bestHasTitle = titled;
+        st->tiedWithoutTitle = titled ? 0 : 1;
+    } else if (score == st->score && !titled && !st->bestHasTitle) {
+        ++st->tiedWithoutTitle;
     }
     return TRUE;
 }
@@ -166,21 +216,42 @@ BOOL CALLBACK MonitorContainsProc(HMONITOR, HDC, LPRECT, LPARAM lp) {
 
 std::wstring ConfigDir() {
     static const std::wstring dir = [] {
-        wchar_t appData[MAX_PATH]{};
-        const DWORD length = GetEnvironmentVariableW(L"APPDATA", appData, ARRAYSIZE(appData));
-        if (length == 0 || length >= ARRAYSIZE(appData)) {
-            wchar_t exe[MAX_PATH]{};
-            GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
-            std::wstring d(exe);
-            const size_t slash = d.find_last_of(L'\\');
-            if (slash != std::wstring::npos) d.resize(slash);
+        // The roaming AppData folder from the shell, not the environment,
+        // which can be missing or overridden.
+        std::wstring d;
+        PWSTR roaming = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_CREATE, nullptr,
+                                           &roaming))) {
+            d = std::wstring(roaming) + L"\\RearViewMirror";
+        }
+        CoTaskMemFree(roaming);
+        if (!d.empty() &&
+            (CreateDirectoryW(d.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS)) {
             return d;
         }
-        const std::wstring d = std::wstring(appData) + L"\\RearViewMirror";
-        CreateDirectoryW(d.c_str(), nullptr);
+        // Last resort: beside the executable.
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+        d = exe;
+        const size_t slash = d.find_last_of(L'\\');
+        if (slash != std::wstring::npos) d.resize(slash);
         return d;
     }();
     return dir;
+}
+
+uint32_t GroupFromIdentity(const MirrorState& state) {
+    // FNV-1a over the saved identity.
+    uint32_t h = 2166136261u;
+    for (const std::wstring* part : { &state.exeName, &state.className, &state.title }) {
+        for (wchar_t c : *part) {
+            h ^= static_cast<uint32_t>(towlower(c));
+            h *= 16777619u;
+        }
+        h ^= 0x1F;   // Separator, so "ab"+"c" differs from "a"+"bc".
+        h *= 16777619u;
+    }
+    return h == 0 ? 1 : h;
 }
 
 std::wstring ConfigPath() {
@@ -199,6 +270,10 @@ HWND FindMatchingWindow(const MirrorState& state, const std::vector<HWND>& exclu
     if (state.exeName.empty() && state.className.empty() && state.title.empty()) return nullptr;
     MatchState st{ &state, &exclude };
     EnumWindows(&MatchProc, reinterpret_cast<LPARAM>(&st));
+    // Executable and class alone are enough only when they point at a single
+    // window. With several candidates and no title to choose by, binding to
+    // any of them could mirror, and stream, the wrong window: wait instead.
+    if (st.best && !st.bestHasTitle && st.tiedWithoutTitle > 1) return nullptr;
     return st.best;
 }
 
@@ -251,6 +326,8 @@ std::vector<MirrorState> LoadMirrorStates() {
         // Files from before click-through was per mirror carried one global flag.
         s.clickThrough = ReadInt(section, L"ClickThrough", legacyClickThrough, path) != 0;
         s.hidden       = ReadInt(section, L"Hidden", 0, path) != 0;
+        s.group = static_cast<uint32_t>(wcstoul(ReadStr(section, L"Group", path).c_str(), nullptr, 10));
+        if (s.group == 0) s.group = GroupFromIdentity(s);   // Saved before groups existed.
 
         if (RectW(s.crop) > 0 && RectH(s.crop) > 0) states.push_back(std::move(s));
     }
@@ -286,6 +363,7 @@ bool SaveMirrorStates(const std::vector<MirrorState>& states) {
         Line(text, L"Enabled", s.enabled ? 1 : 0);
         Line(text, L"ClickThrough", s.clickThrough ? 1 : 0);
         Line(text, L"Hidden", s.hidden ? 1 : 0);
+        Line(text, L"Group", std::to_wstring(s.group));
     }
 
     return WriteTextAtomically(ConfigPath(), text);

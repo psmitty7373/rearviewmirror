@@ -158,9 +158,10 @@ void WindowCapture::OnFrame(Shared& state, wgc::Direct3D11CaptureFramePool const
             std::lock_guard lock(state.mutex);
             if (contentSize.Width != state.poolSize.Width ||
                 contentSize.Height != state.poolSize.Height) {
+                // Recorded only once the pool really is that size, so a failed
+                // recreate is tried again on the next frame.
                 needsResize = true;
                 newSize = contentSize;
-                state.poolSize = contentSize;
             }
 
             if (state.onFrame) {
@@ -175,6 +176,9 @@ void WindowCapture::OnFrame(Shared& state, wgc::Direct3D11CaptureFramePool const
         }
 
         frame.Close();   // Must precede Recreate.
+    } catch (const winrt::hresult_error& e) {
+        Gfx::Get().CheckDevice(e.code());
+        return;
     } catch (...) {
         return;
     }
@@ -182,6 +186,10 @@ void WindowCapture::OnFrame(Shared& state, wgc::Direct3D11CaptureFramePool const
     if (needsResize && newSize.Width > 0 && newSize.Height > 0) {
         try {
             pool.Recreate(Gfx::Get().winrtDevice, kFormat, kBufferCount, newSize);
+            std::lock_guard lock(state.mutex);
+            state.poolSize = newSize;
+        } catch (const winrt::hresult_error& e) {
+            Gfx::Get().CheckDevice(e.code());
         } catch (...) {}
     }
 }

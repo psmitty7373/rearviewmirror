@@ -143,25 +143,23 @@ void MirrorRenderer::Shutdown() {
     cropDirty_ = true;
 }
 
+// Caller holds presentMutex_ (and nothing else), from before it drew.
 void MirrorRenderer::Present(UINT syncInterval) {
-    std::lock_guard lock(presentMutex_);
     comp_.Present(syncInterval);
 }
 
 void MirrorRenderer::Resize(UINT width, UINT height) {
+    // Nothing may be presenting while the buffers are resized.
+    std::lock_guard present(presentMutex_);
     bool drew = false;
     {
         std::lock_guard lock(mutex_);
         if (!comp_.Valid()) return;
         if (width == comp_.Width() && height == comp_.Height()) return;
 
-        // The render target view must go before the buffers are resized, and
-        // nothing may be presenting meanwhile.
+        // The render target view must go before the buffers are resized.
         rtv_ = nullptr;
-        {
-            std::lock_guard present(presentMutex_);
-            if (!comp_.Resize(width, height)) return;
-        }
+        if (!comp_.Resize(width, height)) return;
         if (cacheTex_) {
             std::lock_guard device(Gfx::Get().deviceMutex);
             drew = RenderLocked();
@@ -255,8 +253,14 @@ bool MirrorRenderer::EnsureCache(UINT width, UINT height) {
     desc.BindFlags  = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
     auto& g = Gfx::Get();
-    return SUCCEEDED(g.d3d->CreateTexture2D(&desc, nullptr, cacheTex_.put())) &&
-           SUCCEEDED(g.d3d->CreateShaderResourceView(cacheTex_.get(), nullptr, cacheSrv_.put()));
+    HRESULT hr = g.d3d->CreateTexture2D(&desc, nullptr, cacheTex_.put());
+    if (SUCCEEDED(hr)) hr = g.d3d->CreateShaderResourceView(cacheTex_.get(), nullptr, cacheSrv_.put());
+    g.CheckDevice(hr);
+    if (FAILED(hr)) {   // Half-made must not pass for made next time.
+        cacheSrv_ = nullptr;
+        cacheTex_ = nullptr;
+    }
+    return SUCCEEDED(hr);
 }
 
 bool MirrorRenderer::EnsureCrop(UINT width, UINT height) {
@@ -280,8 +284,14 @@ bool MirrorRenderer::EnsureCrop(UINT width, UINT height) {
     desc.MiscFlags  = D3D11_RESOURCE_MISC_GENERATE_MIPS;
 
     auto& g = Gfx::Get();
-    return SUCCEEDED(g.d3d->CreateTexture2D(&desc, nullptr, cropTex_.put())) &&
-           SUCCEEDED(g.d3d->CreateShaderResourceView(cropTex_.get(), nullptr, cropSrv_.put()));
+    HRESULT hr = g.d3d->CreateTexture2D(&desc, nullptr, cropTex_.put());
+    if (SUCCEEDED(hr)) hr = g.d3d->CreateShaderResourceView(cropTex_.get(), nullptr, cropSrv_.put());
+    g.CheckDevice(hr);
+    if (FAILED(hr)) {   // Half-made must not pass for made next time.
+        cropSrv_ = nullptr;
+        cropTex_ = nullptr;
+    }
+    return SUCCEEDED(hr);
 }
 
 bool MirrorRenderer::EnsureRenderTarget() {
@@ -302,6 +312,9 @@ void MirrorRenderer::SubmitFrame(ID3D11Texture2D* source, UINT contentWidth, UIN
     source->GetDesc(&sd);
     if (contentWidth > sd.Width || contentHeight > sd.Height) return;
 
+    // Drawing and presenting are one step: another thread's draw and present
+    // in between would leave this present showing a back buffer nobody drew.
+    std::lock_guard present(presentMutex_);
     bool drew = false;
     {
         std::lock_guard lock(mutex_);
@@ -340,6 +353,7 @@ void MirrorRenderer::RepushFrame() {
 
 void MirrorRenderer::Redraw() {
     if (!presenting_.load()) return;
+    std::lock_guard present(presentMutex_);
     bool drew = false;
     {
         std::lock_guard lock(mutex_);

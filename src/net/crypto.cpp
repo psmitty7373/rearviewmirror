@@ -6,8 +6,15 @@ namespace rvm::net {
 
 namespace {
 
-constexpr char  kSalt[] = "RearViewMirror.stream.v1";
-constexpr ULONG kIterations = 100000;
+constexpr char  kSalt[] = "RearViewMirror.stream.v2";
+
+// A key nobody can know: used whenever derivation fails, so failure can only
+// ever mean "nothing decrypts", never "everything is under a zero key".
+Key UnknowableKey() {
+    Key k{};
+    RandomBytes(k.data(), k.size());
+    return k;
+}
 
 struct AlgHandle {
     BCRYPT_ALG_HANDLE h = nullptr;
@@ -35,45 +42,56 @@ std::wstring FromUtf8(const std::string& s) {
     return out;
 }
 
-bool RandomBytes(void* out, size_t len) {
-    return BCRYPT_SUCCESS(BCryptGenRandom(nullptr, static_cast<PUCHAR>(out),
-                                          static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG));
+void RandomBytes(void* out, size_t len) {
+    auto* p = static_cast<PUCHAR>(out);
+    while (len > 0) {
+        const ULONG chunk = static_cast<ULONG>((std::min)(len, static_cast<size_t>(0x10000000)));
+        if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, p, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+            // Nonces, session ids and keys would be predictable: stop.
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
+        p += chunk;
+        len -= chunk;
+    }
 }
 
 Key DeriveMasterKey(const std::wstring& passphrase) {
-    Key key{};
     AlgHandle alg(BCRYPT_SHA256_ALGORITHM, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (!alg.h) return key;
+    if (!alg.h) return UnknowableKey();
 
+    Key key{};
     std::string pass = ToUtf8(passphrase);
-    BCryptDeriveKeyPBKDF2(alg.h,
-                          reinterpret_cast<PUCHAR>(pass.data()), static_cast<ULONG>(pass.size()),
-                          reinterpret_cast<PUCHAR>(const_cast<char*>(kSalt)),
-                          static_cast<ULONG>(sizeof(kSalt) - 1),
-                          kIterations, key.data(), static_cast<ULONG>(key.size()), 0);
+    const NTSTATUS status = BCryptDeriveKeyPBKDF2(
+        alg.h, reinterpret_cast<PUCHAR>(pass.data()), static_cast<ULONG>(pass.size()),
+        reinterpret_cast<PUCHAR>(const_cast<char*>(kSalt)), static_cast<ULONG>(sizeof(kSalt) - 1),
+        kPbkdf2Iterations, key.data(), static_cast<ULONG>(key.size()), 0);
     SecureZeroMemory(pass.data(), pass.size());
-    return key;
+    return BCRYPT_SUCCESS(status) ? key : UnknowableKey();
 }
 
 Key DeriveSessionKey(const Key& master, const uint8_t clientRandom[kRandomBytes],
-                     const uint8_t serverRandom[kRandomBytes]) {
-    Key out{};
+                     const uint8_t serverRandom[kRandomBytes], Direction direction) {
     AlgHandle alg(BCRYPT_SHA256_ALGORITHM, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (!alg.h) return out;
+    if (!alg.h) return UnknowableKey();
 
     BCRYPT_HASH_HANDLE hash = nullptr;
     if (!BCRYPT_SUCCESS(BCryptCreateHash(alg.h, &hash, nullptr, 0,
                                          const_cast<PUCHAR>(master.data()),
                                          static_cast<ULONG>(master.size()), 0))) {
-        return out;
+        return UnknowableKey();
     }
-    static const char label[] = "session";
-    BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(label)), sizeof(label) - 1, 0);
-    BCryptHashData(hash, const_cast<PUCHAR>(clientRandom), kRandomBytes, 0);
-    BCryptHashData(hash, const_cast<PUCHAR>(serverRandom), kRandomBytes, 0);
-    BCryptFinishHash(hash, out.data(), static_cast<ULONG>(out.size()), 0);
+    static const char c2s[] = "session c->s";
+    static const char s2c[] = "session s->c";
+    const char* label = direction == Direction::kClientToServer ? c2s : s2c;
+    Key out{};
+    const bool ok =
+        BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(label)),
+                                      sizeof(c2s) - 1, 0)) &&
+        BCRYPT_SUCCESS(BCryptHashData(hash, const_cast<PUCHAR>(clientRandom), kRandomBytes, 0)) &&
+        BCRYPT_SUCCESS(BCryptHashData(hash, const_cast<PUCHAR>(serverRandom), kRandomBytes, 0)) &&
+        BCRYPT_SUCCESS(BCryptFinishHash(hash, out.data(), static_cast<ULONG>(out.size()), 0));
     BCryptDestroyHash(hash);
-    return out;
+    return ok ? out : UnknowableKey();
 }
 
 Cipher::~Cipher() {
@@ -104,7 +122,7 @@ bool Cipher::Init(const Key& key) {
 
 bool Cipher::Seal(const uint8_t nonce[kNonceBytes], const uint8_t* aad, size_t aadLen,
                   const uint8_t* plain, size_t len, uint8_t* out) const {
-    if (!key_) return false;
+    if (!key_ || !plain || !out || len == 0) return false;
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
     BCRYPT_INIT_AUTH_MODE_INFO(info);
     info.pbNonce    = const_cast<PUCHAR>(nonce);
@@ -122,7 +140,10 @@ bool Cipher::Seal(const uint8_t nonce[kNonceBytes], const uint8_t* aad, size_t a
 
 bool Cipher::Open(const uint8_t nonce[kNonceBytes], const uint8_t* aad, size_t aadLen,
                   const uint8_t* sealed, size_t len, uint8_t* out) const {
-    if (!key_ || len < kTagBytes) return false;
+    // With an empty body BCryptDecrypt gets a null output buffer, treats the
+    // call as a size query and succeeds without checking the tag: a forged
+    // datagram would authenticate. Nothing we send is ever empty.
+    if (!key_ || !out || len <= kTagBytes) return false;
     const size_t body = len - kTagBytes;
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;

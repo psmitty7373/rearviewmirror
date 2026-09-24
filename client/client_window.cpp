@@ -4,7 +4,6 @@ namespace rvm {
 
 namespace {
 
-constexpr wchar_t kClientClass[] = L"RvmClientWindow";
 constexpr wchar_t kClientTitle[] = L"Rear View Mirror Client";
 
 constexpr float kPad      = 12.0f;
@@ -50,12 +49,16 @@ bool Overlaps(float ax, float ay, float aw, float ah, float bx, float by, float 
 
 }  // namespace
 
-bool ClientWindow::Create() {
+bool ClientWindow::Create(bool relaunched) {
+    relaunched_ = relaunched;
+    startedMs_ = GetTickCount64();
+
     POINT cursor{};
     GetCursorPos(&cursor);
-    const RECT work = WorkAreaFor(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY));
+    const HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+    const RECT work = WorkAreaFor(monitor);
 
-    dpiScale_ = static_cast<float>(GetDpiForSystem()) / 96.0f;
+    dpiScale_ = DpiScaleFor(monitor);
     const int w = (std::min)(static_cast<int>(S(1100.0f)), RectW(work) - 40);
     const int h = (std::min)(static_cast<int>(S(700.0f)), RectH(work) - 40);
     RECT bounds{ (work.left + work.right) / 2 - w / 2, (work.top + work.bottom) / 2 - h / 2, 0, 0 };
@@ -63,7 +66,7 @@ bool ClientWindow::Create() {
     bounds.bottom = bounds.top + h;
 
     if (!CreateStyled(kClientClass, kClientTitle, bounds, WS_OVERLAPPEDWINDOW,
-                      WS_EX_NOREDIRECTIONBITMAP)) {
+                      WS_EX_NOREDIRECTIONBITMAP, CS_DBLCLKS)) {
         return false;
     }
     if (HICON bigIcon = LoadAppIcon(GetSystemMetrics(SM_CXICON))) {
@@ -76,6 +79,7 @@ bool ClientWindow::Create() {
     dpiScale_ = static_cast<float>(GetDpiForWindow(Hwnd())) / 96.0f;
     ApplyTitleBarTheme(Hwnd());
     EnsureFonts();
+    Gfx::Get().SetDeviceLostHandler([hwnd = Hwnd()] { PostMessageW(hwnd, WM_RVM_DEVICE_LOST, 0, 0); });
 
     ClientConfig config = LoadClientConfig();
     sidebarHidden_ = config.sidebarHidden;
@@ -88,7 +92,13 @@ bool ClientWindow::Create() {
         WINDOWPLACEMENT wp{ sizeof(wp) };
         wp.rcNormalPosition = config.window;
         wp.showCmd = config.windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        // Landing on a monitor of another DPI sends WM_DPICHANGED, whose
+        // suggested rect would rescale the saved size. The saved rect is
+        // already in that monitor's pixels, so it is applied as is.
+        restoringPlacement_ = true;
         SetWindowPlacement(Hwnd(), &wp);
+        SetWindowPlacement(Hwnd(), &wp);
+        restoringPlacement_ = false;
     } else {
         ShowWindow(Hwnd(), SW_SHOW);
     }
@@ -97,6 +107,25 @@ bool ClientWindow::Create() {
     // Nothing remembered: straight into adding the first server.
     if (servers_.empty()) PostMessageW(Hwnd(), WM_COMMAND, 1, 0);
     return true;
+}
+
+// The graphics device is gone, and every swapchain, decoder and texture with
+// it. Save, and let a fresh process reconnect on a new device. A device that
+// fails again straight after a relaunch is reported rather than relaunched,
+// so a broken GPU cannot cause a restart loop.
+void ClientWindow::OnDeviceLost() {
+    if (deviceLostHandled_) return;
+    deviceLostHandled_ = true;
+    SaveConfig();
+    const bool looping = relaunched_ && GetTickCount64() - startedMs_ < 30000;
+    if (looping || !RelaunchSelf()) {
+        MessageBoxW(nullptr,
+                    L"The graphics device stopped working and did not recover. "
+                    L"Your layout is saved; start the client again once the display "
+                    L"driver is working.",
+                    kAppName, MB_OK | MB_ICONERROR);
+    }
+    PostMessageW(Hwnd(), WM_CLOSE, 0, 0);
 }
 
 void ClientWindow::EnsureFonts() {
@@ -156,6 +185,9 @@ void ClientWindow::RemoveServer(uint32_t tag) {
     if (it == servers_.end()) return;
     const std::wstring label = (*it)->label;
 
+    for (auto& t : tiles_) {
+        if (t.key.server == tag) Retire(std::move(t.popout));
+    }
     tiles_.erase(std::remove_if(tiles_.begin(), tiles_.end(),
                                 [&](const Tile& t) { return t.key.server == tag; }),
                  tiles_.end());
@@ -291,7 +323,8 @@ void ClientWindow::RemoveTile(TileKey key, bool remember) {
     auto it = std::find_if(tiles_.begin(), tiles_.end(), [&](const Tile& t) { return t.key == key; });
     if (it == tiles_.end()) return;
     if (remember) pendingTiles_.push_back(ToLayout(*it));
-    tiles_.erase(it);   // Destroys its pop-out window, if any.
+    Retire(std::move(it->popout));
+    tiles_.erase(it);
     if (focused_ == key) focused_ = {};
     if (drag_.active && drag_.key == key) EndDrag(false);
     SaveConfig();
@@ -355,17 +388,42 @@ const RemoteMirror* ClientWindow::MirrorFor(TileKey key) const {
     return nullptr;
 }
 
+bool ClientWindow::ShownSize(TileKey key, UINT& w, UINT& h) const {
+    const StreamView* v = ViewFor(key);
+    const RemoteMirror* m = MirrorFor(key);
+    const bool listed = m && m->width > 0 && m->height > 0;
+    if (!v || v->frames == 0 || v->width == 0 || v->height == 0) {
+        if (!listed) return false;
+        w = m->width;
+        h = m->height;
+        return true;
+    }
+    w = v->width;
+    h = v->height;
+    if (!listed) return true;
+
+    // Only when the listed crop explains this stream's size: a list from
+    // before a resize must not bend the new picture.
+    for (const bool align16 : { false, true }) {
+        UINT ew = 0, eh = 0;
+        net::EncodeSize(m->width, m->height, align16, ew, eh);
+        if (ew != w || eh != h) continue;
+        // Keep the stream's resolution along one side and shorten the other.
+        const double crop = static_cast<double>(m->width) / m->height;
+        if (crop >= static_cast<double>(w) / h) {
+            h = (std::max)(1u, static_cast<UINT>(std::lround(w / crop)));
+        } else {
+            w = (std::max)(1u, static_cast<UINT>(std::lround(h * crop)));
+        }
+        break;
+    }
+    return true;
+}
+
 void ClientWindow::PopOut(Tile& tile) {
     if (tile.popout) return;
     UINT nativeW = 0, nativeH = 0;
-    if (const StreamView* v = ViewFor(tile.key); v && v->frames > 0) {
-        nativeW = v->width;
-        nativeH = v->height;
-    } else if (const RemoteMirror* m = MirrorFor(tile.key)) {
-        nativeW = m->width;
-        nativeH = m->height;
-    }
-    if (nativeW == 0 || nativeH == 0) {
+    if (!ShownSize(tile.key, nativeW, nativeH)) {
         nativeW = 640;
         nativeH = 360;
     }
@@ -373,7 +431,9 @@ void ClientWindow::PopOut(Tile& tile) {
     auto popout = std::make_unique<PopoutWindow>();
     if (!popout->Create(Hwnd(), TokenOf(tile.key), tile.popSettings, nativeW, nativeH, Hwnd())) return;
     if (const StreamView* v = ViewFor(tile.key)) {
-        popout->SetFrame(v->texture, v->width, v->height, v->frames);
+        UINT w = v->width, h = v->height;
+        ShownSize(tile.key, w, h);
+        popout->SetFrame(v->texture, w, h, v->frames);
         popout->Render();
     }
     tile.popout = std::move(popout);
@@ -381,10 +441,23 @@ void ClientWindow::PopOut(Tile& tile) {
     SaveConfig();
 }
 
+// A pop-out's own window procedure may still be on the stack: its right-click
+// menu runs a nested message loop in which a list update can remove its box.
+// So its window goes now, but the object only between messages.
+void ClientWindow::Retire(std::unique_ptr<PopoutWindow> popout) {
+    if (!popout) return;
+    popout->Destroy();
+    retiredPopouts_.push_back(std::move(popout));
+}
+
+void ClientWindow::FreeRetired() {
+    retiredPopouts_.clear();
+}
+
 void ClientWindow::Dock(Tile& tile) {
     if (!tile.popout) return;
     tile.popSettings = tile.popout->CurrentSettings();
-    tile.popout.reset();
+    Retire(std::move(tile.popout));
     SaveConfig();
 }
 
@@ -392,7 +465,9 @@ void ClientWindow::FeedPopouts(uint32_t serverTag) {
     for (auto& t : tiles_) {
         if (!t.popout || t.key.server != serverTag) continue;
         if (const StreamView* v = ViewFor(t.key)) {
-            t.popout->SetFrame(v->texture, v->width, v->height, v->frames);
+            UINT w = v->width, h = v->height;
+            ShownSize(t.key, w, h);
+            t.popout->SetFrame(v->texture, w, h, v->frames);
             t.popout->Render();
         }
     }
@@ -401,9 +476,7 @@ void ClientWindow::FeedPopouts(uint32_t serverTag) {
 // Size the box so the stream shows at 100%, as far as the canvas allows.
 void ClientWindow::FitToStream(Tile& tile) {
     UINT w = 0, h = 0;
-    if (const StreamView* v = ViewFor(tile.key); v && v->frames > 0) { w = v->width; h = v->height; }
-    else if (const RemoteMirror* m = MirrorFor(tile.key))            { w = m->width; h = m->height; }
-    if (w == 0 || h == 0) return;
+    if (!ShownSize(tile.key, w, h)) return;
 
     // One stream pixel per screen pixel, scaled down evenly if the canvas is
     // smaller than that.
@@ -767,10 +840,22 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const ClientEvent event = ClientEventOf(wp);
         if (event == ClientEvent::FrameReady) server->client->AckFrameReady();
         if (event == ClientEvent::ListUpdated) MirrorsChanged(*server);
-        Render();
+        // A new frame only changes the canvas if one of this server's boxes
+        // is on it; streams shown only in pop-outs leave the canvas alone.
+        bool redraw = event != ClientEvent::FrameReady;
+        if (!redraw && !IsIconic(Hwnd())) {
+            for (const auto& t : tiles_) {
+                if (!t.popout && t.key.server == server->tag) { redraw = true; break; }
+            }
+        }
+        if (redraw) Render();
         if (event == ClientEvent::FrameReady) FeedPopouts(server->tag);
         return 0;
     }
+
+    case WM_RVM_DEVICE_LOST:
+        OnDeviceLost();
+        return 0;
 
     case WM_RVM_POPOUT_EVENT: {
         Tile* tile = FindTile(KeyOf(lp));
@@ -811,9 +896,12 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DPICHANGED: {
         dpiScale_ = static_cast<float>(HIWORD(wp)) / 96.0f;
         EnsureFonts();
-        const RECT* suggested = reinterpret_cast<RECT*>(lp);
-        SetWindowPos(Hwnd(), nullptr, suggested->left, suggested->top,
-                     RectW(*suggested), RectH(*suggested), SWP_NOZORDER | SWP_NOACTIVATE);
+        UpdateChipScale();
+        if (!restoringPlacement_) {
+            const RECT* suggested = reinterpret_cast<RECT*>(lp);
+            SetWindowPos(Hwnd(), nullptr, suggested->left, suggested->top,
+                         RectW(*suggested), RectH(*suggested), SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         Render();
         return 0;
     }
@@ -971,7 +1059,10 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONDBLCLK: {
         const Hit hit = HitTest(POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) });
-        if (hit.part == Part::Tile) {
+        // Anywhere but a box, the second click of a quick pair is just a
+        // click: toggling two mirrors in a row must not lose one.
+        if (hit.part != Part::Tile) return OnMessage(WM_LBUTTONDOWN, wp, lp);
+        {
             EndDrag(false);
             const Tile* t = FindTile(hit.Key());
             if (t && !t->popout) {
@@ -1004,7 +1095,8 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CLOSE:
         SaveConfig();
-        tiles_.clear();     // Pop-out windows first,
+        for (auto& t : tiles_) Retire(std::move(t.popout));   // Pop-out windows first,
+        tiles_.clear();
         servers_.clear();   // then the connections.
         DestroyWindow(Hwnd());
         return 0;
@@ -1106,10 +1198,12 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
         dc->FillRoundedRectangle(D2D1::RoundedRect(cell, S(6.0f), S(6.0f)), brush_.get());
 
         if (view && view->texture && view->width > 0 && view->height > 0 && view->frames > 0) {
-            // Letterbox to the stream's aspect.
+            // Letterbox to the mirror's true aspect.
+            UINT sw = view->width, sh = view->height;
+            ShownSize(tile.key, sw, sh);
             const float cw = cell.right - cell.left, ch = cell.bottom - cell.top;
-            const float scale = (std::min)(cw / view->width, ch / view->height);
-            const float dw = view->width * scale, dh = view->height * scale;
+            const float scale = (std::min)(cw / sw, ch / sh);
+            const float dw = sw * scale, dh = sh * scale;
             const float dx = cell.left + (cw - dw) * 0.5f, dy = cell.top + (ch - dh) * 0.5f;
             if (ID2D1Bitmap1* bitmap = BitmapFor(dc, view->texture.get())) {
                 dc->DrawBitmap(bitmap, D2D1::RectF(dx, dy, dx + dw, dy + dh), 1.0f,

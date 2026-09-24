@@ -53,14 +53,15 @@ private:
     bool EnsureCrop(UINT width, UINT height);
     bool EnsureRenderTarget();
 
-    // Draws without presenting. Callers hold mutex_ and Gfx::deviceMutex, then
-    // release both before presenting, so no lock spans the vsync wait.
+    // Draws without presenting. Callers hold presentMutex_, mutex_ and
+    // Gfx::deviceMutex, then release the last two before presenting, so only
+    // presentMutex_ spans the vsync wait. Lock order is that order.
     bool RenderLocked();
     void Present(UINT syncInterval);
     RECT ComputeCropLocked() const;
 
     mutable std::mutex mutex_;
-    std::mutex presentMutex_;   // Present against ResizeBuffers only.
+    std::mutex presentMutex_;   // One draw-and-present, or resize, at a time.
     CompSurface comp_;
 
     winrt::com_ptr<ID3D11Texture2D>          cacheTex_;

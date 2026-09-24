@@ -28,11 +28,15 @@ struct MirrorInfo {
 // holding the key can grow memory or flood the app.
 class StreamServer {
 public:
+    StreamServer();
     ~StreamServer();
+    StreamServer(const StreamServer&) = delete;
+    StreamServer& operator=(const StreamServer&) = delete;
 
     bool Start(const StreamSettings& settings);
     void Stop();
     bool Running() const { return running_.load(); }
+    uint16_t Port() const;   // The UDP port bound; settings.port 0 picks a free one.
     size_t ClientCount() const;
     size_t StreamCount() const;   // Encoders and buffers currently allocated.
 
@@ -61,9 +65,19 @@ private:
     struct Pending {
         std::shared_ptr<Client> client;
         uint32_t clientSession = 0;
+        uint8_t  clientRandom[net::kRandomBytes]{};
         std::vector<uint8_t> welcome;   // Resent as-is if the HELLO is repeated.
         uint64_t createdMs = 0;
     };
+
+    // HELLOs answered recently, by client session and random. A second copy
+    // is a replay and is dropped before it can cost the admission budget.
+    using HelloId = std::array<uint8_t, 4 + net::kRandomBytes>;
+    struct HelloSeen { HelloId id; uint64_t ms; };
+    static constexpr size_t   kMaxRecentHellos = 1024;
+    static constexpr uint64_t kRecentHelloMs = 120000;
+    void ExpireRecentHellos(uint64_t nowMs);
+    void Subscribe(const std::shared_ptr<Client>& client, uint32_t mirrorId, uint64_t nowMs);
 
     void NetLoop();
     void EncodeLoop();
@@ -106,6 +120,8 @@ private:
     std::vector<std::shared_ptr<Client>> clients_;
 
     std::vector<Pending> pending_;   // Net thread only.
+    std::set<HelloId>     recentHellos_;       // Net thread only.
+    std::deque<HelloSeen> recentHelloOrder_;
     double   admitTokens_ = 0.0;     // Net thread only.
     uint64_t admitRefillMs_ = 0;
 

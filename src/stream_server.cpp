@@ -30,11 +30,9 @@ constexpr double kResendBurst  = 1000.0;
 // to its end, not dropped, so a newcomer always gets its keyframe.
 constexpr uint64_t kKeyframeGapMs = 250;
 
-// Hardware encoders refuse small frames: NVENC accepts 256x128 but not
-// 128x128. A small crop is scaled up uniformly until both dimensions clear
-// this floor on the way into the encoder; the client just shows the larger
-// picture.
-constexpr UINT kMinEncodeDim = 256;
+// A crop being dragged changes size many times a second; the encoder is only
+// rebuilt once the size has held this long.
+constexpr uint64_t kResizeSettleMs = 250;
 
 uint64_t NowMs() {
     return GetTickCount64();
@@ -91,28 +89,30 @@ struct StreamServer::Client {
 // through a few texture slots between the capture thread that converts them
 // and the encode thread that feeds them in; if the encoder falls behind, the
 // newest frame wins and the older one is simply never encoded.
-struct StreamServer::Stream {
+struct StreamServer::Stream : std::enable_shared_from_this<StreamServer::Stream> {
     explicit Stream(uint32_t id) : mirrorId(id), sender(id) {}
 
     const uint32_t mirrorId;
 
-    // Frame slots. The encoder reads a texture some time after taking it, so
-    // a slot stays off limits to capture until its encoded frame comes out.
-    static constexpr int kSlots = 4;
-    static constexpr size_t kMaxInflight = 2;   // Beyond this, assume the oldest was consumed.
+    // Frame slots. The encoder reads a texture some time after taking it; a
+    // slot stays off limits to capture until the encoder reports, through its
+    // tracked sample, that it has let go. `generation` changes whenever the
+    // textures are replaced, so a late report about an old one is ignored.
+    static constexpr int kSlots = 5;
 
     std::mutex swap;
     winrt::com_ptr<ID3D11Texture2D> textures[kSlots];
+    bool     inEncoder[kSlots]{};
+    uint64_t generation = 0;
     UINT texW = 0, texH = 0;
     int  ready = -1;           // Latest complete frame, or -1.
     int  busy  = -1;           // Being handed to the encoder, or -1.
     int  held  = -1;           // Last frame encoded, kept intact for Repeat(), or -1.
-    std::deque<int> inflight;  // Inside the encoder, oldest first.
     bool reinit = false;
+    uint64_t sizeChangedMs = 0;   // When the textures last changed size.
 
     bool SlotFree(int i) const {
-        return i != ready && i != busy && i != held &&
-               std::find(inflight.begin(), inflight.end(), i) == inflight.end();
+        return i != ready && i != busy && i != held && !inEncoder[i];
     }
 
     // Set once an encoder refused the exact size: frames are then scaled to
@@ -146,31 +146,30 @@ struct StreamServer::Stream {
     bool     keyframeDeferred = false;
 };
 
+// The wake event lives as long as the server: a capture thread may still be
+// signalling it just after Stop(), so it is never closed while that can happen.
+StreamServer::StreamServer() : frameEvent_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+
 StreamServer::~StreamServer() {
     Stop();
+    if (frameEvent_) CloseHandle(frameEvent_);
 }
 
 bool StreamServer::Start(const StreamSettings& settings) {
     Stop();
-    if (!settings.enabled || settings.key.empty()) return false;
+    if (!settings.enabled || settings.key.empty() || !frameEvent_) return false;
     if (!socket_.Open(settings.port)) return false;
 
     settings_ = settings;
     fps_ = static_cast<UINT>(ClampI(static_cast<int>(settings.fps), static_cast<int>(kMinStreamFps),
                                     static_cast<int>(kMaxStreamFps)));
-    masterKey_ = DeriveMasterKey(settings.key);
-    if (!master_.SetKey(masterKey_)) {
-        socket_.Close();
-        SecureZeroMemory(masterKey_.data(), masterKey_.size());
-        return false;
-    }
     admitTokens_ = kAdmitBurst;
     admitRefillMs_ = NowMs();
-    frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ResetEvent(frameEvent_);
     running_ = true;
     netThread_ = std::thread([this] { NetLoop(); });
     encodeThread_ = std::thread([this] { EncodeLoop(); });
-    Log(L"server: started on udp %u, %u kbps, %u fps, encoder '%s'", settings.port,
+    Log(L"server: started on udp %u, %u kbps, %u fps, encoder '%s'", Port(),
         settings.bitrateKbps, settings.fps, HardwareEncoderName().c_str());
     return true;
 }
@@ -198,9 +197,14 @@ void StreamServer::Stop() {
         std::lock_guard lock(streamsMutex_);
         streams_.clear();
     }
+    recentHellos_.clear();
+    recentHelloOrder_.clear();
     socket_.Close();
-    if (frameEvent_) { CloseHandle(frameEvent_); frameEvent_ = nullptr; }
     SecureZeroMemory(masterKey_.data(), masterKey_.size());
+}
+
+uint16_t StreamServer::Port() const {
+    return socket_.LocalPort();
 }
 
 size_t StreamServer::ClientCount() const {
@@ -323,16 +327,8 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
     const UINT cropH = static_cast<UINT>(RectH(crop));
     if (cropW < kMinStreamDim || cropH < kMinStreamDim) return;
 
-    // Encode size: the crop, upscaled uniformly if it is under the encoder's
-    // floor, and even in both dimensions for NV12.
-    const float scale = (std::max)(1.0f, (std::max)(static_cast<float>(kMinEncodeDim) / cropW,
-                                                    static_cast<float>(kMinEncodeDim) / cropH));
-    UINT w = static_cast<UINT>(cropW * scale) & ~1u;
-    UINT h = static_cast<UINT>(cropH * scale) & ~1u;
-    if (s->align16.load()) {
-        w = (w + 15) & ~15u;
-        h = (h + 15) & ~15u;
-    }
+    UINT w = 0, h = 0;
+    EncodeSize(cropW, cropH, s->align16.load(), w, h);
 
     // Hold each stream to the configured rate, on an even cadence. A frame
     // someone is waiting for (a keyframe, a new viewer) always goes through.
@@ -354,42 +350,64 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
         return;
     }
 
+    // Every way a frame can be dropped below marks it owed, so that if the
+    // source then goes still its last picture is fetched again, not lost.
     int write = -1;
     {
         std::lock_guard lock(s->swap);
         if (w != s->texW || h != s->texH) {
-            if (s->busy >= 0) return;   // Encoder mid-frame; resize on the next one.
+            if (s->busy >= 0) {   // Encoder mid-frame; resize on the next one.
+                s->skipped = true;
+                return;
+            }
+            // All or nothing: a half-replaced set would leave slots that are
+            // null or the wrong size behind indices still in use.
             D3D11_TEXTURE2D_DESC d{};
             d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
             d.Format = DXGI_FORMAT_NV12; d.SampleDesc = { 1, 0 };
             d.Usage = D3D11_USAGE_DEFAULT;
             d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            for (auto& t : s->textures) {
-                t = nullptr;
-                if (FAILED(Gfx::Get().d3d->CreateTexture2D(&d, nullptr, t.put()))) {
-                    Log(L"server: NV12 texture %ux%u failed for mirror %u", w, h, mirrorId);
+            winrt::com_ptr<ID3D11Texture2D> fresh[Stream::kSlots];
+            for (auto& t : fresh) {
+                const HRESULT hr = Gfx::Get().d3d->CreateTexture2D(&d, nullptr, t.put());
+                if (FAILED(hr)) {
+                    RVM_LOG_SAMPLED(100, L"server: NV12 texture %ux%u failed for mirror %u (0x%08X)",
+                                    w, h, mirrorId, static_cast<unsigned>(hr));
+                    Gfx::Get().CheckDevice(hr);
+                    s->skipped = true;
                     return;
                 }
             }
+            for (int i = 0; i < Stream::kSlots; ++i) {
+                s->textures[i] = std::move(fresh[i]);
+                s->inEncoder[i] = false;   // Old textures live on in their samples.
+            }
+            ++s->generation;
             Log(L"server: stream %u textures %ux%u", mirrorId, w, h);
             s->texW = w;
             s->texH = h;
             s->ready = -1;
             s->held = -1;
-            s->inflight.clear();
             s->reinit = true;
+            s->sizeChangedMs = NowMs();
         }
         for (int i = 0; i < Stream::kSlots; ++i) {
             if (s->SlotFree(i)) { write = i; break; }
         }
+        if (write < 0) {
+            s->skipped = true;   // Every slot is still with the encoder.
+            return;
+        }
     }
-    if (write < 0) return;
 
     // The whole crop, scaled by the video processor into the encode texture.
     const RECT src{ crop.left, crop.top, crop.left + static_cast<LONG>(cropW),
                     crop.top + static_cast<LONG>(cropH) };
-    if (!s->converter.Convert(cache, 0, &src, s->textures[write].get())) {
+    const bool converted = s->converter.Convert(cache, 0, &src, s->textures[write].get());
+    if (!converted) {
         RVM_LOG_SAMPLED(300, L"server: convert failed for mirror %u", mirrorId);
+        std::lock_guard lock(s->swap);
+        s->skipped = true;
         return;
     }
 
@@ -404,9 +422,13 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
 // Encode side
 
 void StreamServer::EncodeLoop() {
+    // Media Foundation objects live in the multithreaded apartment; this
+    // thread joins it rather than relying on one existing by accident.
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
     while (running_) {
-        // Short timeout: an encoder that finished a frame after Encode()
-        // stopped waiting for it gets drained here, not on the next input.
+        // The wait also serves the frame-rate cap's owed frames and nudging a
+        // still encoder, which no event announces.
         WaitForSingleObject(frameEvent_, 20);
         if (!running_) break;
 
@@ -418,6 +440,13 @@ void StreamServer::EncodeLoop() {
         for (auto& s : streams) EncodeStream(*s);
         PruneStreams();
     }
+
+    // Encoders are shut down on the thread and in the apartment that made them.
+    {
+        std::lock_guard lock(streamsMutex_);
+        for (auto& [id, s] : streams_) s->encoder.Shutdown();
+    }
+    if (SUCCEEDED(com)) CoUninitialize();
 }
 
 // A stream nobody watches is freed: its encoder was shut down by
@@ -444,17 +473,9 @@ void StreamServer::EncodeStream(Stream& s) {
     if (s.subscribers.load() == 0) {
         if (s.encoder.Ready()) s.encoder.Shutdown();   // Free the hardware session.
         std::lock_guard lock(s.swap);
-        s.inflight.clear();
         s.held = -1;
         return;
     }
-
-    // Encoded frames come out in the order their inputs went in; each one
-    // frees the oldest slot the encoder was holding.
-    const auto retire = [&](size_t count) {
-        std::lock_guard lock(s.swap);
-        for (size_t i = 0; i < count && !s.inflight.empty(); ++i) s.inflight.pop_front();
-    };
 
     std::vector<EncodedFrame> produced;
     if (s.encoder.Ready() && !s.encoder.Service(produced)) {
@@ -462,21 +483,44 @@ void StreamServer::EncodeStream(Stream& s) {
         Log(L"server: encoder for mirror %u failed; recreating", s.mirrorId);
         s.encoder.Shutdown();
         std::lock_guard lock(s.swap);
-        s.inflight.clear();
         s.reinit = true;
     }
-    retire(produced.size());
+
+    // Hands a slot to the encoder. The slot stays reserved until the encoder
+    // reports it has let go of the texture, from whatever thread that is.
+    const auto feed = [&](int slot, bool repeat) {
+        uint64_t generation = 0;
+        {
+            std::lock_guard lock(s.swap);
+            s.inEncoder[slot] = true;
+            generation = s.generation;
+        }
+        std::weak_ptr<Stream> weak = s.shared_from_this();
+        H264Encoder::Released released = [weak, slot, generation] {
+            if (auto st = weak.lock()) {
+                std::lock_guard lock(st->swap);
+                if (st->generation == generation) st->inEncoder[slot] = false;
+            }
+        };
+        ID3D11Texture2D* texture = s.textures[slot].get();
+        return repeat ? s.encoder.Repeat(texture, produced, std::move(released))
+                      : s.encoder.Encode(texture, produced, std::move(released));
+    };
 
     // Take the newest frame only when the encoder can use it now, or has to
-    // be (re)created for it; otherwise it waits, and a newer one may replace it.
+    // be (re)created for it; otherwise it waits, and a newer one may replace
+    // it. While a crop is being resized, wait for the size to settle rather
+    // than rebuild the encoder for every intermediate size.
     int idx = -1;
     bool reinit = false;
     UINT w = 0, h = 0;
     {
         std::lock_guard lock(s.swap);
-        const bool mustInit = !s.encoder.Ready() || s.reinit || s.encoder.Width() != s.texW ||
-                              s.encoder.Height() != s.texH;
-        if (s.ready >= 0 && (mustInit || s.encoder.WantsInput())) {
+        const bool sizeDiffers = s.encoder.Width() != s.texW || s.encoder.Height() != s.texH;
+        const bool settling = s.encoder.Ready() && sizeDiffers &&
+                              NowMs() - s.sizeChangedMs < kResizeSettleMs;
+        const bool mustInit = !s.encoder.Ready() || s.reinit || sizeDiffers;
+        if (s.ready >= 0 && !settling && (mustInit || s.encoder.WantsInput())) {
             idx = s.ready;
             s.ready = -1;
             s.busy = idx;
@@ -488,9 +532,9 @@ void StreamServer::EncodeStream(Stream& s) {
     }
 
     if (idx < 0) {
-        // The cap skipped the source's latest picture and nothing has come
-        // since: fetch it again now that the cap allows, or the viewer would
-        // be left on an older one.
+        // The cap, or a busy moment, skipped the source's latest picture and
+        // nothing has come since: fetch it again, or the viewer would be left
+        // on an older one.
         bool owed = false;
         {
             const int64_t interval = 1'000'000 / static_cast<int64_t>((std::max)(fps_.load(), 1u));
@@ -515,15 +559,9 @@ void StreamServer::EncodeStream(Stream& s) {
                 }
             }
             if (again >= 0) {
-                const size_t before = produced.size();
-                const bool fed = s.encoder.Repeat(s.textures[again].get(), produced);
-                {
-                    std::lock_guard lock(s.swap);
-                    s.busy = -1;
-                    if (fed) s.inflight.push_back(again);
-                    while (s.inflight.size() > Stream::kMaxInflight) s.inflight.pop_front();
-                }
-                retire(produced.size() - before);
+                feed(again, /*repeat=*/true);
+                std::lock_guard lock(s.swap);
+                s.busy = -1;
             }
         }
         if (!produced.empty()) SendFrames(s, produced);
@@ -553,7 +591,6 @@ void StreamServer::EncodeStream(Stream& s) {
                 ok ? L"ok" : L"FAILED");
             {
                 std::lock_guard lock(s.swap);
-                s.inflight.clear();
                 s.held = -1;
             }
             if (!ok) {
@@ -581,18 +618,14 @@ void StreamServer::EncodeStream(Stream& s) {
     }
     if (s.wantKeyframe.exchange(false)) s.encoder.RequestKeyframe();
 
-    const size_t before = produced.size();
-    const bool fed = s.encoder.Encode(s.textures[idx].get(), produced);
+    const bool fed = feed(idx, /*repeat=*/false);
     if (fed) {
         std::lock_guard lock(s.swap);
         s.busy = -1;
         s.held = idx;
-        s.inflight.push_back(idx);
-        while (s.inflight.size() > Stream::kMaxInflight) s.inflight.pop_front();
     } else {
         giveBack();
     }
-    retire(produced.size() - before);
     RVM_LOG_SAMPLED(300, L"server: encode mirror %u -> fed=%d frames=%zu%s", s.mirrorId, fed ? 1 : 0,
                     produced.size(), (!produced.empty() && produced[0].keyframe) ? L" (keyframe)" : L"");
     if (!produced.empty()) SendFrames(s, produced);
@@ -630,6 +663,15 @@ void StreamServer::SendFrames(Stream& s, const std::vector<EncodedFrame>& frames
 // Network side
 
 void StreamServer::NetLoop() {
+    // Stretching the passphrase takes a noticeable fraction of a second, so it
+    // happens here rather than on the UI thread that called Start. Datagrams
+    // arriving meanwhile wait in the socket.
+    masterKey_ = DeriveMasterKey(settings_.key);
+    if (!master_.SetKey(masterKey_)) {
+        Log(L"server: could not set up the handshake key");
+        return;
+    }
+
     std::vector<uint8_t> buffer(kMaxDatagram + 64);
     uint64_t lastSweep = NowMs();
     uint64_t lastKeyframeService = lastSweep;
@@ -711,17 +753,26 @@ void StreamServer::Handshake(const Endpoint& from, const uint8_t* data, size_t l
         version != kVersion || !r.Bytes(clientRandom, kRandomBytes)) {
         return;
     }
-    if (!AdmissionAllowed(nowMs)) return;
 
     // The client resends HELLO until answered. If our WELCOME was merely slow,
     // answer the repeat with the same one: a new server random would give the
-    // two sides different session keys.
+    // two sides different session keys. This costs nothing from the budget.
     for (const auto& p : pending_) {
-        if (p.client->endpoint == from && p.clientSession == clientSession) {
+        if (p.client->endpoint == from && p.clientSession == clientSession &&
+            memcmp(p.clientRandom, clientRandom, kRandomBytes) == 0) {
             socket_.SendTo(from, p.welcome.data(), p.welcome.size());
             return;
         }
     }
+
+    // A HELLO already answered once is a replay: someone captured it. It is
+    // dropped before it can use up the admission budget real clients need.
+    HelloId id{};
+    memcpy(id.data(), &clientSession, sizeof(clientSession));
+    memcpy(id.data() + sizeof(clientSession), clientRandom, kRandomBytes);
+    ExpireRecentHellos(nowMs);
+    if (recentHellos_.count(id)) return;
+    if (!AdmissionAllowed(nowMs)) return;
 
     // Full: no WELCOME at all, so the client keeps retrying and says so,
     // rather than believing it is connected. A client already here from this
@@ -735,18 +786,26 @@ void StreamServer::Handshake(const Endpoint& from, const uint8_t* data, size_t l
 
     uint8_t serverRandom[kRandomBytes];
     RandomBytes(serverRandom, kRandomBytes);
-    const uint32_t serverSession = RandomSession();
+    uint32_t serverSession = RandomSession();
+    while (serverSession == clientSession) serverSession = RandomSession();
 
-    // WELCOME goes back under the master key; everything after it is under
-    // the session key, on fresh counters and windows.
+    // WELCOME goes back under the master key and echoes the client's random,
+    // so the client accepts only the answer to its own HELLO, never a WELCOME
+    // someone recorded earlier. Everything after it is under per-direction
+    // session keys, on fresh counters and windows.
     master_.BeginSend(serverSession, RandomCounter());
     Writer w;
     w.U8(static_cast<uint8_t>(Msg::Welcome));
     w.Bytes(serverRandom, kRandomBytes);
+    w.Bytes(clientRandom, kRandomBytes);
     std::vector<uint8_t> datagram;
     if (!master_.Seal(w.Data().data(), w.Data().size(), datagram)) return;
 
-    if (!client->channel.SetKey(DeriveSessionKey(masterKey_, clientRandom, serverRandom))) return;
+    if (!client->channel.SetKeys(
+            DeriveSessionKey(masterKey_, clientRandom, serverRandom, Direction::kServerToClient),
+            DeriveSessionKey(masterKey_, clientRandom, serverRandom, Direction::kClientToServer))) {
+        return;
+    }
     client->channel.BeginSend(serverSession);
     client->channel.BeginRecv(clientSession);
 
@@ -755,7 +814,16 @@ void StreamServer::Handshake(const Endpoint& from, const uint8_t* data, size_t l
                                   [&](const Pending& p) { return p.client->endpoint == from; }),
                    pending_.end());
     if (pending_.size() >= kMaxPending) pending_.erase(pending_.begin());
-    pending_.push_back({ client, clientSession, datagram, nowMs });
+    Pending p{ client, clientSession, {}, datagram, nowMs };
+    memcpy(p.clientRandom, clientRandom, kRandomBytes);
+    pending_.push_back(std::move(p));
+
+    recentHellos_.insert(id);
+    recentHelloOrder_.push_back({ id, nowMs });
+    while (recentHelloOrder_.size() > kMaxRecentHellos) {
+        recentHellos_.erase(recentHelloOrder_.front().id);
+        recentHelloOrder_.pop_front();
+    }
 
     socket_.SendTo(from, datagram.data(), datagram.size());
     RVM_LOG_SAMPLED(50, L"server: handshake from %s", from.ToString().c_str());
@@ -766,11 +834,41 @@ void StreamServer::Handshake(const Endpoint& from, const uint8_t* data, size_t l
 bool StreamServer::Promote(const std::shared_ptr<Client>& client) {
     if (auto old = FindClient(client->endpoint)) RemoveClient(old);
 
-    std::lock_guard lock(clientsMutex_);
-    if (clients_.size() >= kMaxClients) return false;
-    clients_.push_back(client);
-    Log(L"server: client %s admitted", client->endpoint.ToString().c_str());
-    return true;
+    {
+        std::lock_guard lock(clientsMutex_);
+        if (clients_.size() < kMaxClients) {
+            clients_.push_back(client);
+            Log(L"server: client %s admitted", client->endpoint.ToString().c_str());
+            return true;
+        }
+    }
+    // Two handshakes raced for the last slot. The loser was already welcomed,
+    // so say goodbye rather than leave it believing it is connected.
+    Writer w;
+    w.U8(static_cast<uint8_t>(Msg::Bye));
+    SendTo(*client, w.Data());
+    return false;
+}
+
+void StreamServer::Subscribe(const std::shared_ptr<Client>& client, uint32_t id, uint64_t nowMs) {
+    if (client->subscriptions.count(id)) return;
+    if (client->subscriptions.size() >= kMaxSubscriptions || !MirrorListed(id)) return;
+    auto s = AcquireStream(id);
+    client->subscriptions.insert(id);
+    {
+        std::lock_guard lock(s->subsMutex);
+        s->subs.push_back(client);
+    }
+    RVM_LOG_SAMPLED(50, L"server: %s subscribes to mirror %u (subscribers now %d)",
+                    client->endpoint.ToString().c_str(), id, s->subscribers.load());
+    ForceKeyframe(*s, nowMs);   // A newcomer can only start on an IDR.
+}
+
+void StreamServer::ExpireRecentHellos(uint64_t nowMs) {
+    while (!recentHelloOrder_.empty() && nowMs - recentHelloOrder_.front().ms > kRecentHelloMs) {
+        recentHellos_.erase(recentHelloOrder_.front().id);
+        recentHelloOrder_.pop_front();
+    }
 }
 
 // Every name is cut, evenly and on character boundaries, until the whole
@@ -823,17 +921,7 @@ void StreamServer::HandleMessage(const std::shared_ptr<Client>& client, Reader& 
 
     case Msg::Subscribe: {
         uint32_t id = 0;
-        if (!r.U32(id) || client->subscriptions.count(id)) break;
-        if (client->subscriptions.size() >= kMaxSubscriptions || !MirrorListed(id)) break;
-        auto s = AcquireStream(id);
-        client->subscriptions.insert(id);
-        {
-            std::lock_guard lock(s->subsMutex);
-            s->subs.push_back(client);
-        }
-        RVM_LOG_SAMPLED(50, L"server: %s subscribes to mirror %u (subscribers now %d)",
-                        client->endpoint.ToString().c_str(), id, s->subscribers.load());
-        ForceKeyframe(*s, nowMs);   // A newcomer can only start on an IDR.
+        if (r.U32(id)) Subscribe(client, id, nowMs);
         break;
     }
 
@@ -848,8 +936,15 @@ void StreamServer::HandleMessage(const std::shared_ptr<Client>& client, Reader& 
         break;
 
     case Msg::KeyframeReq: {
+        // A client waiting for a keyframe of a mirror it is not subscribed to
+        // lost its Subscribe on the way (control messages are plain UDP): the
+        // request itself subscribes it, under the same limits.
         uint32_t id = 0;
-        if (!r.U32(id) || !client->subscriptions.count(id)) break;
+        if (!r.U32(id)) break;
+        if (!client->subscriptions.count(id)) {
+            Subscribe(client, id, nowMs);
+            break;
+        }
         RVM_LOG_SAMPLED(50, L"server: keyframe requested for mirror %u", id);
         if (auto s = FindStream(id)) ForceKeyframe(*s, nowMs);
         break;

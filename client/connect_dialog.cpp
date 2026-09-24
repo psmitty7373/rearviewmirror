@@ -33,17 +33,28 @@ INT_PTR CALLBACK ConnectDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         case IDOK: {
             ConnectSettings s;
             s.host = OneLine(GetText(dlg, IDC_CONNECT_HOST));
-            s.port = static_cast<uint16_t>(GetDlgItemInt(dlg, IDC_CONNECT_PORT, nullptr, FALSE));
-            s.key  = GetText(dlg, IDC_CONNECT_KEY);
-            if (s.host.empty() || s.port == 0 || s.key.empty()) {
+            BOOL portOk = FALSE;
+            const UINT port = GetDlgItemInt(dlg, IDC_CONNECT_PORT, &portOk, FALSE);
+            s.key = GetSecretText(dlg, IDC_CONNECT_KEY);
+            if (s.host.empty() || s.key.empty()) {
                 MessageBoxW(dlg, L"Host, port and key are all needed.", kAppName,
                             MB_OK | MB_ICONWARNING);
                 return TRUE;
             }
+            if (!portOk || port == 0 || port > 65535) {
+                MessageBoxW(dlg, L"Enter a UDP port between 1 and 65535.", kAppName,
+                            MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+            s.port = static_cast<uint16_t>(port);
             *settings = s;
             EndDialog(dlg, IDOK);
             return TRUE;
         }
+        case IDC_CONNECT_SHOWKEY:
+            RevealEditText(GetDlgItem(dlg, IDC_CONNECT_KEY),
+                           IsDlgButtonChecked(dlg, IDC_CONNECT_SHOWKEY) == BST_CHECKED);
+            return TRUE;
         case IDCANCEL:
             EndDialog(dlg, IDCANCEL);
             return TRUE;

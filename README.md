@@ -38,7 +38,7 @@ streamed. **Off** (manager switch or tray list) stops capturing entirely.
 | --- | --- |
 | `Ctrl+Alt+M` | New mirror |
 | `Ctrl+Alt+T` | Click-through on for all mirrors, or off if all are on |
-| `Ctrl+Alt+X` | Close all mirrors and forget them |
+| `Ctrl+Alt+X` | Close all mirrors and forget them (asks first) |
 
 ## Tray and manager
 
@@ -51,12 +51,17 @@ streamed. **Off** (manager switch or tray list) stops capturing entirely.
 
 If a mirror's source window closes, the mirror waits and comes back when the
 window reopens. Only *Close*, *Remove* and `Ctrl+Alt+X` discard a mirror.
+Several mirrors made from one window come back on the same window together.
+
+If the graphics driver resets, the app and the client restart themselves and
+pick up where they left off.
 
 ## Streaming
 
 **On the PC with the mirrors:** open *Streaming* (tray menu or manager header).
 
-1. Pick a UDP port and press *Generate* for a shared key.
+1. Pick a UDP port and press *Generate* for a shared key. The key is shown so
+   you can copy it; *Show* reveals or hides it.
 2. Set *Bitrate* and *Frame rate* (an upper limit, 1 to 240 fps).
 3. Press *Start*. Forward the UDP port on your router to this PC, and allow the
    app through Windows Firewall when asked.
@@ -65,6 +70,9 @@ The dialog shows whether the server is running and how many clients are
 connected. A running server starts again at the next launch. Streaming needs a
 hardware H.264 encoder (NVIDIA, Intel or AMD); the dialog names the one it
 found.
+
+The app and the client must be the same version. This release changed the
+protocol, so update both PCs together.
 
 **On the viewing PC:** run `RearViewMirrorClient.exe`, press *Add server…*, and
 enter the host or public address, the port and the same key. Click a mirror in
@@ -82,6 +90,7 @@ several servers.
 local mirror. Close it, or click its placeholder, to return it to the canvas.
 
 The client remembers servers, keys and layout, and reconnects on its own.
+Starting it again brings the open client to the front.
 
 **Frame rate:** a stream can't exceed the refresh rate of the monitor showing
 the source window, and a window that isn't changing sends few frames. For high
@@ -89,7 +98,8 @@ frame rates, hide the local mirror and raise the bitrate.
 
 ## Building
 
-Needs Visual Studio 2022 Build Tools (C++ workload) and the Windows 10/11 SDK.
+Needs Visual Studio 2022 (any edition, or the Build Tools) with the C++
+workload, and the Windows 10/11 SDK. `build.bat` finds them itself.
 
 ```
 build.bat
@@ -99,12 +109,15 @@ This produces `build\RearViewMirror.exe` and `build\RearViewMirrorClient.exe`,
 both self-contained. They are signed with a self-signed certificate that the
 first build creates in your certificate store. Run
 `powershell -File tools\sign.ps1 -Trust` to have this PC treat it as a trusted
-publisher, or build with `-DRVM_SIGN=OFF` to skip signing.
+publisher, or build with `-DRVM_SIGN=OFF` to skip signing. Without the SDK's
+signtool, the build skips signing with a warning.
 
 ## Files
 
 Everything lives in `%APPDATA%\RearViewMirror`. Keys are encrypted to your
-Windows account.
+Windows account, so a settings file copied to another user or PC can't unlock
+them. The app then asks for the key again; in the client, remove that server
+and add it again.
 
 | File | Contents |
 | --- | --- |

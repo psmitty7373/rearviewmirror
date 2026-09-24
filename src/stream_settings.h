@@ -7,6 +7,9 @@ struct StreamSettings {
     bool         enabled = false;   // Running; restored at the next launch.
     uint16_t     port = 5901;
     std::wstring key;               // The pre-shared passphrase.
+    // A saved key this Windows account could not decrypt (the file came from
+    // another user or PC). Kept as is, so saving does not erase it.
+    std::vector<uint8_t> lockedKey;
     UINT         bitrateKbps = 8000;
     UINT         fps = 60;          // Upper limit per stream; a still window sends fewer.
 };

@@ -27,7 +27,16 @@ struct MirrorState {
 
     // No window on screen, but capture (and so streaming) carries on.
     bool      hidden       = false;
+
+    // Mirrors made from the same window share a group, so they bind to one
+    // window together; different groups never share a window. Never 0 once
+    // loaded or created.
+    uint32_t  group        = 0;
 };
+
+// A group number for a mirror with nothing better to go on: the same for the
+// same saved identity, so mirrors saved from one window still end up together.
+uint32_t GroupFromIdentity(const MirrorState& state);
 
 std::wstring ConfigDir();
 std::wstring ConfigPath();

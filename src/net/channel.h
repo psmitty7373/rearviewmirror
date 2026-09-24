@@ -8,7 +8,14 @@ namespace rvm::net {
 // datagram is rejected.
 class SecureChannel {
 public:
+    SecureChannel() = default;
+    SecureChannel(const SecureChannel&) = delete;
+    SecureChannel& operator=(const SecureChannel&) = delete;
+
+    // One key both ways: only for the master-key handshake messages.
     bool SetKey(const Key& key);
+    // A session: each direction has its own key.
+    bool SetKeys(const Key& sendKey, const Key& recvKey);
 
     // The handshake runs under the long-lived master key, so it starts its
     // counter at a random point: session ids are only 32 bits, and a nonce

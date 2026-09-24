@@ -32,6 +32,10 @@ bool SecureChannel::SetKey(const Key& key) {
     return sendCipher_.Init(key) && recvCipher_.Init(key);
 }
 
+bool SecureChannel::SetKeys(const Key& sendKey, const Key& recvKey) {
+    return sendCipher_.Init(sendKey) && recvCipher_.Init(recvKey);
+}
+
 void SecureChannel::BeginSend(uint32_t sessionId, uint64_t startCounter) {
     sendSession_ = sessionId;
     sendCounter_ = startCounter;
@@ -66,7 +70,9 @@ bool SecureChannel::Open(const uint8_t* datagram, size_t len, std::vector<uint8_
                          uint32_t& senderSession) {
     uint64_t counter = 0;
     if (!ReadHeader(datagram, len, senderSession, counter)) return false;
-    if (len > kMaxDatagram || len < kHeaderBytes + kTagBytes) return false;
+    // Every message carries at least its type byte; a body-less datagram is
+    // forged by definition and must not even reach the cipher.
+    if (len > kMaxDatagram || len < kHeaderBytes + kTagBytes + 1) return false;
     if (recvBound_ && senderSession != recvSession_) return false;
 
     // Replay window: reject anything already seen or too old to track.

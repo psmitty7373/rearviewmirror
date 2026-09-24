@@ -14,7 +14,7 @@
 namespace rvm::net {
 
 constexpr uint8_t  kMagic   = 0xA5;
-constexpr uint8_t  kVersion = 1;
+constexpr uint8_t  kVersion = 2;   // 2: per-direction keys, bound WELCOME, 600k PBKDF2.
 constexpr uint16_t kDefaultPort = 5901;
 
 constexpr size_t kKeyBytes    = 32;
@@ -29,9 +29,43 @@ constexpr size_t kMaxPlain    = kMaxDatagram - kHeaderBytes - kTagBytes;
 
 using Key = std::array<uint8_t, kKeyBytes>;
 
+// Hardware encoders refuse small frames: NVENC accepts 256x128 but not
+// 128x128. A small crop is scaled up uniformly until both dimensions clear
+// this floor on the way into the encoder; the client just shows the larger
+// picture.
+constexpr UINT kMinEncodeDim = 256;
+
+// The other way, H.264 hardware encoders stop at 4096 a side, and the GPU at
+// 16384. Larger crops are scaled down to fit.
+constexpr UINT kMaxEncodeDim = 4096;
+
+// The size the server encodes a crop at: scaled up uniformly to clear the
+// floor, down uniformly to fit the ceiling, even in both dimensions for NV12,
+// and padded to whole macroblocks for encoders that need it. A strip too thin
+// to satisfy both limits in proportion is held at them, so its stream is out
+// of proportion; the client, which knows the crop from the mirror list, uses
+// this to recognise that and draw it in the true proportions.
+inline void EncodeSize(UINT cropW, UINT cropH, bool align16, UINT& w, UINT& h) {
+    double sw = cropW, sh = cropH;
+    const double up = (std::max)(1.0, (std::max)(kMinEncodeDim / sw, kMinEncodeDim / sh));
+    sw *= up;
+    sh *= up;
+    const double down = (std::min)(1.0, (std::min)(kMaxEncodeDim / sw, kMaxEncodeDim / sh));
+    sw *= down;
+    sh *= down;
+    w = static_cast<UINT>(ClampI(static_cast<int>(sw), static_cast<int>(kMinEncodeDim),
+                                 static_cast<int>(kMaxEncodeDim))) & ~1u;
+    h = static_cast<UINT>(ClampI(static_cast<int>(sh), static_cast<int>(kMinEncodeDim),
+                                 static_cast<int>(kMaxEncodeDim))) & ~1u;
+    if (align16) {
+        w = (std::min)((w + 15) & ~15u, kMaxEncodeDim);
+        h = (std::min)((h + 15) & ~15u, kMaxEncodeDim);
+    }
+}
+
 enum class Msg : uint8_t {
     Hello = 1,       // client -> server  {version u16, clientRandom[16]}
-    Welcome,         // server -> client  {serverRandom[16]}
+    Welcome,         // server -> client  {serverRandom[16], clientRandom[16] echoed}
     ListReq,         // client -> server
     ListResp,        // server -> client  {count u8, {id u32, w u16, h u16, name str}...}
     Subscribe,       // client -> server  {mirrorId u32}

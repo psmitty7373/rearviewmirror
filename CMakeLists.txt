@@ -15,6 +15,17 @@ target_include_directories(rvm_options INTERFACE src)
 # certificate that tools/sign.ps1 keeps in the user's certificate store.
 option(RVM_SIGN "Sign executables after linking" ON)
 if(RVM_SIGN)
+    # Without the Windows SDK's signtool there is nothing to sign with; build
+    # unsigned rather than fail every link.
+    set(_rvm_pf86 "ProgramFiles(x86)")
+    file(GLOB _rvm_signtools "$ENV{${_rvm_pf86}}/Windows Kits/10/bin/*/x64/signtool.exe")
+    find_program(RVM_SIGNTOOL signtool HINTS "$ENV{WindowsSdkVerBinPath}/x64")
+    if(NOT RVM_SIGNTOOL AND NOT _rvm_signtools)
+        message(WARNING "signtool.exe not found (install the Windows SDK); executables will not be signed.")
+        set(RVM_SIGN OFF)
+    endif()
+endif()
+if(RVM_SIGN)
     # Runs once per build, before any executable links, so parallel signing
     # steps find the certificate rather than racing to create it.
     add_custom_target(rvm_signcert
@@ -43,7 +54,7 @@ add_library(rvmcore STATIC
 )
 target_link_libraries(rvmcore PUBLIC rvm_options
     d3d11 dxgi d2d1 dwrite dcomp d3dcompiler
-    dwmapi shell32 user32 gdi32 windowsapp
+    dwmapi shell32 user32 gdi32 ole32 shcore windowsapp
 )
 
 # Streaming: encryption, UDP transport, packetisation and the H.264 codec.

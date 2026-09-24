@@ -67,7 +67,7 @@ void ManagerWindow::Open(App* app) {
     app_ = app;
 
     if (Hwnd()) {
-        ShowWindow(Hwnd(), SW_SHOW);
+        ShowWindow(Hwnd(), IsIconic(Hwnd()) ? SW_RESTORE : SW_SHOW);
         SetForegroundWindow(Hwnd());
         Refresh();
         return;
@@ -75,9 +75,10 @@ void ManagerWindow::Open(App* app) {
 
     POINT cursor{};
     GetCursorPos(&cursor);
-    const RECT work = WorkAreaFor(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY));
+    const HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+    const RECT work = WorkAreaFor(monitor);
 
-    dpiScale_ = static_cast<float>(GetDpiForSystem()) / 96.0f;
+    dpiScale_ = DpiScaleFor(monitor);
     const int w = static_cast<int>(S(600.0f));
     const int h = static_cast<int>(S(560.0f));
     RECT bounds{ (work.left + work.right) / 2 - w / 2, (work.top + work.bottom) / 2 - h / 2, 0, 0 };
@@ -283,6 +284,20 @@ ManagerWindow::Hit ManagerWindow::HitTest(POINT pt) const {
     return hit;
 }
 
+void ManagerWindow::EndSliderDrag() {
+    dragging_ = false;   // First, so the WM_CAPTURECHANGED from releasing is ignored.
+    ReleaseCapture();
+    // Commit the dragged value to the settings file exactly once.
+    if (app_) {
+        if (Mirror* m = app_->FindMirror(active_.id)) {
+            if (active_.part == Part::Opacity) m->SetOpacity(m->Opacity());
+            else                               m->SetZoom(m->CurrentScale());
+        }
+    }
+    active_ = Hit{};
+    Render();
+}
+
 void ManagerWindow::ApplySliderDrag(POINT pt) {
     if (!app_) return;
     Mirror* m = app_->FindMirror(active_.id);
@@ -338,6 +353,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DPICHANGED: {
         dpiScale_ = static_cast<float>(HIWORD(wp)) / 96.0f;
         EnsureFonts();
+        UpdateChipScale();
         const RECT* suggested = reinterpret_cast<RECT*>(lp);
         SetWindowPos(Hwnd(), nullptr, suggested->left, suggested->top,
                      RectW(*suggested), RectH(*suggested), SWP_NOZORDER | SWP_NOACTIVATE);
@@ -383,20 +399,16 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_CAPTURECHANGED:
+        // Alt+Tab, a dialog or another app took the mouse mid-drag: keep
+        // what the slider shows, as a release would.
+        if (dragging_ && reinterpret_cast<HWND>(lp) != Hwnd()) EndSliderDrag();
+        return 0;
+
     case WM_LBUTTONUP: {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (dragging_) {
-            dragging_ = false;
-            ReleaseCapture();
-            // Commit the dragged value to the settings file exactly once.
-            if (app_) {
-                if (Mirror* m = app_->FindMirror(active_.id)) {
-                    if (active_.part == Part::Opacity) m->SetOpacity(m->Opacity());
-                    else                               m->SetZoom(m->CurrentScale());
-                }
-            }
-            active_ = Hit{};
-            Render();
+            EndSliderDrag();
             return 0;
         }
 
@@ -423,7 +435,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
                 break;
             case Part::Toggle:
                 if (Mirror* m = app_->FindMirror(hit.id)) {
-                    if (!m->SetEnabled(!m->Enabled())) {
+                    if (!app_->SetMirrorEnabled(*m, !m->Enabled())) {
                         MessageBoxW(Hwnd(),
                                     L"That mirror's source window is not open, so it "
                                     L"cannot be switched on yet.",

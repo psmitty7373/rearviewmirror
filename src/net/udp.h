@@ -16,9 +16,13 @@ struct Endpoint {
 // A single UDP socket, dual-stack where the OS allows it.
 class UdpSocket {
 public:
+    UdpSocket() = default;
+    UdpSocket(const UdpSocket&) = delete;             // Owns the socket.
+    UdpSocket& operator=(const UdpSocket&) = delete;
     ~UdpSocket();
 
     bool Open(uint16_t bindPort);   // 0 for an ephemeral port.
+    uint16_t LocalPort() const;     // The port actually bound, or 0.
     void Close();
     bool Valid() const { return sock_ != INVALID_SOCKET; }
 

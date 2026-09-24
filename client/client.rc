@@ -13,7 +13,8 @@ BEGIN
     LTEXT           "UDP port:", -1, 12, 34, 70, 10
     EDITTEXT        IDC_CONNECT_PORT, 86, 31, 60, 14, ES_NUMBER | ES_AUTOHSCROLL
     LTEXT           "Shared key:", -1, 12, 54, 70, 10
-    EDITTEXT        IDC_CONNECT_KEY, 86, 51, 162, 14, ES_AUTOHSCROLL
+    EDITTEXT        IDC_CONNECT_KEY, 86, 51, 122, 14, ES_AUTOHSCROLL | ES_PASSWORD
+    AUTOCHECKBOX    "Show", IDC_CONNECT_SHOWKEY, 212, 53, 36, 10
     LTEXT           "The key must match the one set under Streaming on the other machine.", -1, 12, 74, 236, 18
     DEFPUSHBUTTON   "Connect", IDOK, 146, 96, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 200, 96, 48, 14

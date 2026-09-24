@@ -46,7 +46,7 @@ bool PopoutWindow::Create(HWND notify, LPARAM token, const Settings& settings, U
     RECT bounds{ 0, 0, ClampExtent(static_cast<int>(nativeW_), kMinWidth),
                  ClampExtent(static_cast<int>(nativeH_), kMinHeight) };
     const DWORD ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE;
-    if (!CreateStyled(kPopoutClass, kAppName, bounds, WS_POPUP | WS_THICKFRAME, ex)) return false;
+    if (!CreateStyled(kPopoutClass, kAppName, bounds, WS_POPUP | WS_THICKFRAME, ex, CS_DBLCLKS)) return false;
 
     if (clickThrough_) ApplyClickThroughStyle();
 
@@ -192,10 +192,11 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         RECT r{};
         GetWindowRect(hwnd_, &r);
-        const bool left   = pt.x < r.left + kResizeBorder;
-        const bool right  = pt.x >= r.right - kResizeBorder;
-        const bool top    = pt.y < r.top + kResizeBorder;
-        const bool bottom = pt.y >= r.bottom - kResizeBorder;
+        const int border = MulDiv(kResizeBorder, static_cast<int>(GetDpiForWindow(hwnd_)), 96);
+        const bool left   = pt.x < r.left + border;
+        const bool right  = pt.x >= r.right - border;
+        const bool top    = pt.y < r.top + border;
+        const bool bottom = pt.y >= r.bottom - border;
         if (top && left)     return HTTOPLEFT;
         if (top && right)    return HTTOPRIGHT;
         if (bottom && left)  return HTBOTTOMLEFT;
@@ -230,6 +231,12 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSELEAVE:
         hovered_ = false;
+        Render();
+        return 0;
+
+    case WM_DPICHANGED:
+        // Chips follow the monitor's DPI; the window stays in stream pixels.
+        UpdateChipScale();
         Render();
         return 0;
 

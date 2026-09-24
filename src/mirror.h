@@ -22,7 +22,9 @@ public:
 
     // Off stops the capture entirely, so it costs nothing. False if it could not
     // be turned back on because the source window is gone.
-    bool SetEnabled(bool enabled);
+    // `exclude`: windows other groups of mirrors are showing. `preferred`: the
+    // window this mirror's own group is showing, if any; used as is.
+    bool SetEnabled(bool enabled, const std::vector<HWND>& exclude = {}, HWND preferred = nullptr);
     bool Enabled() const { return state_.enabled; }
 
     // The source window went away. Capture stops and the window hides, but the
@@ -32,11 +34,12 @@ public:
 
     // Bind an orphaned mirror to a window that has since appeared. Windows in
     // `exclude` are already someone else's source.
-    bool TryRebind(const std::vector<HWND>& exclude);
+    bool TryRebind(const std::vector<HWND>& exclude, HWND preferred = nullptr);
 
     std::wstring DisplayName() const;
     MirrorState SaveState() const;
     HWND Target() const { return target_; }
+    uint32_t Group() const { return state_.group; }
 
     void SetClickThrough(bool enabled);
     bool ClickThrough() const { return state_.clickThrough; }

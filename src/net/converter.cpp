@@ -12,6 +12,8 @@ bool VideoConverter::Init() {
 bool VideoConverter::Ensure(UINT inW, UINT inH, UINT outW, UINT outH) {
     if (processor_ && inW == inW_ && inH == inH_ && outW == outW_ && outH == outH_) return true;
 
+    inputs_.clear();    // Views belong to the enumerator going away.
+    outputs_.clear();
     processor_ = nullptr;
     enumerator_ = nullptr;
 
@@ -31,8 +33,62 @@ bool VideoConverter::Ensure(UINT inW, UINT inH, UINT outW, UINT outH) {
         enumerator_ = nullptr;
         return false;
     }
+    // A straight conversion: no driver denoising, edge enhancement or other
+    // "improvements" the processor may otherwise apply on its own.
+    context_->VideoProcessorSetStreamAutoProcessingMode(processor_.get(), 0, FALSE);
     inW_ = inW; inH_ = inH; outW_ = outW; outH_ = outH;
     return true;
+}
+
+ID3D11VideoProcessorInputView* VideoConverter::InputView(ID3D11Texture2D* src, UINT slice) {
+    for (size_t i = 0; i < inputs_.size(); ++i) {
+        if (inputs_[i].texture == src && inputs_[i].slice == slice) {
+            std::rotate(inputs_.begin() + static_cast<ptrdiff_t>(i),
+                        inputs_.begin() + static_cast<ptrdiff_t>(i) + 1, inputs_.end());
+            return inputs_.back().view.get();
+        }
+    }
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ivd.Texture2D.ArraySlice = slice;
+    winrt::com_ptr<ID3D11VideoProcessorInputView> view;
+    const HRESULT hr = device_->CreateVideoProcessorInputView(src, enumerator_.get(), &ivd, view.put());
+    if (FAILED(hr)) {
+        D3D11_TEXTURE2D_DESC sd{};
+        src->GetDesc(&sd);
+        RVM_LOG_SAMPLED(300, L"converter: input view failed 0x%08X (bind 0x%X)",
+                        static_cast<unsigned>(hr), sd.BindFlags);
+        Gfx::Get().CheckDevice(hr);
+        return nullptr;
+    }
+    if (inputs_.size() >= kMaxViews) inputs_.erase(inputs_.begin());
+    inputs_.push_back({ src, slice, std::move(view) });
+    return inputs_.back().view.get();
+}
+
+ID3D11VideoProcessorOutputView* VideoConverter::OutputView(ID3D11Texture2D* dst) {
+    for (size_t i = 0; i < outputs_.size(); ++i) {
+        if (outputs_[i].texture == dst) {
+            std::rotate(outputs_.begin() + static_cast<ptrdiff_t>(i),
+                        outputs_.begin() + static_cast<ptrdiff_t>(i) + 1, outputs_.end());
+            return outputs_.back().view.get();
+        }
+    }
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    winrt::com_ptr<ID3D11VideoProcessorOutputView> view;
+    const HRESULT hr = device_->CreateVideoProcessorOutputView(dst, enumerator_.get(), &ovd, view.put());
+    if (FAILED(hr)) {
+        D3D11_TEXTURE2D_DESC dd{};
+        dst->GetDesc(&dd);
+        RVM_LOG_SAMPLED(300, L"converter: output view failed 0x%08X (bind 0x%X)",
+                        static_cast<unsigned>(hr), dd.BindFlags);
+        Gfx::Get().CheckDevice(hr);
+        return nullptr;
+    }
+    if (outputs_.size() >= kMaxViews) outputs_.erase(outputs_.begin());
+    outputs_.push_back({ dst, std::move(view) });
+    return outputs_.back().view.get();
 }
 
 bool VideoConverter::EnsureScratch(DXGI_FORMAT format, UINT w, UINT h) {
@@ -90,26 +146,9 @@ bool VideoConverter::Convert(ID3D11Texture2D* src, UINT srcSubresource, const RE
         return false;
     }
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
-    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ivd.Texture2D.ArraySlice = srcSubresource;
-    winrt::com_ptr<ID3D11VideoProcessorInputView> input;
-    HRESULT hr = device_->CreateVideoProcessorInputView(src, enumerator_.get(), &ivd, input.put());
-    if (FAILED(hr)) {
-        RVM_LOG_SAMPLED(300, L"converter: input view failed 0x%08X (bind 0x%X)",
-                        static_cast<unsigned>(hr), sd.BindFlags);
-        return false;
-    }
-
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
-    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    winrt::com_ptr<ID3D11VideoProcessorOutputView> output;
-    hr = device_->CreateVideoProcessorOutputView(dst, enumerator_.get(), &ovd, output.put());
-    if (FAILED(hr)) {
-        RVM_LOG_SAMPLED(300, L"converter: output view failed 0x%08X (bind 0x%X)",
-                        static_cast<unsigned>(hr), dd.BindFlags);
-        return false;
-    }
+    ID3D11VideoProcessorInputView* input = InputView(src, srcSubresource);
+    ID3D11VideoProcessorOutputView* output = input ? OutputView(dst) : nullptr;
+    if (!output) return false;
 
     // BT.709, full-range RGB on the RGB side and studio-range YCbCr on the
     // other; the processor applies whichever direction the formats imply.
@@ -133,9 +172,12 @@ bool VideoConverter::Convert(ID3D11Texture2D* src, UINT srcSubresource, const RE
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
-    stream.pInputSurface = input.get();
-    hr = context_->VideoProcessorBlt(processor_.get(), output.get(), 0, 1, &stream);
-    if (FAILED(hr)) RVM_LOG_SAMPLED(300, L"converter: blt failed 0x%08X", static_cast<unsigned>(hr));
+    stream.pInputSurface = input;
+    const HRESULT hr = context_->VideoProcessorBlt(processor_.get(), output, 0, 1, &stream);
+    if (FAILED(hr)) {
+        RVM_LOG_SAMPLED(300, L"converter: blt failed 0x%08X", static_cast<unsigned>(hr));
+        Gfx::Get().CheckDevice(hr);
+    }
     return SUCCEEDED(hr);
 }
 

@@ -49,7 +49,9 @@ capture textures, window rects and overlays all use physical pixels.
 
 The picker and region selector are Direct2D windows on the same device. The
 picker uses low-level mouse and keyboard hooks so the choosing click never
-reaches the target application.
+reaches the target application. The hooks only record what happened and wake
+the picker's loop; finding the window under the cursor happens there, because
+a low-level hook stalls every mouse event on the desktop until it returns.
 
 ## Threading
 
@@ -60,14 +62,16 @@ sequence landing inside a Direct2D `BeginDraw`/`EndDraw` still clobbers render
 target, viewport and shaders. `Gfx::deviceMutex` is held across each complete
 draw.
 
-Lock order is **capture state → renderer → device**, never reversed, and
-`Present` happens outside all three.
+Lock order is **capture state → renderer present → renderer → device**, never
+reversed.
 
 - `WindowCapture` runs the frame callback under its state lock, and `Stop()`
   takes the same lock, so a capture owner can't be destroyed mid-callback.
-- The renderer draws under its own lock plus the device lock, then releases
-  both before presenting, so a vsync wait blocks nothing else. `Present` and
-  `ResizeBuffers` are serialised by a small dedicated mutex.
+- The renderer's present lock covers one whole draw-and-present, or a resize.
+  Otherwise a UI redraw could present between a capture thread's draw and its
+  present, which would then show a back buffer nobody drew. The renderer and
+  device locks are released before presenting, so a vsync wait holds up only
+  that one mirror's other presents.
 - Direct2D windows draw only a snapshot taken in `PrepareDraw`, before the
   device lock. Nothing in `OnDraw` calls into a mirror, which keeps the order
   impossible to invert by accident.
@@ -80,8 +84,17 @@ Nested loops re-post `WM_QUIT` rather than swallowing it.
 
 Exceptions never cross a window procedure: `WndProcThunk` catches them, because
 a C++ exception can't unwind through the kernel callback that calls it. Graphics
-paths return failure rather than throw, so a lost device leaves a mirror that
-stops updating, not a crash.
+paths return failure rather than throw.
+
+**Device loss.** Every swapchain, capture pool, texture and encoder belongs to
+the one device, so a removed or reset device can't be patched up in place.
+Failing calls go through `Gfx::CheckDevice`, which recognises a lost device and
+fires a handler once. The app or client saves, starts a fresh copy of itself
+with `--after-device-loss <pid>`, and exits. The new process waits for the old
+one before taking the single-instance mutex. A device lost again within 30 s of
+such a restart is reported instead, so a broken driver can't cause a restart
+loop. If the device can't be created with video support, it is created without
+it: mirrors still work, streaming does not.
 
 ## Persistence
 
@@ -93,8 +106,16 @@ clamped to what the device can create.
 
 Window handles don't survive a restart, so each mirror records the source's
 executable, class and title. At launch it binds to the best live match: the
-executable must agree, and so must the class or the title (a long shared prefix
-counts, so retitled windows still match). Two mirrors never bind to one window.
+executable must agree, and so must the class or the title. Titles are compared
+without decorations like a leading "(3) " or a trailing unsaved-changes mark,
+and a long shared prefix counts, so retitled windows still match. A match on
+executable and class alone is taken only when exactly one window fits; with no
+executable recorded, the title must match.
+
+Mirrors made from one window share a **group** number, saved with them. A group
+binds to one window together, and different groups never share a window, so
+two mirrors of one app's two windows don't collapse onto the same one. Files
+from before groups get one derived from each mirror's recorded identity.
 
 Unmatched mirrors wait. The app re-checks at 2 s, 4 s, then every 8 s, and also
 the moment any window comes to the foreground, which is what reopening an app
@@ -117,10 +138,11 @@ carries everything.
   that queues them and wakes the encode thread. Nothing polls, so a frame costs
   only the encoder's own time (about 1 ms), independent of the system timer's
   15.6 ms tick.
-- **Latest frame wins.** Frames pass through four texture slots between capture
-  and encoder. A slot the encoder still holds is protected until its output
-  appears; if the encoder is behind, older frames are dropped, never queued. The
-  client does the same on its decode queue.
+- **Latest frame wins.** Frames pass through five texture slots between capture
+  and encoder. Each frame goes in as a tracked sample, so the encoder's own
+  release of the sample says when its slot is free again. If the encoder is
+  behind, older frames are dropped, never queued. The client does the same on
+  its decode queue.
 - **Frame-rate ceiling.** Frames beyond the configured rate are skipped on an
   even cadence. A frame a new viewer or keyframe is waiting for always passes,
   and if the source stops on a skipped frame, that frame is fetched again.
@@ -131,7 +153,16 @@ carries everything.
   server asks the mirror to repush its last frame when a client subscribes or
   needs a keyframe.
 - **Decode on the GPU.** The client decodes with DXVA into textures and draws
-  them with Direct2D; the canvas is composited, never copied.
+  them with Direct2D; the canvas is composited, never copied. A new frame
+  redraws the canvas only if one of that server's boxes is on it.
+- **True proportions.** A very thin strip can't be scaled to fit both the
+  256 px floor and the 4096 px ceiling in proportion, and 16-pixel padding
+  stretches a frame slightly. `net::EncodeSize` is shared by both ends: when
+  the listed crop explains a stream's size, the client draws it in the crop's
+  proportions, not the stream's.
+- **Video processor.** The converter caches its input and output views for the
+  few textures that come round every frame, and turns off the driver's
+  automatic processing so the conversion is a plain one.
 
 ### Encoder quirks
 
@@ -152,13 +183,19 @@ carries everything.
 ## Security
 
 Everything on the wire is AES-256-GCM under a key derived from the shared
-passphrase (PBKDF2, 100k rounds). Each session gets its own key from a
-two-random handshake; per-direction counters are the nonces, and a 64-packet
+passphrase (PBKDF2-SHA256, 600k rounds). Each session derives two keys from a
+two-random handshake, one per direction, so neither side's traffic can be
+reflected back at it. Per-direction counters are the nonces, and a 64-packet
 window rejects replays. Probes of the port see ciphertext and get no reply.
+This is protocol version 2, which doesn't interoperate with version 1.
 
-A HELLO only earns a pending handshake; a client takes a slot only after its
-first message under the session key, so a captured HELLO replayed later gets
-nowhere. Even a client holding the key is bounded:
+The WELCOME echoes the client's random, so a client ignores any WELCOME that
+isn't the answer to its own HELLO. A HELLO only earns a pending handshake; a
+client takes a slot only after its first message under the session key. A
+HELLO seen in the last two minutes is refused outright, and an older one
+replayed still can't produce a message under the new session key, so a
+captured HELLO gets nowhere. A datagram too short to hold a tag and a body is dropped before
+decryption. Even a client holding the key is bounded:
 
 | Limit | Value |
 | --- | --- |
@@ -171,6 +208,9 @@ nowhere. Even a client holding the key is bounded:
 
 Send and receive use separate cipher objects, since they run on different
 threads. Keys are stored DPAPI-protected to the Windows account on both ends.
+A saved key that can't be decrypted, because the file came from another
+account or PC, is kept as it is rather than erased on the next save, and the
+user is told to enter it again. Key fields are masked, with a *Show* box.
 
 ## Platform notes
 
@@ -187,10 +227,12 @@ threads. Keys are stored DPAPI-protected to the Windows account on both ends.
 ## Signing
 
 `tools/sign.ps1` keeps a self-signed code-signing certificate,
-`CN=Rear View Mirror`, in `Cert:\CurrentUser\My` (RSA 3072, ten years). CMake
-creates it once per build before anything links, then signs each executable
-after linking, with a timestamp when the network allows. Nothing is stored in
-the repository.
+`CN=Rear View Mirror`, in `Cert:\CurrentUser\My` (RSA 3072, ten years). Its
+private key can't be exported, and it is marked as not a certificate authority,
+so trusting it can't vouch for anything else. CMake creates it once per build
+before anything links, then signs each executable after linking, with a
+timestamp when the network allows. Without signtool, CMake turns signing off
+with a warning. Nothing is stored in the repository.
 
 | Command | Effect |
 | --- | --- |
@@ -204,7 +246,8 @@ the repository.
 packetisation with loss, GPU encode/decode round trips, encoder size limits, a
 full server-to-client loopback, reconnects, hostile-client limits, the
 frame-rate cap and a 120 fps end-to-end stream. It logs to `test.log` beside the
-app's logs.
+app's logs. Timing checks leave room for a busy machine; servers bind port 0
+so a running copy of the app doesn't get in the way.
 
 | Mode | Purpose |
 | --- | --- |

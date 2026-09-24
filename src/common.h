@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <random>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -50,6 +51,19 @@ constexpr UINT WM_RVM_HOVER         = WM_APP + 7;
 constexpr UINT WM_RVM_MIRROR_ORPHANED = WM_APP + 8;   // wParam: mirror id
 constexpr UINT WM_RVM_FOREGROUND_CHANGED = WM_APP + 9;
 constexpr UINT WM_RVM_STREAM_WANT_FRAME = WM_APP + 10;   // wParam: mirror id
+constexpr UINT WM_RVM_DEVICE_LOST = WM_APP + 11;
+
+// Relaunching after a lost graphics device: the new process is started with
+// this argument and the old one's process id, and waits for it to exit.
+constexpr wchar_t kRestartArg[] = L"--after-device-loss";
+
+// Starts a fresh copy of this executable that waits for this one to exit.
+// False if it could not be started.
+bool RelaunchSelf();
+
+// In a process started by RelaunchSelf: waits (bounded) for the previous one
+// to exit. True if this process is such a relaunch.
+bool WaitForPreviousInstance();
 
 constexpr wchar_t kAppName[]      = L"Rear View Mirror";
 constexpr wchar_t kAppWindowClass[] = L"RvmAppWindow";
@@ -94,7 +108,18 @@ std::wstring Plural(int n, const wchar_t* singular, const wchar_t* plural);
 RECT WorkAreaFor(HMONITOR monitor);
 RECT WorkAreaFor(HWND hwnd);
 
+// Shared, cached per size; never destroy the result.
 HICON LoadAppIcon(int size);
+
+// The effective DPI scale (1.0 = 96 DPI) of a monitor, for sizing a window
+// before it exists there.
+float DpiScaleFor(HMONITOR monitor);
+
+// Reads a dialog field holding a secret; the stack copy is wiped.
+std::wstring GetSecretText(HWND dlg, int id);
+
+// Shows or masks a password edit control's text (a "Show" checkbox).
+void RevealEditText(HWND edit, bool reveal);
 
 // Gives a framed window a dark or light title bar to match the Windows app
 // theme. Call after creation and again on WM_SETTINGCHANGE.

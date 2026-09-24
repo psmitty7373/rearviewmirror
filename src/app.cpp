@@ -86,8 +86,8 @@ void App::RemoveTrayIcon() {
         Shell_NotifyIconW(NIM_DELETE, &nid);
         trayAdded_ = false;
     }
-    if (iconLarge_) { DestroyIcon(iconLarge_); iconLarge_ = nullptr; }
-    if (iconSmall_) { DestroyIcon(iconSmall_); iconSmall_ = nullptr; }
+    iconLarge_ = nullptr;   // Shared icons; LoadAppIcon owns them.
+    iconSmall_ = nullptr;
 }
 
 void App::ShowBalloon(const std::wstring& text) {
@@ -162,7 +162,11 @@ void App::ShowTrayMenu() {
 
     if (cmd >= kMirrorMenuBase) {
         if (Mirror* m = FindMirror(cmd - kMirrorMenuBase)) {
-            if (!m->SetEnabled(!m->Enabled())) {
+            if (m->Enabled() && m->Hidden()) {
+                m->SetHidden(false);   // Listed as "(hidden)": the click shows it.
+                return;
+            }
+            if (!SetMirrorEnabled(*m, !m->Enabled())) {
                 ShowBalloon(L"Could not switch that mirror back on: its source "
                             L"window is not open.");
             }
@@ -175,7 +179,7 @@ void App::ShowTrayMenu() {
     case kTrayStreaming:    ShowStreamSettings(); break;
     case kTrayNewMirror:    RequestNewMirror(); break;
     case kTrayClickThrough: SetClickThroughAll(!allThrough); break;
-    case kTrayCloseAll:     CloseAll(); break;
+    case kTrayCloseAll:     ConfirmCloseAll(); break;
     case kTrayExit:         PostMessageW(hwnd_, WM_CLOSE, 0, 0); break;
     default: break;
     }
@@ -192,6 +196,13 @@ void App::ConfirmCloseMirror(uint32_t id) {
 }
 
 void App::NewMirror() {
+    // Picking and selecting run nested loops; a second request arriving
+    // meanwhile (hotkey, second launch, manager button) must not start a
+    // second, overlapping selection.
+    if (selecting_) return;
+    selecting_ = true;
+    struct Reset { bool& flag; ~Reset() { flag = false; } } reset{ selecting_ };
+
     HWND target = PickWindow();
     if (!target) return;
 
@@ -208,6 +219,7 @@ void App::NewMirror() {
     state.crop     = crop;
     state.baseSize = captureSize;
     FillIdentity(target, state);
+    state.group = GroupForWindow(target);
 
     auto mirror = std::make_unique<Mirror>(nextId_++);
     if (!mirror->Create(state, target, hwnd_)) {
@@ -263,6 +275,38 @@ void App::CloseMirror(uint32_t id) {
             manager_.Refresh();
             return;
         }
+    }
+}
+
+// The graphics device is gone, and every capture, swapchain and encoder with
+// it. Save, and let a fresh process pick up from the saved state on a new
+// device. A device that fails again straight after a relaunch is reported
+// rather than relaunched, so a broken GPU cannot cause a restart loop.
+void App::OnDeviceLost() {
+    if (deviceLostHandled_) return;
+    deviceLostHandled_ = true;
+    SaveNow();
+    const bool looping = relaunched_ && GetTickCount64() - startedMs_ < 30000;
+    if (looping || !RelaunchSelf()) {
+        MessageBoxW(nullptr,
+                    L"The graphics device stopped working and did not recover. "
+                    L"Your mirrors are saved; start Rear View Mirror again once the display "
+                    L"driver is working.",
+                    kAppName, MB_OK | MB_ICONERROR);
+    }
+    PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+}
+
+// Everything, including mirrors still waiting for their apps, is forgotten for
+// good, and the hotkey is system-wide: confirm first.
+void App::ConfirmCloseAll() {
+    const int count = static_cast<int>(mirrors_.size() + pending_.size());
+    if (count == 0) return;
+    const std::wstring question = L"Close and forget " + Plural(count, L"mirror", L"mirrors") +
+                                  L"? This cannot be undone.";
+    SetForegroundWindow(hwnd_);
+    if (MessageBoxW(hwnd_, question.c_str(), kAppName, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+        CloseAll();
     }
 }
 
@@ -377,21 +421,50 @@ void App::SaveNow() {
     SaveMirrorStates(states);
 }
 
-std::vector<HWND> App::BoundTargets() const {
+std::vector<HWND> App::TargetsOfOtherGroups(uint32_t group) const {
     std::vector<HWND> targets;
     for (const auto& m : mirrors_) {
-        if (m->Target() && IsWindow(m->Target())) targets.push_back(m->Target());
+        if (m->Group() != group && m->Target() && IsWindow(m->Target())) targets.push_back(m->Target());
     }
     return targets;
 }
 
+HWND App::TargetOfGroup(uint32_t group, const Mirror* except) const {
+    for (const auto& m : mirrors_) {
+        if (m.get() != except && m->Group() == group && !m->Orphaned() && m->Target() &&
+            IsWindow(m->Target())) {
+            return m->Target();
+        }
+    }
+    return nullptr;
+}
+
+// A second mirror of a window another mirror already shows joins its group;
+// otherwise a fresh, unused group number.
+uint32_t App::GroupForWindow(HWND target) const {
+    for (const auto& m : mirrors_) {
+        if (m->Target() == target && m->Group() != 0) return m->Group();
+    }
+    std::random_device random;
+    for (;;) {
+        const uint32_t g = random();
+        if (g != 0 && std::none_of(mirrors_.begin(), mirrors_.end(),
+                                   [&](const auto& m) { return m->Group() == g; })) {
+            return g;
+        }
+    }
+}
+
+bool App::SetMirrorEnabled(Mirror& mirror, bool on) {
+    return mirror.SetEnabled(on, TargetsOfOtherGroups(mirror.Group()),
+                             TargetOfGroup(mirror.Group(), &mirror));
+}
+
 int App::TryRebindOrphans() {
     int rebound = 0;
-    std::vector<HWND> bound = BoundTargets();
     for (auto& m : mirrors_) {
         if (!m->Orphaned()) continue;
-        if (m->TryRebind(bound)) {
-            bound.push_back(m->Target());
+        if (m->TryRebind(TargetsOfOtherGroups(m->Group()), TargetOfGroup(m->Group(), m.get()))) {
             ++rebound;
         }
     }
@@ -430,12 +503,13 @@ int App::RunRestorePass() {
 
 int App::TryRestorePending() {
     int restored = 0;
-    std::vector<HWND> bound = BoundTargets();
-
     for (auto it = pending_.begin(); it != pending_.end();) {
         HWND target = nullptr;
         if (it->enabled) {
-            target = FindMatchingWindow(*it, bound);
+            // A group member already showing the window takes it straight
+            // away; otherwise search, never among other groups' windows.
+            target = TargetOfGroup(it->group, nullptr);
+            if (!target) target = FindMatchingWindow(*it, TargetsOfOtherGroups(it->group));
             if (!target) {
                 ++it;
                 continue;
@@ -448,7 +522,6 @@ int App::TryRestorePending() {
             ++it;   // Keep it for the next attempt rather than forgetting it.
             continue;
         }
-        if (target) bound.push_back(target);
         AttachStream(*mirror);
         mirrors_.push_back(std::move(mirror));
         ++restored;
@@ -472,6 +545,15 @@ void App::RestoreSaved() {
 }
 
 LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
+    // Explorer restarting takes every notification icon with it; it
+    // broadcasts this once it is back, and the icon has to be added again.
+    static const UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    if (msg == taskbarCreated && taskbarCreated != 0) {
+        trayAdded_ = false;
+        CreateTrayIcon();
+        return 0;
+    }
+
     switch (msg) {
     case WM_RVM_NEW_MIRROR:
         NewMirror();
@@ -494,6 +576,10 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_RVM_FOREGROUND_CHANGED:
         if (AnythingWaiting()) RunRestorePass();
+        return 0;
+
+    case WM_RVM_DEVICE_LOST:
+        OnDeviceLost();
         return 0;
 
     case WM_RVM_STREAM_WANT_FRAME: {
@@ -544,7 +630,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         switch (static_cast<int>(wp)) {
         case kHotkeyNewMirror:    RequestNewMirror(); break;
         case kHotkeyClickThrough: SetClickThroughAll(!AllClickThrough()); break;
-        case kHotkeyCloseAll:     CloseAll(); break;
+        case kHotkeyCloseAll:     ConfirmCloseAll(); break;
         default: break;
         }
         return 0;
@@ -571,7 +657,9 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd_, msg, wp, lp);
 }
 
-int App::Run() {
+int App::Run(bool relaunched) {
+    relaunched_ = relaunched;
+    startedMs_ = GetTickCount64();
     if (!CaptureSupported()) {
         MessageBoxW(nullptr,
                     L"Windows Graphics Capture is not available on this system.\n"
@@ -586,9 +674,19 @@ int App::Run() {
     if (!CreateOwnerWindow()) return 1;
     CreateTrayIcon();
 
-    RegisterHotKey(hwnd_, kHotkeyNewMirror,    MOD_CONTROL | MOD_ALT, 'M');
-    RegisterHotKey(hwnd_, kHotkeyClickThrough, MOD_CONTROL | MOD_ALT, 'T');
-    RegisterHotKey(hwnd_, kHotkeyCloseAll,     MOD_CONTROL | MOD_ALT, 'X');
+    // Posted from whatever thread first sees the device go; handled below.
+    Gfx::Get().SetDeviceLostHandler([hwnd = hwnd_] { PostMessageW(hwnd, WM_RVM_DEVICE_LOST, 0, 0); });
+
+    const struct { int id; UINT key; const wchar_t* name; } hotkeys[] = {
+        { kHotkeyNewMirror, 'M', L"Ctrl+Alt+M" },
+        { kHotkeyClickThrough, 'T', L"Ctrl+Alt+T" },
+        { kHotkeyCloseAll, 'X', L"Ctrl+Alt+X" },
+    };
+    for (const auto& h : hotkeys) {
+        if (!RegisterHotKey(hwnd_, h.id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, h.key)) {
+            Log(L"app: hotkey %s is taken by another program (%lu)", h.name, GetLastError());
+        }
+    }
 
     foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                       &ForegroundChanged, 0, 0,
@@ -598,8 +696,13 @@ int App::Run() {
 
     streamSettings_ = LoadStreamSettings();
     if (!ApplyStreamSettings()) {
-        ShowBalloon(L"Streaming could not start on UDP port " +
-                    std::to_wstring(streamSettings_.port) + L". Is another program using it?");
+        if (streamSettings_.key.empty() && !streamSettings_.lockedKey.empty()) {
+            ShowBalloon(L"Streaming is off: the saved key could not be decrypted by this Windows "
+                        L"account. Open Streaming and enter it again.");
+        } else {
+            ShowBalloon(L"Streaming could not start on UDP port " +
+                        std::to_wstring(streamSettings_.port) + L". Is another program using it?");
+        }
     }
 
     MSG msg;

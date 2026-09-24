@@ -85,6 +85,46 @@ constexpr uint64_t kNudgeAfterMs = 40;
 
 }  // namespace
 
+// Told by a tracked sample when every other reference to it has gone: the
+// encoder has finished with the texture inside. Runs its function once.
+class ReleaseCallback final : public IMFAsyncCallback {
+public:
+    explicit ReleaseCallback(std::function<void()> fn) : fn_(std::move(fn)) {}
+
+    void Fire() {
+        if (!fired_.exchange(true) && fn_) fn_();
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback)) {
+            *out = static_cast<IMFAsyncCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG n = --refs_;
+        if (n == 0) delete this;
+        return n;
+    }
+    STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
+    STDMETHODIMP Invoke(IMFAsyncResult*) override {
+        Fire();
+        return S_OK;
+    }
+
+private:
+    ~ReleaseCallback() { Fire(); }   // Whatever happens, report exactly once.
+
+    std::atomic<ULONG> refs_{ 1 };
+    std::atomic<bool>  fired_{ false };
+    std::function<void()> fn_;
+};
+
 // Receives an asynchronous encoder's events on a Media Foundation thread,
 // queues them, and signals. It is reference counted like any COM object: the
 // encoder holds one reference and a pending BeginGetEvent holds another, so it
@@ -297,10 +337,14 @@ bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps) {
         if (TryInit(activate.get())) {
             // Hardware encoders ask for their first input a moment after
             // starting; wait for that so the caller's first frame is taken.
+            // The clock is read once per pass: reading it twice could see the
+            // deadline pass in between and wait a wrapped, near-infinite time.
             std::vector<EncodedFrame> none;
             const ULONGLONG deadline = GetTickCount64() + 200;
-            while (!WantsInput() && Service(none) && GetTickCount64() < deadline) {
-                WaitForEvents(static_cast<DWORD>(deadline - GetTickCount64()));
+            while (!WantsInput() && Service(none)) {
+                const ULONGLONG now = GetTickCount64();
+                if (now >= deadline) break;
+                WaitForEvents(static_cast<DWORD>(deadline - now));
             }
             Log(L"encoder: '%s' ready at %ux%u, %u fps, %u kbps%s", name_.c_str(), width_, height_,
                 fps_, bitrate_ / 1000, WantsInput() ? L"" : L" (no input request yet)");
@@ -444,11 +488,11 @@ bool H264Encoder::NeedsNudge(uint64_t nowMs) const {
     return mft_ && awaitingOutput_ && repeats_ < kMaxNudges && nowMs - lastFedMs_ >= kNudgeAfterMs;
 }
 
-bool H264Encoder::Repeat(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out) {
+bool H264Encoder::Repeat(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released) {
     ++repeats_;
     const bool wasAwaiting = awaitingOutput_;
     const size_t before = out.size();
-    const bool fed = Encode(nv12, out);
+    const bool fed = Encode(nv12, out, std::move(released));
     // A repeat is filler: it must not itself be waited on once the real
     // frame it was pushing out has appeared.
     if (out.size() == before) awaitingOutput_ = wasAwaiting;
@@ -583,9 +627,14 @@ bool H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
     return true;
 }
 
-bool H264Encoder::Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out) {
-    if (!mft_ || !nv12 || failed_) return false;
-    if (!Service(out) || inputsWanted_ <= 0) return false;
+bool H264Encoder::Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released) {
+    // Until the tracked sample exists, `released` is ours to call.
+    const auto notTaken = [&] {
+        if (released) released();
+        return false;
+    };
+    if (!mft_ || !nv12 || failed_) return notTaken();
+    if (!Service(out) || inputsWanted_ <= 0) return notTaken();
 
     if (forceKeyframe_.exchange(false, std::memory_order_relaxed) && codec_) {
         VARIANT v;
@@ -595,12 +644,22 @@ bool H264Encoder::Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out) 
         codec_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
     }
 
+    // A tracked sample reports when the encoder has let go of it, which is
+    // the only reliable sign that it has finished reading the texture.
     winrt::com_ptr<IMFMediaBuffer> buffer;
-    winrt::com_ptr<IMFSample> sample;
+    winrt::com_ptr<IMFTrackedSample> tracked;
     if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12, 0, FALSE, buffer.put())) ||
-        FAILED(MFCreateSample(sample.put()))) {
+        FAILED(MFCreateTrackedSample(tracked.put()))) {
+        return notTaken();
+    }
+    auto* callback = new ReleaseCallback(std::move(released));
+    if (FAILED(tracked->SetAllocator(callback, nullptr))) {
+        callback->Fire();      // Never tracked, so never reported: report it now.
+        callback->Release();
         return false;
     }
+    callback->Release();       // The sample holds it until it reports.
+    auto sample = tracked.as<IMFSample>();
     sample->AddBuffer(buffer.get());
     const LONGLONG duration = FrameDuration(fps_);
     sample->SetSampleTime(frameIndex_ * duration);

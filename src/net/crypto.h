@@ -5,21 +5,32 @@
 
 namespace rvm::net {
 
-bool RandomBytes(void* out, size_t len);
+// Cryptographic randomness. The system generator does not fail in practice;
+// if it ever does, the process stops rather than carry on with weak values.
+void RandomBytes(void* out, size_t len);
 
-// The shared secret both ends type. PBKDF2-SHA256 with a fixed application
-// salt: what matters is that a probe of the port learns nothing, not that the
-// passphrase resists an offline attack from someone who already has the key.
+// The shared secret both ends type, stretched with PBKDF2-SHA256. A captured
+// handshake lets an observer test guesses offline, so the work factor is high
+// and the app generates long random keys; a short typed passphrase would be
+// the weak point. Any failure yields an unguessable random key, never a
+// known one, so a broken crypto provider fails closed.
+constexpr unsigned kPbkdf2Iterations = 600000;
 Key DeriveMasterKey(const std::wstring& passphrase);
 
-// Per-session key from the two handshake randoms, so a counter is never reused
-// under one key across sessions.
+// Per-session, per-direction key from the two handshake randoms, so a
+// counter is never reused under one key and a datagram can never be
+// reflected back to its sender. `direction` is kClientToServer or
+// kServerToClient.
+enum class Direction { kClientToServer, kServerToClient };
 Key DeriveSessionKey(const Key& master, const uint8_t clientRandom[kRandomBytes],
-                     const uint8_t serverRandom[kRandomBytes]);
+                     const uint8_t serverRandom[kRandomBytes], Direction direction);
 
 // AES-256-GCM through the system provider.
 class Cipher {
 public:
+    Cipher() = default;
+    Cipher(const Cipher&) = delete;             // Owns CNG handles.
+    Cipher& operator=(const Cipher&) = delete;
     ~Cipher();
     bool Init(const Key& key);
 

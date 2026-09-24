@@ -36,11 +36,12 @@ bool D2DOverlay::Create(const wchar_t* className, RECT bounds, bool clickThrough
 }
 
 bool D2DOverlay::CreateStyled(const wchar_t* className, const wchar_t* title, RECT bounds,
-                              DWORD style, DWORD exStyle) {
+                              DWORD style, DWORD exStyle, UINT classStyle) {
     auto& g = Gfx::Get();
 
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
+    wc.style         = classStyle;
     wc.lpfnWndProc   = &WndProcThunk<D2DOverlay, &D2DOverlay::OnMessage>;
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
@@ -59,11 +60,22 @@ bool D2DOverlay::CreateStyled(const wchar_t* className, const wchar_t* title, RE
     if (!comp_.Create(hwnd_, static_cast<UINT>((std::max)(RectW(client), 1)),
                       static_cast<UINT>((std::max)(RectH(client), 1))) ||
         FAILED(g.d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, dc_.put())) ||
-        FAILED(g.dwrite->CreateTextFormat(L"Segoe UI Variable Text", nullptr,
-                                          DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-                                          DWRITE_FONT_STRETCH_NORMAL, kFontSize, L"en-us",
-                                          font_.put()))) {
+        !UpdateChipScale()) {
         Destroy();
+        return false;
+    }
+    return true;
+}
+
+// Chips (hints, size read-outs, name tags) follow the window's DPI like
+// everything else drawn in it.
+bool D2DOverlay::UpdateChipScale() {
+    chipScale_ = hwnd_ ? static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f : 1.0f;
+    font_ = nullptr;
+    if (FAILED(Gfx::Get().dwrite->CreateTextFormat(L"Segoe UI Variable Text", nullptr,
+                                                  DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                                                  DWRITE_FONT_STRETCH_NORMAL, kFontSize * chipScale_,
+                                                  L"en-us", font_.put()))) {
         return false;
     }
     font_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -152,9 +164,12 @@ void D2DOverlay::Render() {
             const HRESULT hr = dc_->EndDraw();
 
             if (hr == D2DERR_RECREATE_TARGET) {
+                // Either the target alone is stale, or the whole device went.
+                Gfx::Get().CheckDevice(hr);
                 DropTarget();
                 continue;
             }
+            Gfx::Get().CheckDevice(hr);
             break;
         }
     }
@@ -178,8 +193,9 @@ D2D1_SIZE_F D2DOverlay::DrawChip(ID2D1DeviceContext* dc, const std::wstring& tex
     if (text.empty() || !brush_) return { 0.0f, 0.0f };
 
     const D2D1_SIZE_F ts = MeasureText(text);
-    const float w = ts.width + kChipPadX * 2.0f;
-    const float h = ts.height + kChipPadY * 2.0f;
+    const float padX = kChipPadX * chipScale_, padY = kChipPadY * chipScale_;
+    const float w = ts.width + padX * 2.0f;
+    const float h = ts.height + padY * 2.0f;
 
     if (alignX == 1) x -= w * 0.5f;
     else if (alignX == 2) x -= w;
@@ -192,10 +208,10 @@ D2D1_SIZE_F D2DOverlay::DrawChip(ID2D1DeviceContext* dc, const std::wstring& tex
     dc->FillRoundedRectangle(rr, brush_.get());
 
     brush_->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.14f));
-    dc->DrawRoundedRectangle(rr, brush_.get(), 1.0f);
+    dc->DrawRoundedRectangle(rr, brush_.get(), chipScale_);
 
     brush_->SetColor(D2D1::ColorF(0.94f, 0.95f, 0.97f, 1.0f));
-    const D2D1_RECT_F textRect{ x + kChipPadX, y + kChipPadY, x + w, y + h };
+    const D2D1_RECT_F textRect{ x + padX, y + padY, x + w, y + h };
     dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), font_.get(), textRect,
                   brush_.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 

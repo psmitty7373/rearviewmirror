@@ -12,8 +12,10 @@
 #define IDC_STREAM_FPS      208
 #define IDC_STREAM_TOGGLE   209
 #define IDC_STREAM_HELP     210
+#define IDC_STREAM_SHOWKEY  211
 
 #define IDD_CONNECT         300
 #define IDC_CONNECT_HOST    301
 #define IDC_CONNECT_PORT    302
 #define IDC_CONNECT_KEY     303
+#define IDC_CONNECT_SHOWKEY 304

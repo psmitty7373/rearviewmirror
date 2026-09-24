@@ -62,7 +62,8 @@ function Get-SigningCert {
             -KeyAlgorithm RSA -KeyLength 3072 `
             -HashAlgorithm SHA256 `
             -KeyUsage DigitalSignature `
-            -KeyExportPolicy Exportable `
+            -KeyExportPolicy NonExportable `
+            -TextExtension @('2.5.29.19={critical}{text}ca=0') `
             -CertStoreLocation Cert:\CurrentUser\My `
             -NotAfter (Get-Date).AddYears(10)
     } finally {
@@ -113,8 +114,15 @@ $file = (Resolve-Path $Path).Path
 # A timestamp keeps the signature valid after the certificate expires, but
 # needs the network; sign without one rather than fail the build offline.
 $common = @('sign', '/sha1', $cert.Thumbprint, '/fd', 'SHA256', '/q')
-& $signtool @common /tr http://timestamp.digicert.com /td SHA256 $file 2>$null
-if ($LASTEXITCODE -ne 0) {
+# Under 'Stop', Windows PowerShell turns a native tool's redirected stderr
+# into a terminating error, which would end the script before the fallback.
+$stamped = $false
+& {
+    $ErrorActionPreference = 'Continue'
+    & $signtool @common /tr http://timestamp.digicert.com /td SHA256 $file 2>$null | Out-Null
+}
+if ($LASTEXITCODE -eq 0) { $stamped = $true }
+if (-not $stamped) {
     & $signtool @common $file
     if ($LASTEXITCODE -ne 0) { throw "signtool failed on $file" }
     Write-Host "Signed (no timestamp): $file"

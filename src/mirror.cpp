@@ -205,7 +205,7 @@ void Mirror::UpdateVisibility() {
     }
 }
 
-bool Mirror::SetEnabled(bool enabled) {
+bool Mirror::SetEnabled(bool enabled, const std::vector<HWND>& exclude, HWND preferred) {
     if (!hwnd_) return false;
     if (state_.enabled == enabled) return true;
 
@@ -218,9 +218,10 @@ bool Mirror::SetEnabled(bool enabled) {
         return true;
     }
 
-    // The source may have closed or restarted while we were off.
+    // The source may have closed or restarted while we were off. Another
+    // mirror of the same window already knows where it is now.
     if (!IsWindow(target_)) {
-        HWND found = FindMatchingWindow(state_);
+        HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude);
         if (!found) return false;
         target_ = found;
         if (state_.baseSize.cx <= 0 || state_.baseSize.cy <= 0) {
@@ -250,10 +251,10 @@ void Mirror::Orphan() {
     UpdateVisibility();
 }
 
-bool Mirror::TryRebind(const std::vector<HWND>& exclude) {
+bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred) {
     if (!hwnd_ || !orphaned_) return false;
 
-    HWND found = FindMatchingWindow(state_, exclude);
+    HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude);
     if (!found) return false;
 
     target_ = found;
@@ -410,10 +411,11 @@ LRESULT Mirror::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         RECT r{};
         GetWindowRect(hwnd_, &r);
-        const bool left   = pt.x < r.left + kResizeBorder;
-        const bool right  = pt.x >= r.right - kResizeBorder;
-        const bool top    = pt.y < r.top + kResizeBorder;
-        const bool bottom = pt.y >= r.bottom - kResizeBorder;
+        const int border = MulDiv(kResizeBorder, static_cast<int>(GetDpiForWindow(hwnd_)), 96);
+        const bool left   = pt.x < r.left + border;
+        const bool right  = pt.x >= r.right - border;
+        const bool top    = pt.y < r.top + border;
+        const bool bottom = pt.y >= r.bottom - border;
         if (top && left)     return HTTOPLEFT;
         if (top && right)    return HTTOPRIGHT;
         if (bottom && left)  return HTBOTTOMLEFT;

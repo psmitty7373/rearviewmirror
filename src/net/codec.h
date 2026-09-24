@@ -58,7 +58,13 @@ public:
     // Hands one frame to the encoder, if it wants input; the encoded result
     // arrives later through Service(). Anything already finished is
     // collected into `out`. False if the frame was not taken.
-    bool Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out);
+    //
+    // `released` runs exactly once per call, whether or not the frame was
+    // taken: at once if it was not, otherwise when the encoder lets go of the
+    // texture, which can be after this returns and on another thread. Until
+    // then the texture must not be written.
+    using Released = std::function<void()>;
+    bool Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released = {});
 
     // For tests and benchmarks: waits for the encoder to want input, feeds
     // it, and waits until at least one frame comes out, up to `timeoutMs`.
@@ -72,7 +78,7 @@ public:
     // the last real frame has produced nothing for a while: the caller should
     // feed the same picture again with Repeat() to push it out.
     bool NeedsNudge(uint64_t nowMs) const;
-    bool Repeat(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out);
+    bool Repeat(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released = {});
 
     const std::wstring& Name() const { return name_; }
 

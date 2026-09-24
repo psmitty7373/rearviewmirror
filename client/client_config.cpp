@@ -47,8 +47,15 @@ bool ReadServer(const std::wstring& section, const std::wstring& path, ConnectSe
     s.host = OneLine(ReadStr(section, L"Host", path));
     if (s.host.empty()) return false;
     s.port = static_cast<uint16_t>(ClampI(ReadInt(section, L"Port", net::kDefaultPort, path), 1, 65535));
+    const std::vector<uint8_t> blob = net::FromHex(ReadStr(section, L"KeyBlob", path));
     std::wstring secret;
-    if (net::UnprotectSecret(net::FromHex(ReadStr(section, L"KeyBlob", path)), secret)) s.key = secret;
+    if (net::UnprotectSecret(blob, secret)) {
+        s.key = std::move(secret);
+    } else if (!blob.empty()) {
+        s.lockedKey = blob;
+        Log(L"client: the saved key for %s could not be decrypted by this Windows account",
+            s.host.c_str());
+    }
     return true;
 }
 
@@ -135,7 +142,7 @@ bool SaveClientConfig(const ClientConfig& config) {
 
     for (size_t i = 0; i < servers; ++i) {
         const ConnectSettings& s = config.servers[i];
-        std::vector<uint8_t> blob;
+        std::vector<uint8_t> blob = s.lockedKey;
         if (!s.key.empty() && !net::ProtectSecret(s.key, blob)) return false;
         text += L"\r\n[Server" + std::to_wstring(i + 1) + L"]\r\n";
         Line(text, L"Host", OneLine(s.host));
