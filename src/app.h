@@ -1,7 +1,7 @@
 #pragma once
 #include "manager.h"
 #include "mirror.h"
-#include "stream_server.h"
+#include "streaming.h"
 
 namespace rvm {
 
@@ -17,11 +17,13 @@ public:
     void    CloseMirror(uint32_t id);
     void    RequestNewMirror();
 
-    // The streaming server, for the manager's header button, which opens the
-    // settings dialog where it is started and stopped.
-    bool   StreamingOn() const { return server_.Running(); }
-    size_t StreamClients() const { return server_.ClientCount(); }
-    void   ShowStreamSettings();
+    // Streaming, for the manager's header button, which opens the settings
+    // dialog where it is started and stopped. A build without streaming has
+    // no button.
+    bool   StreamingAvailable() const { return Streaming::Available(); }
+    bool   StreamingOn() const { return streaming_.Running(); }
+    size_t StreamClients() const { return streaming_.Clients(); }
+    void   ShowStreamSettings() { streaming_.ShowSettings(); }
 
     // Switching a mirror on binds it under the same rules as a restore.
     bool   SetMirrorEnabled(Mirror& mirror, bool on);
@@ -59,12 +61,9 @@ private:
     uint32_t GroupForWindow(HWND target) const;
     uint32_t NewGroup() const;
 
-    bool ApplyStreamSettings();
-    void PushMirrorList();
-    void AttachStream(Mirror& mirror);
-
-    StreamServer   server_;
-    StreamSettings streamSettings_;
+    // Declared before the mirrors, so it is destroyed after them: each mirror
+    // hands its frames to it.
+    Streaming streaming_;
 
     std::vector<std::unique_ptr<Mirror>> mirrors_;
 

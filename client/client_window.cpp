@@ -38,6 +38,15 @@ enum TileMenuId : UINT {
     kMenuPopOut = 1, kMenuReturn, kMenuClickThrough, kMenuFront, kMenuBack, kMenuFit, kMenuRemove,
 };
 
+// "0.4 ms" on a LAN, "38 ms" over the internet: a decimal only where it says
+// something.
+std::wstring FormatRtt(int64_t us) {
+    wchar_t text[32]{};
+    if (us < 10'000) _snwprintf_s(text, _TRUNCATE, L"%.1f ms", us / 1000.0);
+    else              _snwprintf_s(text, _TRUNCATE, L"%lld ms", static_cast<long long>((us + 500) / 1000));
+    return text;
+}
+
 bool Contains(const D2D1_RECT_F& r, POINT p) {
     const float x = static_cast<float>(p.x), y = static_cast<float>(p.y);
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
@@ -389,8 +398,10 @@ const RemoteMirror* ClientWindow::MirrorFor(TileKey key) const {
 }
 
 bool ClientWindow::ShownSize(TileKey key, UINT& w, UINT& h) const {
-    const StreamView* v = ViewFor(key);
-    const RemoteMirror* m = MirrorFor(key);
+    return ShownSizeOf(ViewFor(key), MirrorFor(key), w, h);
+}
+
+bool ClientWindow::ShownSizeOf(const StreamView* v, const RemoteMirror* m, UINT& w, UINT& h) {
     const bool listed = m && m->width > 0 && m->height > 0;
     if (!v || v->frames == 0 || v->width == 0 || v->height == 0) {
         if (!listed) return false;
@@ -404,10 +415,19 @@ bool ClientWindow::ShownSize(TileKey key, UINT& w, UINT& h) const {
 
     // Only when the listed crop explains this stream's size: a list from
     // before a resize must not bend the new picture.
-    for (const bool align16 : { false, true }) {
-        UINT ew = 0, eh = 0;
-        net::EncodeSize(m->width, m->height, align16, ew, eh);
-        if (ew != w || eh != h) continue;
+    // Every size the server might have chosen for this crop: each floor it
+    // steps through for fussy encoders, with and without alignment.
+    const auto explains = [&] {
+        for (const UINT floor : net::kEncodeFloors) {
+            for (const bool align16 : { false, true }) {
+                UINT ew = 0, eh = 0;
+                net::EncodeSize(m->width, m->height, align16, ew, eh, floor);
+                if (ew == w && eh == h) return true;
+            }
+        }
+        return false;
+    };
+    if (explains()) {
         // Keep the stream's resolution along one side and shorten the other.
         const double crop = static_cast<double>(m->width) / m->height;
         if (crop >= static_cast<double>(w) / h) {
@@ -415,7 +435,6 @@ bool ClientWindow::ShownSize(TileKey key, UINT& w, UINT& h) const {
         } else {
             w = (std::max)(1u, static_cast<UINT>(std::lround(h * crop)));
         }
-        break;
     }
     return true;
 }
@@ -461,15 +480,29 @@ void ClientWindow::Dock(Tile& tile) {
     SaveConfig();
 }
 
+// Straight from the connection, not the canvas's snapshot: that is only
+// refreshed when the canvas redraws, which a frame shown only in pop-outs,
+// or a minimised window, does not cause.
 void ClientWindow::FeedPopouts(uint32_t serverTag) {
+    Server* server = FindServer(serverTag);
+    if (!server) return;
+    std::vector<StreamView> views;
+    bool fetched = false;
     for (auto& t : tiles_) {
         if (!t.popout || t.key.server != serverTag) continue;
-        if (const StreamView* v = ViewFor(t.key)) {
-            UINT w = v->width, h = v->height;
-            ShownSize(t.key, w, h);
-            t.popout->SetFrame(v->texture, w, h, v->frames);
-            t.popout->Render();
+        if (!fetched) {
+            views = server->client->Views();
+            fetched = true;
         }
+        const auto v = std::find_if(views.begin(), views.end(),
+                                    [&](const StreamView& view) { return view.id == t.key.id; });
+        if (v == views.end()) continue;
+        UINT w = v->width, h = v->height;
+        ShownSizeOf(&*v, MirrorFor(t.key), w, h);
+        t.popout->SetFrame(v->texture, w, h, v->frames);
+        const wchar_t* stalled = StreamStateText(v->state);
+        t.popout->SetWaitingText(stalled ? stalled : L"Waiting for the first frame…");
+        t.popout->Render();
     }
 }
 
@@ -849,7 +882,9 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         if (redraw) Render();
-        if (event == ClientEvent::FrameReady) FeedPopouts(server->tag);
+        // Pop-outs follow every event: frames, and the server's word on why a
+        // stream is not coming.
+        FeedPopouts(server->tag);
         return 0;
     }
 
@@ -1124,7 +1159,7 @@ void ClientWindow::PrepareDraw() {
         v.label     = s->label;
         v.status    = s->client->Status();
         v.connected = s->client->Connected();
-        v.rttMs     = s->client->RttMs();
+        v.rttUs     = s->client->RttUs();
         v.mirrors   = s->client->Mirrors();
         v.views     = s->client->Views();
         views_.push_back(std::move(v));
@@ -1212,8 +1247,10 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
             }
         } else {
             const bool connected = sv && sv->connected;
-            DrawLabel(dc, connected ? L"Waiting for the first frame…" : L"Reconnecting…", cell,
-                      bodyFont_.get(), kDim, DWRITE_TEXT_ALIGNMENT_CENTER);
+            const wchar_t* stalled = view ? StreamStateText(view->state) : nullptr;
+            DrawLabel(dc, !connected ? L"Reconnecting…"
+                                     : stalled ? stalled : L"Waiting for the first frame…",
+                      cell, bodyFont_.get(), kDim, DWRITE_TEXT_ALIGNMENT_CENTER);
         }
     }
 
@@ -1303,7 +1340,7 @@ void ClientWindow::OnDraw(ID2D1DeviceContext* dc) {
                 std::wstring status = sv->status;
                 if (sv->connected) {
                     status = L"Connected";
-                    if (sv->rttMs >= 0) status += L"   ·   " + std::to_wstring(sv->rttMs) + L" ms";
+                    if (sv->rttUs >= 0) status += L"   ·   " + FormatRtt(sv->rttUs);
                     if (sv->mirrors.empty()) status += L"   ·   no mirrors";
                 }
                 DrawLabel(dc, Ellipsize(status, 40),

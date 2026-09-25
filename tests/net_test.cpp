@@ -2,6 +2,7 @@
 // packetisation with loss and recovery, and a full GPU encode -> decode round
 // trip through Media Foundation.
 #include "capture.h"
+#include "crash.h"
 #include "net/channel.h"
 #include "net/codec.h"
 #include "net/converter.h"
@@ -367,6 +368,29 @@ static void TestEncoderSizes() {
     Check(allInit, "every size at or above the 256 px floor can be encoded");
 }
 
+// The size rule shared by server and client. A small crop is scaled up evenly
+// to the floor, and to each larger floor the server steps through when an
+// encoder refuses it; large crops are left alone by the floors.
+static void TestEncodeSizeRule() {
+    printf("encode size rule\n");
+    UINT w = 0, h = 0;
+    EncodeSize(70, 93, false, w, h);
+    Check((std::min)(w, h) == 256, "a 70x93 crop is scaled up to the 256 px floor");
+    bool shapesKept = true, floorsMet = true;
+    for (const UINT floor : kEncodeFloors) {
+        EncodeSize(70, 93, true, w, h, floor);
+        floorsMet = floorsMet && (std::min)(w, h) >= floor && (w % 16) == 0 && (h % 16) == 0;
+        const double aspect = static_cast<double>(w) / h;
+        shapesKept = shapesKept && std::abs(aspect - 70.0 / 93.0) < 0.05;
+    }
+    Check(floorsMet, "each floor is met, at 16-pixel alignment");
+    Check(shapesKept, "raising the floor keeps the crop's shape");
+    UINT bw = 0, bh = 0;
+    EncodeSize(1920, 1080, false, w, h);
+    EncodeSize(1920, 1080, false, bw, bh, 1024);
+    Check(w == bw && h == bh, "a crop larger than every floor is untouched by them");
+}
+
 // Every choice in the Streaming dialog's encoder preset list starts an
 // encoder that produces frames. `--presets` measures what each one costs.
 static void TestEncoderPresets() {
@@ -704,8 +728,12 @@ static void TestLoopback() {
         }
     }
 
-    Check(WaitFor([&] { return client.RttMs() >= 0; }, 3000), "ping/pong yields a round-trip time");
-    printf("  loopback RTT %d ms\n", client.RttMs());
+    Check(WaitFor([&] { return client.RttUs() >= 0; }, 3000), "ping/pong yields a round-trip time");
+    printf("  loopback RTT %.3f ms\n", client.RttUs() / 1000.0);
+    // Loopback is a fraction of a millisecond: a real measurement is neither
+    // zero (the old tick-count timing) nor anywhere near a second.
+    Check(client.RttUs() > 0 && client.RttUs() < 100'000,
+          "the round trip is measured below a millisecond, not rounded to zero");
 
     // A still source: capture delivers nothing, so the server must be able to
     // ask for the mirror's last frame when a client subscribes.
@@ -1085,6 +1113,94 @@ static void TestHostileClients() {
 
 // A 60 fps source against a 10 fps cap: about 10 frames a second get through,
 // evenly, and when the source stops, its last picture is still delivered.
+// GeForce cards run only a few encoder sessions at once (twelve on an RTX
+// 4080's current driver, three on a GT 730's). With more mirrors watched than that, every
+// stream must either deliver frames or tell the viewer the encoder is full,
+// never leave it waiting in silence; and when a working stream closes, a
+// waiting one takes its session.
+static void TestEncoderSessionLimit() {
+    printf("encoder session limit\n");
+    if (HardwareEncoderName().empty()) {
+        printf("  SKIP  no hardware H.264 encoder on this machine\n");
+        return;
+    }
+    auto& g = Gfx::Get();
+    constexpr uint32_t kStreams = 16;
+
+    D3D11_TEXTURE2D_DESC bd{};
+    bd.Width = 320; bd.Height = 240; bd.MipLevels = 1; bd.ArraySize = 1;
+    bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; bd.SampleDesc = { 1, 0 };
+    bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    winrt::com_ptr<ID3D11Texture2D> source;
+    g.d3d->CreateTexture2D(&bd, nullptr, source.put());
+    const RECT crop{ 0, 0, 320, 240 };
+
+    StreamSettings settings;
+    settings.enabled = true;
+    settings.port = 0;
+    settings.key = L"session-limit-key";
+    settings.bitrateKbps = 1000;
+    settings.fps = 30;
+
+    StreamServer server;
+    server.SetFrameRequester([&](uint32_t id) {
+        std::lock_guard<std::mutex> device(g.deviceMutex);
+        server.SubmitFrame(id, source.get(), crop);
+    });
+    Check(server.Start(settings), "server starts");
+    std::vector<MirrorInfo> list;
+    for (uint32_t id = 1; id <= kStreams; ++id) list.push_back({ id, L"Mirror", 320, 240 });
+    server.SetMirrorList(list);
+
+    StreamClient client;
+    client.Connect(L"127.0.0.1", server.Port(), L"session-limit-key", nullptr);
+    Check(WaitFor([&] { return client.Connected() && client.Mirrors().size() == kStreams; }, 5000),
+          "client connects and lists every mirror");
+    for (uint32_t id = 1; id <= kStreams; ++id) client.SetSubscribed(id, true);
+
+    // Feeds every stream for a while, as live sources would.
+    auto feedFor = [&](int ms) {
+        const ULONGLONG until = GetTickCount64() + ms;
+        while (GetTickCount64() < until) {
+            {
+                std::lock_guard<std::mutex> device(g.deviceMutex);
+                for (uint32_t id = 1; id <= kStreams; ++id) server.SubmitFrame(id, source.get(), crop);
+            }
+            Sleep(40);
+        }
+    };
+    feedFor(6000);
+
+    std::vector<uint32_t> working, full;
+    int silent = 0;
+    for (const auto& v : client.Views()) {
+        if (v.frames > 0) working.push_back(v.id);
+        else if (v.state == static_cast<uint8_t>(StreamState::EncoderFull)) full.push_back(v.id);
+        else ++silent;
+    }
+    printf("  %u streams: %zu encoding, %zu told the encoder is full, %d silent\n", kStreams,
+           working.size(), full.size(), silent);
+    Check(silent == 0, "every stream delivers frames or says the encoder is full");
+    if (full.empty()) {
+        printf("  (this GPU ran all %u at once; no limit to test beyond)\n", kStreams);
+    } else if (!working.empty()) {
+        // Closing one working stream frees its session for a waiting one.
+        client.SetSubscribed(working.front(), false);
+        bool started = false;
+        const ULONGLONG until = GetTickCount64() + 6000;
+        while (!started && GetTickCount64() < until) {
+            feedFor(200);
+            for (const auto& v : client.Views()) {
+                if (v.frames > 0 && std::find(full.begin(), full.end(), v.id) != full.end()) started = true;
+            }
+        }
+        Check(started, "a freed encoder session goes to a waiting stream");
+    }
+
+    client.Disconnect();
+    server.Stop();
+}
+
 static void TestFrameRateCap() {
     printf("frame-rate cap\n");
     if (HardwareEncoderName().empty()) {
@@ -1480,10 +1596,10 @@ static int LiveProbe() {
         Sleep(500);
         auto views = client.Views();
         const uint64_t frames = views.empty() ? 0 : views[0].frames;
-        printf("  t=%4dms  frames=%llu  size=%ux%u  rtt=%d  status=%ls\n", (i + 1) * 500,
+        printf("  t=%4dms  frames=%llu  size=%ux%u  rtt=%.2fms  status=%ls\n", (i + 1) * 500,
                static_cast<unsigned long long>(frames),
                views.empty() ? 0u : views[0].width, views.empty() ? 0u : views[0].height,
-               client.RttMs(), client.Status().c_str());
+               client.RttUs() / 1000.0, client.Status().c_str());
         if (frames >= 10) break;
     }
     client.Disconnect();
@@ -1491,6 +1607,18 @@ static int LiveProbe() {
 }
 
 int main(int argc, char** argv) {
+    // `--crash-probe`: crashes on purpose, to check the crash report. No
+    // Windows error dialog; the report lands in crashprobe.log and a dump.
+    if (argc > 1 && strcmp(argv[1], "--crash-probe") == 0) {
+        SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
+        LogOpen(L"crashprobe");
+        InstallCrashHandler(L"crashprobe");
+        std::thread([] {
+            volatile int* nowhere = nullptr;
+            *nowhere = 42;
+        }).join();
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "--presets") == 0) {
         winrt::init_apartment(winrt::apartment_type::single_threaded);
         LogOpen(L"test");
@@ -1536,6 +1664,7 @@ int main(int argc, char** argv) {
         Gfx::Get().Init();
         TestCodec();
         TestEncoderSizes();
+        TestEncodeSizeRule();
         TestRateControl();
         TestEncoderPresets();
         TestConverterSources();
@@ -1543,6 +1672,7 @@ int main(int argc, char** argv) {
         TestLoopback();
         TestWelcomeBinding();
         TestHostileClients();
+        TestEncoderSessionLimit();
         TestFrameRateCap();
         TestHighFrameRate();
     } catch (...) {

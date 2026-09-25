@@ -61,7 +61,7 @@ private:
         std::wstring label;
         std::wstring status;
         bool         connected = false;
-        int          rttMs = -1;
+        int64_t      rttUs = -1;   // Round trip, microseconds; -1 before the first.
         std::vector<RemoteMirror> mirrors;
         std::vector<StreamView>   views;
     };
@@ -121,6 +121,7 @@ private:
     // mirror's true proportions where the encoder had to pad or squeeze it.
     // Falls back to the listed crop before the first frame. False if neither.
     bool  ShownSize(TileKey key, UINT& w, UINT& h) const;
+    static bool ShownSizeOf(const StreamView* view, const RemoteMirror* mirror, UINT& w, UINT& h);
     void  ShowTileMenu(TileKey key, POINT screenPt);
     const StreamView*   ViewFor(TileKey key) const;
     const RemoteMirror* MirrorFor(TileKey key) const;

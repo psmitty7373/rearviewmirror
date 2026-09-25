@@ -22,6 +22,19 @@ uint64_t NowMs() {
     return GetTickCount64();
 }
 
+// Round trips on a LAN take well under a millisecond, far below the tick
+// count's 15.6 ms steps: pings are timed with the performance counter.
+int64_t NowUs() {
+    static const int64_t frequency = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    LARGE_INTEGER c{};
+    QueryPerformanceCounter(&c);
+    return c.QuadPart / frequency * 1'000'000 + (c.QuadPart % frequency) * 1'000'000 / frequency;
+}
+
 }  // namespace
 
 struct StreamClient::Stream {
@@ -42,6 +55,7 @@ struct StreamClient::Stream {
     UINT width = 0, height = 0;
     uint64_t frames = 0;
     size_t queued = 0;
+    uint8_t state = 0;   // net::StreamState, as the server last reported it.
 };
 
 StreamClient::~StreamClient() {
@@ -101,7 +115,7 @@ void StreamClient::Disconnect() {
         mirrors_.clear();
         wanted_.clear();
     }
-    rttMs_ = -1;
+    rttUs_ = -1;
     SecureZeroMemory(masterKey_.data(), masterKey_.size());
 }
 
@@ -118,12 +132,15 @@ void StreamClient::BeginSession() {
 void StreamClient::DropSession(std::wstring status) {
     Log(L"client: session with %s dropped: %s", server_.ToString().c_str(), status.c_str());
     connected_ = false;
-    rttMs_ = -1;
+    rttUs_ = -1;
 
     std::vector<std::shared_ptr<Stream>> streams;
     {
         std::lock_guard lock(stateMutex_);
-        for (const auto& [id, s] : streams_) streams.push_back(s);
+        for (const auto& [id, s] : streams_) {
+            streams.push_back(s);
+            s->state = 0;   // The next session's server says afresh.
+        }
     }
     {
         std::lock_guard lock(queueMutex_);
@@ -207,7 +224,7 @@ std::vector<StreamView> StreamClient::Views() const {
     std::lock_guard lock(stateMutex_);
     std::vector<StreamView> views;
     for (const auto& [id, s] : streams_) {
-        views.push_back({ id, s->texture, s->width, s->height, s->frames });
+        views.push_back({ id, s->texture, s->width, s->height, s->frames, s->state });
     }
     return views;
 }
@@ -286,7 +303,7 @@ void StreamClient::NetLoop() {
             if (now - lastPing >= kPingIntervalMs) {
                 Writer w;
                 w.U8(static_cast<uint8_t>(Msg::Ping));
-                w.U64(now);
+                w.U64(static_cast<uint64_t>(NowUs()));   // The server echoes it back.
                 Send(w.Data());
                 lastPing = now;
             }
@@ -477,7 +494,14 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
 
     case Msg::Pong: {
         uint64_t sent = 0;
-        if (r.U64(sent)) rttMs_ = static_cast<int>(nowMs - sent);
+        if (!r.U64(sent)) break;
+        // Timed now, on arrival: the loop's own timestamp was taken before it
+        // waited for this datagram, and would make a quick answer look instant.
+        const int64_t sample = NowUs() - static_cast<int64_t>(sent);
+        if (sample < 0 || sample > 60'000'000) break;   // Not one of ours.
+        const int64_t previous = rttUs_.load();
+        // Smoothed, so the figure does not flicker with every ping.
+        rttUs_ = previous < 0 ? sample : (previous * 3 + sample) / 4;
         Notify(ClientEvent::StatusChanged);
         break;
     }
@@ -485,6 +509,21 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
     case Msg::Bye:
         DropSession(L"The server closed the connection. Reconnecting…");
         break;
+
+    case Msg::StreamStatus: {
+        uint32_t id = 0;
+        uint8_t state = 0;
+        if (!r.U32(id) || !r.U8(state)) return;
+        auto s = FindStream(id);
+        if (!s) return;
+        {
+            std::lock_guard lock(stateMutex_);
+            s->state = state;
+        }
+        Log(L"client: server reports mirror %u state %u", id, static_cast<unsigned>(state));
+        Notify(ClientEvent::StatusChanged);
+        break;
+    }
 
     default:
         break;

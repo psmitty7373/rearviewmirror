@@ -29,6 +29,8 @@ public:
     // follows the stream, so the 100% detent is always the real size.
     void SetFrame(const winrt::com_ptr<ID3D11Texture2D>& texture, UINT width, UINT height,
                   uint64_t frames);
+    // Shown until the first frame arrives.
+    void SetWaitingText(std::wstring text) { waitingText_ = std::move(text); }
     void SetClickThrough(bool on);
     bool ClickThrough() const { return clickThrough_; }
 
@@ -56,6 +58,7 @@ private:
     winrt::com_ptr<ID3D11Texture2D> texture_;
     UINT     frameW_ = 0, frameH_ = 0;
     uint64_t frames_ = 0;
+    std::wstring waitingText_ = L"Waiting for the first frame…";
     ID3D11Texture2D* bitmapFor_ = nullptr;
     winrt::com_ptr<ID2D1Bitmap1> bitmap_;
 

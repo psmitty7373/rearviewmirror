@@ -81,6 +81,7 @@ private:
     App* app_ = nullptr;
 
     std::vector<CardView> cards_;
+    bool   streamingAvailable_ = false;
     bool   streamingOn_ = false;
     size_t streamClients_ = 0;
 

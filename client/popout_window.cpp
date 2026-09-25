@@ -372,7 +372,7 @@ void PopoutWindow::OnDraw(ID2D1DeviceContext* dc) {
     } else {
         brush_->SetColor(D2D1::ColorF(0.02f, 0.03f, 0.05f, 0.85f * opacity_));
         dc->FillRectangle(D2D1::RectF(0, 0, w, h), brush_.get());
-        DrawChip(dc, L"Waiting for the first frame…", w * 0.5f, h * 0.5f, 1, 1);
+        DrawChip(dc, waitingText_, w * 0.5f, h * 0.5f, 1, 1);
     }
 
     if (snapped_) {

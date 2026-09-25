@@ -1,5 +1,5 @@
 #include "app.h"
-#include "net/codec.h"
+#include "crash.h"
 #include "picker.h"
 #include "region.h"
 
@@ -165,15 +165,17 @@ void App::NewMirror() {
                     MB_OK | MB_ICONWARNING);
         return;
     }
-    AttachStream(*mirror);
+    streaming_.Attach(*mirror);
     mirrors_.push_back(std::move(mirror));
     MarkDirty();
     manager_.Refresh();
 }
 
-// The whole desktop, or a region of it. Made without a window on screen: it
-// is almost always there to be streamed, and a full-screen always-on-top copy
-// of the screen would be in the way. The manager can show it.
+// The whole desktop, or a region of it. Where it can be streamed, it is made
+// without a window on screen: it is almost always there to be streamed, and a
+// full-screen always-on-top copy of the screen would be in the way. The
+// manager can show it. A build without streaming shows it, or it would be
+// for nothing.
 void App::NewDesktopMirror() {
     const RECT bounds = DesktopCapture::Bounds();
     const SIZE size{ RectW(bounds), RectH(bounds) };
@@ -184,7 +186,7 @@ void App::NewDesktopMirror() {
     state.source   = SourceKind::Desktop;
     state.crop     = crop;
     state.baseSize = size;
-    state.hidden   = true;
+    state.hidden   = Streaming::Available();
     state.group    = NewGroup();
 
     auto mirror = std::make_unique<Mirror>(nextId_++);
@@ -193,23 +195,15 @@ void App::NewDesktopMirror() {
                     MB_OK | MB_ICONWARNING);
         return;
     }
-    AttachStream(*mirror);
+    streaming_.Attach(*mirror);
     mirrors_.push_back(std::move(mirror));
     MarkDirty();
     manager_.Refresh();
-    ShowBalloon(server_.Running()
-        ? L"The desktop is ready to stream. It has no window here; the manager can show one."
-        : L"Desktop mirror added, without a window here. Turn on Streaming to share it.");
-}
-
-// The streaming tee. The sink outlives every mirror: server_ is destroyed with
-// the App, after all of them.
-void App::AttachStream(Mirror& mirror) {
-    const uint32_t id = mirror.Id();
-    Log(L"app: stream tee attached to mirror %u", id);
-    mirror.SetFrameSink([this, id](ID3D11Texture2D* cache, const RECT& crop) {
-        server_.SubmitFrame(id, cache, crop);
-    });
+    if (Streaming::Available()) {
+        ShowBalloon(streaming_.Running()
+            ? L"The desktop is ready to stream. It has no window here; the manager can show one."
+            : L"Desktop mirror added, without a window here. Turn on Streaming to share it.");
+    }
 }
 
 Mirror* App::MirrorAt(size_t index) {
@@ -291,81 +285,7 @@ void App::CloseAll() {
 void App::MarkDirty() {
     dirty_ = true;
     SetTimer(hwnd_, kTimerSave, kSaveDelayMs, nullptr);
-    PushMirrorList();   // Every state change is also a change to what clients may list.
-}
-
-void App::PushMirrorList() {
-    std::vector<MirrorInfo> list;
-    for (const auto& m : mirrors_) {
-        if (!m->Enabled() || m->Orphaned()) continue;
-        const SIZE native = m->NativeSize();
-        list.push_back({ m->Id(), m->DisplayName(),
-                         static_cast<UINT>((std::max)(native.cx, 0L)),
-                         static_cast<UINT>((std::max)(native.cy, 0L)) });
-    }
-    server_.SetMirrorList(std::move(list));
-}
-
-// Stops the server, and starts it again if the settings say it should run.
-// False if it should run but could not.
-bool App::ApplyStreamSettings() {
-    server_.Stop();
-    manager_.Refresh();
-    if (!streamSettings_.enabled) return true;
-    // The server asks on its network thread; the mirror lives on this one.
-    server_.SetFrameRequester([hwnd = hwnd_](uint32_t mirrorId) {
-        PostMessageW(hwnd, WM_RVM_STREAM_WANT_FRAME, mirrorId, 0);
-    });
-    if (!server_.Start(streamSettings_)) return false;
-    PushMirrorList();
-    manager_.Refresh();
-    return true;
-}
-
-void App::ShowStreamSettings() {
-    StreamControl control;
-    control.start = [this](const StreamSettings& s, std::wstring& error) {
-        streamSettings_ = s;
-        streamSettings_.enabled = true;
-        const bool ok = ApplyStreamSettings();
-        if (!ok) {
-            streamSettings_.enabled = false;
-            error = L"Streaming could not start on UDP port " + std::to_wstring(s.port) +
-                    L". Is another program using it?";
-        }
-        SaveStreamSettings(streamSettings_);
-        return ok;
-    };
-    control.stop = [this] {
-        streamSettings_.enabled = false;
-        SaveStreamSettings(streamSettings_);
-        ApplyStreamSettings();
-    };
-    control.running = [this] { return server_.Running(); };
-    control.status = [this] {
-        if (!server_.Running()) return std::wstring(L"Stopped");
-        return L"Running on UDP port " + std::to_wstring(streamSettings_.port) + L"  ·  " +
-               Plural(static_cast<int>(server_.ClientCount()), L"client", L"clients") +
-               L" connected";
-    };
-
-    StreamSettings edited = streamSettings_;
-    if (!ShowStreamSettingsDialog(hwnd_, edited, control)) return;
-
-    // OK: keep the fields. A running server picks up changed ones by restarting;
-    // its clients reconnect by themselves.
-    const StreamSettings before = streamSettings_;
-    streamSettings_ = edited;
-    SaveStreamSettings(streamSettings_);
-    const bool changed = before.port != edited.port || before.key != edited.key ||
-                         before.bitrateKbps != edited.bitrateKbps || before.fps != edited.fps ||
-                         before.preset != edited.preset;
-    if (server_.Running() && changed && !ApplyStreamSettings()) {
-        ShowBalloon(L"Streaming could not restart on UDP port " +
-                    std::to_wstring(streamSettings_.port) + L". Is another program using it?");
-        streamSettings_.enabled = false;
-        SaveStreamSettings(streamSettings_);
-    }
+    streaming_.MirrorsChanged();   // Every state change can change what clients may list.
 }
 
 void App::SaveNow() {
@@ -485,7 +405,7 @@ int App::TryRestorePending() {
             ++it;   // Keep it for the next attempt rather than forgetting it.
             continue;
         }
-        AttachStream(*mirror);
+        streaming_.Attach(*mirror);
         mirrors_.push_back(std::move(mirror));
         ++restored;
         it = pending_.erase(it);
@@ -533,7 +453,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         if (any) {
-            PushMirrorList();
+            streaming_.MirrorsChanged();
             manager_.Refresh();
         }
         break;
@@ -608,7 +528,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         SaveNow();   // Placements, before anything is torn down.
-        server_.Stop();   // Before the mirrors its frame tees point at.
+        streaming_.Shutdown();   // Before the mirrors its frame tees point at.
         KillTimer(hwnd_, kTimerRestore);
         manager_.Destroy();
         // Retire rather than delete: this can run inside a nested loop that is
@@ -636,6 +556,7 @@ int App::Run(bool relaunched) {
     }
 
     LogOpen(L"server");
+    InstallCrashHandler(L"server");
     Gfx::Get().Init();
 
     if (!CreateOwnerWindow()) return 1;
@@ -660,16 +581,12 @@ int App::Run(bool relaunched) {
 
     RestoreSaved();
 
-    streamSettings_ = LoadStreamSettings();
-    if (!ApplyStreamSettings()) {
-        if (streamSettings_.key.empty() && !streamSettings_.lockedKey.empty()) {
-            ShowBalloon(L"Streaming is off: the saved key could not be decrypted by this Windows "
-                        L"account. Open Streaming and enter it again.");
-        } else {
-            ShowBalloon(L"Streaming could not start on UDP port " +
-                        std::to_wstring(streamSettings_.port) + L". Is another program using it?");
-        }
-    }
+    Streaming::Hooks hooks;
+    hooks.window  = hwnd_;
+    hooks.mirrors = &mirrors_;
+    hooks.changed = [this] { manager_.Refresh(); };
+    hooks.notify  = [this](const std::wstring& text) { ShowBalloon(text); };
+    streaming_.Start(std::move(hooks));
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

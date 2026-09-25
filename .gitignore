@@ -39,3 +39,4 @@ cmake_install.cmake
 # copies of them never belong here.
 *.ini
 *.log
+*.dmp

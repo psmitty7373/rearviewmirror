@@ -21,6 +21,7 @@ How Rear View Mirror works inside, and why. For using and building it, see
 | `src/net/crypto.*`, `channel.*` | PBKDF2/HMAC key derivation, AES-GCM, replay-protected datagrams |
 | `src/net/udp.*`, `packetizer.*` | Dual-stack UDP socket; frame splitting, reassembly, NACK |
 | `src/net/codec.*`, `converter.*` | Media Foundation H.264 encode/decode; D3D11 colour conversion |
+| `src/streaming.*` | The app's one seam to streaming; `streaming_off.cpp` is the empty stand-in |
 | `src/stream_server.*` | Serves mirrors: encoders, sessions, retransmits, limits |
 | `src/stream_settings.*` | Streaming settings file and dialog |
 | `client/` | Client: connection, decode, canvas, pop-out windows, settings |
@@ -103,6 +104,14 @@ Exceptions never cross a window procedure: `WndProcThunk` catches them, because
 a C++ exception can't unwind through the kernel callback that calls it. Graphics
 paths return failure rather than throw.
 
+**Crash reports.** Release builds carry symbols (`/Zi`, `/DEBUG`), with the .pdb
+files beside the executables and no change to the generated code. On a crash,
+`InstallCrashHandler` logs the exception and the crashing thread's stack, with
+function names and lines when the .pdb is present, and writes a small minidump
+to `%APPDATA%\RearViewMirror`. It works on a fresh thread, since the crashing
+thread's stack may be what is broken, and then lets Windows report the crash as
+before. Copy the .pdb along with the .exe to other machines.
+
 **Device loss.** Every swapchain, capture pool, texture and encoder belongs to
 the one device, so a removed or reset device can't be patched up in place.
 Failing calls go through `Gfx::CheckDevice`, which recognises a lost device and
@@ -143,6 +152,22 @@ the same way.
 
 The app is the server; `RearViewMirrorClient.exe` is the client. One UDP port
 carries everything.
+
+**One seam.** The app reaches streaming only through the `Streaming` class. It
+is told when a mirror is created (to attach the mirror's frame hook) and when
+mirrors change (to republish the list). It posts requests for a picture back
+to the app window, and it runs the settings dialog. Mirrors and the renderer
+know nothing of streaming: a mirror offers a generic frame hook and a way to
+resend its last frame. `-DRVM_STREAMING=OFF` compiles `streaming_off.cpp`, which
+does nothing and reports streaming unavailable, and leaves out the libraries,
+the client and the tests. There is no conditional compilation in the code.
+
+| Library | Contents | Used by |
+| --- | --- | --- |
+| `rvmcore` | Device, overlays, persistence, logging | Everything |
+| `rvmnet` | Crypto, UDP, packetizer, codec, converter | Both ends |
+| `rvmserver` | `stream_server.cpp` | App, tests |
+| `rvmclientnet` | `client/stream_client.cpp` | Client, tests |
 
 - **Zero-copy into the encoder.** The renderer's cache texture is teed to the
   server, which crops it into NV12 with one video-processor blit and hands it to
@@ -230,7 +255,24 @@ spend their effort on motion search, which text does not reward.
 - If a keyframe arrives without an SPS and the output type carries a sequence
   header, the header is prepended so a decoder can start.
 - Encoders refuse tiny frames; crops are scaled up to at least 256 px. A size an
-  encoder rejects is retried at 16-pixel alignment.
+  encoder rejects is retried at 16-pixel alignment, then with larger floors
+  (384, 512, 768, 1024 px on the smallest side), keeping the crop's shape. The
+  client recognises every floor, so it still draws the true shape. Once nothing
+  is left to adjust, retries back off from 2 s to a minute, and the viewer is
+  told the mirror cannot be encoded; a new size is tried at once.
+- **Encoder sessions are limited.** GeForce cards run only so many encoder
+  sessions at once: three on the drivers that still support a GT 730, twelve on
+  an RTX 4080's current driver. A refused session looks like any other failure
+  (NVIDIA's reports `MF_E_UNSUPPORTED_D3D_TYPE` from `SetOutputType`), so a
+  failure while other streams hold sessions is taken to be the limit. The frame
+  is not enlarged; the stream waits and is retried the moment another stream
+  lets its encoder go, or every 10 s. Its viewers are sent `StreamStatus`, and
+  the client shows "The server's encoder is busy with other streams" instead of
+  waiting in silence. Before this, the GT 730 machine rebuilt a refused encoder
+  every 2 seconds indefinitely, which was the last thing it logged before a
+  crash.
+- A retry needs a picture, and a still source sends none of its own, so the
+  server asks the mirror for one when a retry falls due.
 - The encoder on the device's own adapter is preferred (`MFTEnum2` with the
   adapter LUID), then every other hardware encoder in turn. Each failure is
   logged with its HRESULT.
@@ -317,3 +359,4 @@ so a running copy of the app doesn't get in the way.
 | `--bench` | Time the encoder path on this machine |
 | `--presets` | Time and quality of each encoder preset at desktop size |
 | `--live` | Connect to this PC's running app and report what arrives |
+| `--crash-probe` | Crash on purpose, with no error dialog, to check the crash report |

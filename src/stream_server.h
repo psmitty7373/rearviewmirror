@@ -85,6 +85,10 @@ private:
     void PruneStreams();
     void SendFrames(Stream& s, const std::vector<net::EncodedFrame>& frames);
     void RequestFrame(uint32_t mirrorId);
+    // Tells the stream's viewers why it is, or is no longer, stalled.
+    void SetStreamState(Stream& s, net::StreamState state);
+    void SendStreamState(Client& client, const Stream& s);
+    int  OtherOpenEncoders(const Stream& self);
     void ForceKeyframe(Stream& s, uint64_t nowMs);
     void ServiceDeferredKeyframes(uint64_t nowMs);
 
@@ -115,6 +119,9 @@ private:
     std::thread netThread_;
     std::thread encodeThread_;
     HANDLE frameEvent_ = nullptr;
+    // Encode thread: an encoder was shut down this pass, so a stream waiting
+    // for a free encoder session may now get one.
+    bool sessionFreed_ = false;
 
     mutable std::mutex clientsMutex_;
     std::vector<std::shared_ptr<Client>> clients_;

@@ -124,6 +124,10 @@ first build creates in your certificate store. Run
 publisher, or build with `-DRVM_SIGN=OFF` to skip signing. Without the SDK's
 signtool, the build skips signing with a warning.
 
+For mirrors only, build with `-DRVM_STREAMING=OFF`. The app then has no
+streaming and no network code, the manager shows no *Streaming* button, and
+desktop mirrors start with a window. The client is not built.
+
 ## Files
 
 Everything lives in `%APPDATA%\RearViewMirror`. Keys are encrypted to your
@@ -137,5 +141,6 @@ and add it again.
 | `stream.ini` | Streaming settings and key |
 | `client.ini` | Client servers, keys and layout |
 | `server.log`, `client.log` | Diagnostics |
+| `server-crash-*.dmp`, `client-crash-*.dmp` | Written if the app or client crashes |
 
 Internals, design notes and tests are in [DEVELOPMENT.md](DEVELOPMENT.md).

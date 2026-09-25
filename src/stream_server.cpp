@@ -34,6 +34,10 @@ constexpr uint64_t kKeyframeGapMs = 250;
 // rebuilt once the size has held this long.
 constexpr uint64_t kResizeSettleMs = 250;
 
+// A stream refused an encoder session while others were open checks again
+// this often, besides trying at once whenever another stream lets one go.
+constexpr uint64_t kEncoderFullRetryMs = 10000;
+
 // The encoder's 0 to 100 scale for a preset. NVIDIA's encoder steps at 33 and
 // 66; Balanced leaves every encoder its own default.
 UINT QualityVsSpeed(EncoderPreset preset) {
@@ -42,6 +46,22 @@ UINT QualityVsSpeed(EncoderPreset preset) {
     case EncoderPreset::Quality: return 100;
     default:                     return H264Encoder::kEncoderDefault;
     }
+}
+
+// Moves a stream to the next encode floor, if that would change the frames it
+// sends: only when their smallest side is below it, so upscaling is what set
+// their size. False when there is no larger floor worth trying.
+template <class StreamT>
+bool RaiseEncodeFloor(StreamT& s, UINT smallestSide) {
+    const UINT current = s.minDim.load();
+    for (const UINT floor : kEncodeFloors) {
+        if (floor > current) {
+            if (smallestSide >= floor) return false;
+            s.minDim = floor;
+            return true;
+        }
+    }
+    return false;
 }
 
 uint64_t NowMs() {
@@ -128,7 +148,18 @@ struct StreamServer::Stream : std::enable_shared_from_this<StreamServer::Stream>
     // Set once an encoder refused the exact size: frames are then scaled to
     // multiples of 16, which every encoder accepts.
     std::atomic<bool> align16{ false };
-    uint64_t nextInitMs = 0;     // Encode thread: a failed Init waits before retrying.
+    // Then, if that is not enough, frames are scaled up further: the smallest
+    // side is at least this (one of kEncodeFloors).
+    std::atomic<UINT> minDim{ kMinEncodeDim };
+    // Encode thread: after every way of making a size acceptable has failed,
+    // retries back off, so a refusing encoder is not rebuilt every 2 seconds
+    // forever. A different size is tried at once.
+    uint64_t nextInitMs = 0;
+    int      initFailures = 0;
+    UINT     failedW = 0, failedH = 0;
+    bool     retryRequested = false;   // A picture was asked for, to retry with.
+    // What viewers were last told about this stream (net::StreamState).
+    std::atomic<uint8_t> state{ 0 };
 
     // The frame-rate cap, under `swap`. A frame the cap skipped is owed: if
     // the source then goes still, the encode thread asks for it again.
@@ -339,7 +370,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
     if (cropW < kMinStreamDim || cropH < kMinStreamDim) return;
 
     UINT w = 0, h = 0;
-    EncodeSize(cropW, cropH, s->align16.load(), w, h);
+    EncodeSize(cropW, cropH, s->align16.load(), w, h, s->minDim.load());
 
     // Hold each stream to the configured rate, on an even cadence. A frame
     // someone is waiting for (a keyframe, a new viewer) always goes through.
@@ -449,6 +480,19 @@ void StreamServer::EncodeLoop() {
             for (auto& [id, s] : streams_) streams.push_back(s);
         }
         for (auto& s : streams) EncodeStream(*s);
+
+        // A session came free: streams waiting for one try at once, on a
+        // fresh picture, rather than at their next scheduled check.
+        if (sessionFreed_) {
+            sessionFreed_ = false;
+            for (auto& s : streams) {
+                if (s->state.load() != static_cast<uint8_t>(StreamState::EncoderFull)) continue;
+                s->nextInitMs = 0;
+                s->failedW = s->failedH = 0;
+                s->retryRequested = true;
+                RequestFrame(s->mirrorId);
+            }
+        }
         PruneStreams();
     }
 
@@ -482,7 +526,10 @@ void StreamServer::PruneStreams() {
 // frames go out as soon as it announces them.
 void StreamServer::EncodeStream(Stream& s) {
     if (s.subscribers.load() == 0) {
-        if (s.encoder.Ready()) s.encoder.Shutdown();   // Free the hardware session.
+        if (s.encoder.Ready()) {
+            s.encoder.Shutdown();   // Free the hardware session.
+            sessionFreed_ = true;
+        }
         std::lock_guard lock(s.swap);
         s.held = -1;
         return;
@@ -493,6 +540,7 @@ void StreamServer::EncodeStream(Stream& s) {
         // The encoder failed; start a fresh one on the next frame.
         Log(L"server: encoder for mirror %u failed; recreating", s.mirrorId);
         s.encoder.Shutdown();
+        sessionFreed_ = true;
         std::lock_guard lock(s.swap);
         s.reinit = true;
     }
@@ -557,6 +605,14 @@ void StreamServer::EncodeStream(Stream& s) {
         }
         if (owed) RequestFrame(s.mirrorId);
 
+        // Waiting to retry an encoder: a retry needs a picture, and a still
+        // source sends none of its own. Ask once, when the retry is due.
+        if (!s.encoder.Ready() && s.failedW != 0 && !s.retryRequested &&
+            GetTickCount64() >= s.nextInitMs) {
+            s.retryRequested = true;
+            RequestFrame(s.mirrorId);
+        }
+
         // Nothing came out, and the encoder is sitting on the last frame: the
         // source is still, so no next frame will come to push it out.
         if (produced.empty() && s.encoder.Ready() && s.encoder.WantsInput() &&
@@ -587,15 +643,17 @@ void StreamServer::EncodeStream(Stream& s) {
 
     const uint64_t now = GetTickCount64();
     if (reinit || !s.encoder.Ready() || s.encoder.Width() != w || s.encoder.Height() != h) {
-        if (s.align16.load() && ((w | h) & 15u)) {
-            // A frame converted before the switch to aligned sizes; the next
-            // one will be aligned, so do not spend an Init on this one.
+        if ((s.align16.load() && ((w | h) & 15u)) || (std::min)(w, h) < s.minDim.load()) {
+            // A frame converted before the switch to aligned or larger sizes;
+            // the next one will fit, so do not spend an Init on this one.
             std::lock_guard lock(s.swap);
             s.busy = -1;
             return;
         }
         bool ok = false;
-        if (now >= s.nextInitMs) {
+        const bool untried = w != s.failedW || h != s.failedH;
+        if (untried || now >= s.nextInitMs) {
+            s.retryRequested = false;
             s.encoder.SetWakeEvent(frameEvent_);
             ok = s.encoder.Init(w, h, settings_.fps, settings_.bitrateKbps * 1000,
                                 QualityVsSpeed(settings_.preset));
@@ -606,15 +664,46 @@ void StreamServer::EncodeStream(Stream& s) {
                 s.held = -1;
             }
             if (!ok) {
-                s.nextInitMs = now + 2000;
-                if (!s.align16.exchange(true)) {
+                s.failedW = w;
+                s.failedH = h;
+                if (const int others = OtherOpenEncoders(s); others > 0) {
+                    // GeForce cards run only a few encoder sessions at once
+                    // (three on a GT 730's drivers, twelve on an RTX 4080's),
+                    // and a refused session looks like any other failure. With
+                    // others open, that is the likely cause: the size is not
+                    // the problem, so it is left alone, and the stream waits
+                    // for a session to free, checking now and then anyway.
+                    s.nextInitMs = now + kEncoderFullRetryMs;
+                    if (s.state.load() != static_cast<uint8_t>(StreamState::EncoderFull)) {
+                        Log(L"server: no encoder session for mirror %u with %d others open; "
+                            L"waiting for one to free", s.mirrorId, others);
+                    }
+                    SetStreamState(s, StreamState::EncoderFull);
+                } else if (!s.align16.exchange(true)) {
                     // Next attempt at an aligned size, with a fresh frame to try it on.
                     Log(L"server: retrying mirror %u at 16-aligned dimensions", s.mirrorId);
-                    s.nextInitMs = now;
                     RequestFrame(s.mirrorId);
+                } else if (RaiseEncodeFloor(s, (std::min)(w, h))) {
+                    // Some encoders refuse small frames above our usual floor:
+                    // scale this one up further, keeping its shape.
+                    Log(L"server: retrying mirror %u with frames at least %u pixels a side",
+                        s.mirrorId, s.minDim.load());
+                    RequestFrame(s.mirrorId);
+                } else {
+                    // Nothing left to adjust: wait longer each time.
+                    ++s.initFailures;
+                    const uint64_t delay =
+                        (std::min)(2000ull << (std::min)(s.initFailures - 1, 5), 60000ull);
+                    s.nextInitMs = now + delay;
+                    Log(L"server: mirror %u cannot be encoded at %ux%u; next try in %llu s",
+                        s.mirrorId, w, h, static_cast<unsigned long long>(delay / 1000));
+                    SetStreamState(s, StreamState::CannotEncode);
                 }
             } else {
+                s.initFailures = 0;
+                s.failedW = s.failedH = 0;
                 s.wantKeyframe = true;
+                SetStreamState(s, StreamState::Ok);
             }
         }
         if (!ok) {
@@ -669,6 +758,37 @@ void StreamServer::SendFrames(Stream& s, const std::vector<EncodedFrame>& frames
             }
         }
     }
+}
+
+// Encode thread, which alone opens and closes encoders.
+int StreamServer::OtherOpenEncoders(const Stream& self) {
+    int open = 0;
+    std::lock_guard lock(streamsMutex_);
+    for (const auto& [id, s] : streams_) {
+        if (s.get() != &self && s->encoder.Ready()) ++open;
+    }
+    return open;
+}
+
+// Viewers hear only of changes; a newcomer is told on subscribing.
+void StreamServer::SetStreamState(Stream& s, StreamState state) {
+    if (s.state.exchange(static_cast<uint8_t>(state)) == static_cast<uint8_t>(state)) return;
+    std::vector<std::shared_ptr<Client>> targets;
+    {
+        std::lock_guard lock(s.subsMutex);
+        for (auto& weak : s.subs) {
+            if (auto c = weak.lock()) targets.push_back(c);
+        }
+    }
+    for (auto& c : targets) SendStreamState(*c, s);
+}
+
+void StreamServer::SendStreamState(Client& client, const Stream& s) {
+    Writer w;
+    w.U8(static_cast<uint8_t>(Msg::StreamStatus));
+    w.U32(s.mirrorId);
+    w.U8(s.state.load());
+    SendTo(client, w.Data());
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +994,8 @@ void StreamServer::Subscribe(const std::shared_ptr<Client>& client, uint32_t id,
     RVM_LOG_SAMPLED(50, L"server: %s subscribes to mirror %u (subscribers now %d)",
                     client->endpoint.ToString().c_str(), id, s->subscribers.load());
     ForceKeyframe(*s, nowMs);   // A newcomer can only start on an IDR.
+    // Joining a stream that is stalled: say why, rather than leave it waiting.
+    if (s->state.load() != static_cast<uint8_t>(StreamState::Ok)) SendStreamState(*client, *s);
 }
 
 void StreamServer::ExpireRecentHellos(uint64_t nowMs) {

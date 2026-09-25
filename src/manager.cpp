@@ -134,6 +134,7 @@ void ManagerWindow::PrepareDraw() {
     cards_.clear();
     if (!app_) return;
 
+    streamingAvailable_ = app_->StreamingAvailable();
     streamingOn_     = app_->StreamingOn();
     streamClients_   = app_->StreamClients();
     for (size_t i = 0; i < app_->MirrorCount(); ++i) {
@@ -251,7 +252,7 @@ ManagerWindow::Hit ManagerWindow::HitTest(POINT pt) const {
         hit.part = Part::NewMirror;
         return hit;
     }
-    if (Contains(StreamingButton(), pt)) {
+    if (streamingAvailable_ && Contains(StreamingButton(), pt)) {
         hit.part = Part::Streaming;
         return hit;
     }
@@ -619,16 +620,19 @@ void ManagerWindow::OnDraw(ID2D1DeviceContext* dc) {
     brush_->SetColor(kStroke);
     dc->FillRectangle(D2D1::RectF(0, S(kHeaderH) - S(1.0f), w, S(kHeaderH)), brush_.get());
 
-    const D2D1_RECT_F heading =
-        D2D1::RectF(S(kPad), 0, StreamingButton().left - S(10.0f), S(kHeaderH));
+    const float headingRight = (streamingAvailable_ ? StreamingButton() : NewMirrorButton()).left;
+    const D2D1_RECT_F heading = D2D1::RectF(S(kPad), 0, headingRight - S(10.0f), S(kHeaderH));
     DrawLabel(dc, Plural(static_cast<int>(cards_.size()), L"mirror", L"mirrors"), heading,
               titleFont_.get(), kText, DWRITE_TEXT_ALIGNMENT_LEADING);
 
-    std::wstring streaming = L"Streaming";
-    if (streamingOn_ && streamClients_ > 0) {
-        streaming += L" (" + std::to_wstring(streamClients_) + L")";
+    if (streamingAvailable_) {   // No button in a build without streaming.
+        std::wstring streaming = L"Streaming";
+        if (streamingOn_ && streamClients_ > 0) {
+            streaming += L" (" + std::to_wstring(streamClients_) + L")";
+        }
+        DrawButton(dc, StreamingButton(), streaming, hot_.part == Part::Streaming, false,
+                   streamingOn_);
     }
-    DrawButton(dc, StreamingButton(), streaming, hot_.part == Part::Streaming, false, streamingOn_);
     DrawButton(dc, NewMirrorButton(), L"New mirror", hot_.part == Part::NewMirror, false);
 
     const float overflow = ContentHeight() - ViewportHeight();

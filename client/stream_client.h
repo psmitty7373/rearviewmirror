@@ -38,7 +38,20 @@ struct StreamView {
     UINT     width = 0;
     UINT     height = 0;
     uint64_t frames = 0;
+    // What the server last said about the stream (net::StreamState): why no
+    // frames are coming, if they are not.
+    uint8_t  state = 0;
 };
+
+// What to show in place of a stream the server says it cannot send, or null
+// when nothing is wrong beyond frames not having arrived yet.
+inline const wchar_t* StreamStateText(uint8_t state) {
+    switch (static_cast<net::StreamState>(state)) {
+    case net::StreamState::EncoderFull:  return L"The server's encoder is busy with other streams";
+    case net::StreamState::CannotEncode: return L"The server's encoder cannot encode this mirror";
+    default:                             return nullptr;
+    }
+}
 
 // Connects to one server, keeps a list of its mirrors, and decodes the
 // subscribed ones. A network thread reassembles and requests resends; a decode
@@ -54,7 +67,9 @@ public:
 
     bool Connected() const { return connected_.load(); }
     std::wstring Status() const;
-    int RttMs() const { return rttMs_.load(); }
+    // Network round trip in microseconds, smoothed over recent pings; -1
+    // until the first answer.
+    int64_t RttUs() const { return rttUs_.load(); }
 
     std::vector<RemoteMirror> Mirrors() const;
     bool IsSubscribed(uint32_t id) const;
@@ -115,7 +130,7 @@ private:
     std::vector<RemoteMirror> mirrors_;
     std::set<uint32_t> wanted_;   // Mirrors the user chose; survives reconnects.
     std::map<uint32_t, std::shared_ptr<Stream>> streams_;
-    std::atomic<int> rttMs_{ -1 };
+    std::atomic<int64_t> rttUs_{ -1 };
 
     std::mutex queueMutex_;
     std::condition_variable queueCv_;

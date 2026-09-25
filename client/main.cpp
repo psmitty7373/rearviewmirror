@@ -1,4 +1,5 @@
 #include "client_window.h"
+#include "crash.h"
 
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -20,6 +21,7 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     }
 
     rvm::LogOpen(L"client");
+    rvm::InstallCrashHandler(L"client");
     try {
         rvm::Gfx::Get().Init();
     } catch (...) {

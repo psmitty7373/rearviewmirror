@@ -39,23 +39,32 @@ constexpr UINT kMinEncodeDim = 256;
 // 16384. Larger crops are scaled down to fit.
 constexpr UINT kMaxEncodeDim = 4096;
 
+// The floors tried in turn when an encoder refuses a size even at 16-pixel
+// alignment. The client tries the same ones to recognise what it receives.
+constexpr UINT kEncodeFloors[] = { 256, 384, 512, 768, 1024 };
+
 // The size the server encodes a crop at: scaled up uniformly to clear the
 // floor, down uniformly to fit the ceiling, even in both dimensions for NV12,
 // and padded to whole macroblocks for encoders that need it. A strip too thin
 // to satisfy both limits in proportion is held at them, so its stream is out
 // of proportion; the client, which knows the crop from the mirror list, uses
 // this to recognise that and draw it in the true proportions.
-inline void EncodeSize(UINT cropW, UINT cropH, bool align16, UINT& w, UINT& h) {
+//
+// `minDim` raises the floor for an encoder that refuses a size above the
+// usual one.
+inline void EncodeSize(UINT cropW, UINT cropH, bool align16, UINT& w, UINT& h,
+                       UINT minDim = kMinEncodeDim) {
+    minDim = (std::min)((std::max)(minDim, kMinEncodeDim), kMaxEncodeDim);
     double sw = cropW, sh = cropH;
-    const double up = (std::max)(1.0, (std::max)(kMinEncodeDim / sw, kMinEncodeDim / sh));
+    const double up = (std::max)(1.0, (std::max)(minDim / sw, minDim / sh));
     sw *= up;
     sh *= up;
     const double down = (std::min)(1.0, (std::min)(kMaxEncodeDim / sw, kMaxEncodeDim / sh));
     sw *= down;
     sh *= down;
-    w = static_cast<UINT>(ClampI(static_cast<int>(sw), static_cast<int>(kMinEncodeDim),
+    w = static_cast<UINT>(ClampI(static_cast<int>(sw), static_cast<int>(minDim),
                                  static_cast<int>(kMaxEncodeDim))) & ~1u;
-    h = static_cast<UINT>(ClampI(static_cast<int>(sh), static_cast<int>(kMinEncodeDim),
+    h = static_cast<UINT>(ClampI(static_cast<int>(sh), static_cast<int>(minDim),
                                  static_cast<int>(kMaxEncodeDim))) & ~1u;
     if (align16) {
         w = (std::min)((w + 15) & ~15u, kMaxEncodeDim);
@@ -77,6 +86,15 @@ enum class Msg : uint8_t {
     Pong,            // either            {t u64}
     MirrorsChanged,  // server -> client  (re-list)
     Bye,             // either
+    StreamStatus,    // server -> client  {mirrorId u32, state u8}: why a stream is not coming
+};
+
+// What a StreamStatus message reports. A client that does not know the message
+// ignores it and simply keeps waiting for frames.
+enum class StreamState : uint8_t {
+    Ok = 0,             // Frames are coming, or will.
+    EncoderFull = 1,    // The GPU has no encoder session free; retried when one frees.
+    CannotEncode = 2,   // The encoder refuses this mirror at every size tried.
 };
 
 constexpr uint8_t kFlagKeyframe = 0x01;
