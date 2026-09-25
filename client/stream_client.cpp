@@ -186,6 +186,15 @@ std::vector<RemoteMirror> StreamClient::Mirrors() const {
     return mirrors_;
 }
 
+#if RVM_REMOTE_CONTROL
+// Checked on every frame while controlling, so it avoids copying the list.
+bool StreamClient::Controllable(uint32_t id) const {
+    std::lock_guard lock(stateMutex_);
+    return std::any_of(mirrors_.begin(), mirrors_.end(),
+                       [&](const RemoteMirror& m) { return m.id == id && m.controllable; });
+}
+#endif
+
 std::shared_ptr<StreamClient::Stream> StreamClient::FindStream(uint32_t id) const {
     std::lock_guard lock(stateMutex_);
     auto it = streams_.find(id);

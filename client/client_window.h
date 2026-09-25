@@ -30,6 +30,10 @@ protected:
     void OnDraw(ID2D1DeviceContext* dc) override;
 
 private:
+    static constexpr wchar_t kClientTitle[] = L"Rear View Mirror Client";
+    // SetTimer ids, kept together so they cannot collide.
+    static constexpr UINT_PTR kChipTimer = 2, kControlTimer = 3, kTitleTimer = 4;
+
     enum class Part { None, AddServer, SidebarToggle, ServerRow, RemoveServer, MirrorItem, Tile, Canvas };
     enum Edge : int { kEdgeLeft = 1, kEdgeRight = 2, kEdgeTop = 4, kEdgeBottom = 8 };
 
@@ -126,6 +130,8 @@ private:
 #if RVM_REMOTE_CONTROL
     void  BeginControl(TileKey key);
     void  EndControl(const wchar_t* message = nullptr);
+    // The plain title, or the title with a control status appended.
+    void  SetTitle(const wchar_t* status = nullptr);
     void  PollControl();
     bool  ControlMessage(UINT msg, WPARAM wp, LPARAM lp);
     bool  DrawControlTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1_RECT_F& cell);
@@ -136,6 +142,7 @@ private:
     net::ControlState controlState_ = net::ControlState::Idle;
 #endif
     D2D1_RECT_F PictureRect(const Tile& tile) const;
+    D2D1_RECT_F PictureRect(const Tile& tile, UINT shownW, UINT shownH) const;
     const StreamView*   ViewFor(TileKey key) const;
     const RemoteMirror* MirrorFor(TileKey key) const;
     // A box's key travels in an LPARAM: both halves need a 64-bit build.

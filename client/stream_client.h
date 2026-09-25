@@ -81,6 +81,7 @@ public:
     std::vector<StreamView> Views() const;
 #if RVM_REMOTE_CONTROL
     net::ControlClient& Control() { return control_; }
+    bool Controllable(uint32_t id) const;
 #endif
 
     // The window calls this when it handles FrameReady, so the next decoded

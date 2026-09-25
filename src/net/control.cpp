@@ -18,6 +18,8 @@ void WriteInput(Writer& w, const RemoteInput& e) {
     w.U8(static_cast<uint8_t>(e.kind)); w.U16(e.code); w.U16(static_cast<uint16_t>(e.value));
     w.U16(e.x); w.U16(e.y); w.U8(e.down ? 1 : 0);
 }
+// The UI thread can stamp a time newer than a `now` read before the lock.
+uint64_t Elapsed(uint64_t now, uint64_t since) { return now > since ? now - since : 0; }
 bool ReadInput(Reader& r, RemoteInput& e) {
     uint8_t kind = 0, down = 0;
     uint16_t value = 0;
@@ -108,6 +110,8 @@ std::vector<uint8_t> ControlHost::Handle(uintptr_t peer, Reader& r, uint64_t now
                 s.owner = peer; s.mirror = mirror; s.token = token; s.ack = 0; s.seen = now;
             }
         }
+    } else if (token == p.token && op == kBegin && eligible && s.owner && s.owner != peer) {
+        status = ControlState::Busy;   // A retried Begin whose Busy reply was lost.
     }
     if (s.owner == peer && s.token == token && s.mirror == mirror) {
         if (!eligible || op == kEnd) {
@@ -198,8 +202,8 @@ std::vector<uint8_t> ControlClient::Poll(uint64_t now) {
     auto& s = *impl_; std::lock_guard lock(s.mutex);
     if (s.ending && now >= s.endUntil) s.ending = false;
     if (!s.ending && s.state != ControlState::Pending && s.state != ControlState::Active) return {};
-    if (!s.ending && (now - s.lastReply >= kControlLeaseMs ||
-        (!s.queue.empty() && now - s.progress >= kControlLeaseMs))) {
+    if (!s.ending && (Elapsed(now, s.lastReply) >= kControlLeaseMs ||
+        (!s.queue.empty() && Elapsed(now, s.progress) >= kControlLeaseMs))) {
         s.state = ControlState::Lost; s.ending = true; s.endUntil = now + kControlLeaseMs;
         s.queue.clear();
     }
@@ -249,14 +253,21 @@ struct ControlKeyboard::Impl {
     std::function<void(const RemoteInput&)> input;
     std::function<void()> release;
     std::array<bool, 256> held{};
+    std::array<bool, 256> local{};   // Down locally before the hook started.
     bool releasing = false;
     static LRESULT CALLBACK Hook(int code, WPARAM wp, LPARAM lp) {
         Impl* s = current;
         if (code < 0 || !s || GetForegroundWindow() != s->window) return CallNextHookEx(nullptr, code, wp, lp);
         const auto& k = *reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         if (k.flags & LLKHF_INJECTED || k.vkCode >= 256) return CallNextHookEx(nullptr, code, wp, lp);
-        if (s->releasing) return 1;
         const bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+        // Keys already down when the hook started stay local, and releases the
+        // remote never saw pass through; either would otherwise stick locally.
+        if (s->local[k.vkCode] || (!down && !s->held[k.vkCode])) {
+            if (!down) s->local[k.vkCode] = false;
+            return CallNextHookEx(nullptr, code, wp, lp);
+        }
+        if (s->releasing) return 1;
         const bool ctrl = s->held[VK_LCONTROL] || s->held[VK_RCONTROL] || s->held[VK_CONTROL] ||
                           (GetAsyncKeyState(VK_CONTROL) & 0x8000);
         const bool alt = s->held[VK_LMENU] || s->held[VK_RMENU] || s->held[VK_MENU] ||
@@ -265,12 +276,10 @@ struct ControlKeyboard::Impl {
             s->releasing = true;
             s->release(); return 1;
         }
-        if (down || s->held[k.vkCode]) {
-            RemoteInput e;
-            e.kind = InputKind::Key; e.code = static_cast<uint16_t>(k.vkCode);
-            e.value = static_cast<int16_t>((k.scanCode & 0xff) | ((k.flags & LLKHF_EXTENDED) ? 0x100 : 0));
-            e.down = down; s->held[k.vkCode] = down; s->input(e);
-        }
+        RemoteInput e;
+        e.kind = InputKind::Key; e.code = static_cast<uint16_t>(k.vkCode);
+        e.value = static_cast<int16_t>((k.scanCode & 0xff) | ((k.flags & LLKHF_EXTENDED) ? 0x100 : 0));
+        e.down = down; s->held[k.vkCode] = down; s->input(e);
         return 1;
     }
 };
@@ -283,6 +292,7 @@ bool ControlKeyboard::Start(HWND window, std::function<void(const RemoteInput&)>
     auto& s = *impl_;
     s.window = window; s.input = std::move(input); s.release = std::move(release); s.held.fill(false);
     s.releasing = false;
+    for (int vk = 0; vk < 256; ++vk) s.local[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
     s.hook = SetWindowsHookExW(WH_KEYBOARD_LL, Impl::Hook, GetModuleHandleW(nullptr), 0);
     if (!s.hook) return false;
     Impl::current = &s;

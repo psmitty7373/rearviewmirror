@@ -35,6 +35,11 @@ if /i "%~1"=="--no-sign" (
     shift
     goto args
 )
+if /i "%~1"=="--sign" (
+    set "SIGNING=-DRVM_SIGN=ON"
+    shift
+    goto args
+)
 if /i "%~1"=="--no-pause" (
     set "NO_PAUSE=1"
     shift
@@ -43,7 +48,7 @@ if /i "%~1"=="--no-pause" (
 set "ARG=%~1"
 if "%ARG:~0,1%"=="-" (
     echo Unknown option: %~1
-    exit /b 1
+    goto fail
 )
 if not defined CFG (
     set "CFG=%~1"
@@ -51,7 +56,7 @@ if not defined CFG (
     set "TGT=%~1"
 ) else (
     echo Unexpected argument: %~1
-    exit /b 1
+    goto fail
 )
 shift
 goto args
@@ -69,23 +74,24 @@ if exist "%VSWHERE%" (
 if not defined VCVARS set "VCVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 if not exist "%VCVARS%" (
     echo Could not find the Visual Studio C++ build tools.
-    exit /b 1
+    goto fail
 )
 call "%VCVARS%" >nul 2>&1
 if errorlevel 1 (
     echo Could not initialize MSVC environment.
-    exit /b 1
+    goto fail
 )
 
-cd /d "%~dp0" || exit /b 1
-cmake -G Ninja -S . -B build "-DCMAKE_BUILD_TYPE=%CFG%" %FEATURES% %SIGNING% || exit /b 1
+cd /d "%~dp0" || goto fail
+cmake -G Ninja -S . -B build "-DCMAKE_BUILD_TYPE=%CFG%" %FEATURES% %SIGNING% || goto fail
 if defined TGT (
-    cmake --build build --target "%TGT%" || exit /b 1
+    cmake --build build --target "%TGT%" || goto fail
 ) else (
-    cmake --build build || exit /b 1
+    cmake --build build || goto fail
 )
 echo.
 echo Build complete.
+if not defined SIGNING findstr /b /c:"RVM_SIGN:BOOL=OFF" build\CMakeCache.txt >nul && echo Signing is off from an earlier --no-sign; pass --sign to turn it back on.
 
 if not defined NO_PAUSE pause
 exit /b 0
@@ -97,8 +103,13 @@ echo   --remote-control  Build streaming and full-desktop control
 echo   --streaming-only  Build streaming without remote control
 echo   --mirrors-only    Build local mirrors without networking or the client
 echo   --no-sign         Disable executable signing
+echo   --sign            Re-enable signing after an earlier --no-sign
 echo   --no-pause        Exit without waiting for a key
 echo.
-echo Without a feature option, keep the previous CMake selection.
+echo Without a feature or signing option, keep the previous CMake selection.
 echo A fresh build defaults to streaming without remote control.
 exit /b 0
+
+:fail
+if not defined NO_PAUSE pause
+exit /b 1

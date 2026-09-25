@@ -1,7 +1,7 @@
 #include "client_window.h"
 
 namespace rvm {
-namespace { constexpr UINT_PTR kControlTimer = 3; }
+namespace { constexpr UINT kStatusTitleMs = 8000; }   // How long an end-of-control status stays.
 
 void ClientWindow::BeginControl(TileKey key) {
     EndControl();
@@ -18,7 +18,7 @@ void ClientWindow::BeginControl(TileKey key) {
     controlState_ = net::ControlState::Pending;
     server->client->Control().Begin(key.id, net::ControlNowMs());
     SetTimer(Hwnd(), kControlTimer, 50, nullptr);
-    SetWindowTextW(Hwnd(), L"Rear View Mirror Client — Requesting desktop control…");
+    SetTitle(L"Requesting desktop control…");
     Render();
 }
 
@@ -33,7 +33,8 @@ void ClientWindow::EndControl(const wchar_t* message) {
         if (Server* server = FindServer(key.server)) server->client->Control().End(net::ControlNowMs());
         if (GetCapture() == Hwnd()) ReleaseCapture();
         KillTimer(Hwnd(), kControlTimer);
-        SetWindowTextW(Hwnd(), message ? message : L"Rear View Mirror Client");
+        SetTitle(message);
+        if (message) SetTimer(Hwnd(), kTitleTimer, kStatusTitleMs, nullptr);
         Render();
     }
 }
@@ -42,19 +43,14 @@ void ClientWindow::PollControl() {
     if (!controlKey_.server) return;
     Server* server = FindServer(controlKey_.server);
     const Tile* tile = FindTile(controlKey_);
-    bool eligible = false;
-    if (server) {
-        for (const auto& mirror : server->client->Mirrors()) {
-            if (mirror.id == controlKey_.id && mirror.controllable) eligible = true;
-        }
-    }
-    if (!server || !tile || tile->popout || !eligible || !server->client->Connected() ||
+    if (!server || !tile || tile->popout || !server->client->Controllable(controlKey_.id) ||
+        !server->client->Connected() ||
         GetForegroundWindow() != Hwnd() || IsIconic(Hwnd())) { EndControl(); return; }
     const auto state = server->client->Control().State();
     if (state != net::ControlState::Pending && state != net::ControlState::Active) {
         EndControl(state == net::ControlState::Busy
-            ? L"Rear View Mirror Client — Desktop is controlled by another viewer"
-            : L"Rear View Mirror Client — Desktop control ended; select Control desktop to retry");
+            ? L"Desktop is controlled by another viewer"
+            : L"Desktop control ended; select Control desktop to retry");
         return;
     }
     if (state == net::ControlState::Active && !controlKeyboardOn_) {
@@ -63,12 +59,17 @@ void ClientWindow::PollControl() {
                 if (Server* s = FindServer(controlKey_.server)) s->client->Control().Push(e);
             }, [window = Hwnd()] { PostMessageW(window, net::WM_RELEASE_CONTROL, 0, 0); });
         if (!controlKeyboardOn_) {
-            EndControl(L"Rear View Mirror Client — Could not capture keyboard input");
+            EndControl(L"Could not capture keyboard input");
             return;
         }
-        SetWindowTextW(Hwnd(), L"Rear View Mirror Client — Controlling desktop · Ctrl+Alt+F12 to release");
+        SetTitle(L"Controlling desktop · Ctrl+Alt+F12 to release");
     }
     if (controlState_ != state) { controlState_ = state; Render(); }
+}
+
+void ClientWindow::SetTitle(const wchar_t* status) {
+    KillTimer(Hwnd(), kTitleTimer);
+    SetWindowTextW(Hwnd(), status ? (std::wstring(kClientTitle) + L" — " + status).c_str() : kClientTitle);
 }
 
 bool ClientWindow::DrawControlTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1_RECT_F& cell) {

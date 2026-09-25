@@ -4,8 +4,6 @@ namespace rvm {
 
 namespace {
 
-constexpr wchar_t kClientTitle[] = L"Rear View Mirror Client";
-
 constexpr float kPad      = 12.0f;
 constexpr float kSidebarW = 240.0f;
 constexpr float kHandleW  = 18.0f;
@@ -20,10 +18,6 @@ constexpr float kSnapPx   = 8.0f;    // Edges this close to another edge line up
 
 constexpr uint64_t kChipHoldMs = 2500;   // Name chip stays this long after the mouse leaves,
 constexpr uint64_t kChipFadeMs = 500;    // then fades out over this.
-constexpr UINT_PTR kChipTimer  = 2;
-#if RVM_REMOTE_CONTROL
-constexpr UINT_PTR kControlTimer = 3;
-#endif
 
 const D2D1_COLOR_F kBg      = { 0.067f, 0.075f, 0.094f, 1.0f };
 const D2D1_COLOR_F kPanel   = { 0.086f, 0.098f, 0.122f, 1.0f };
@@ -667,9 +661,14 @@ D2D1_RECT_F ClientWindow::TileRect(const Tile& tile) const {
 }
 
 D2D1_RECT_F ClientWindow::PictureRect(const Tile& tile) const {
-    const auto cell = TileRect(tile);
     UINT w = 0, h = 0;
-    if (!ShownSize(tile.key, w, h) || !w || !h) return {};
+    if (!ShownSize(tile.key, w, h)) return {};
+    return PictureRect(tile, w, h);
+}
+
+D2D1_RECT_F ClientWindow::PictureRect(const Tile& tile, UINT w, UINT h) const {
+    if (!w || !h) return {};
+    const auto cell = TileRect(tile);
     const float scale = (std::min)((cell.right - cell.left) / w, (cell.bottom - cell.top) / h);
     const float x = (cell.left + cell.right - w * scale) * 0.5f;
     const float y = (cell.top + cell.bottom - h * scale) * 0.5f;
@@ -1038,6 +1037,7 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
 #if RVM_REMOTE_CONTROL
         if (wp == kControlTimer) { PollControl(); return 0; }
+        if (wp == kTitleTimer) { SetTitle(); return 0; }
 #endif
         if (wp == kChipTimer) {
             KillTimer(Hwnd(), kChipTimer);
@@ -1293,8 +1293,8 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
         if (view && view->texture && view->width > 0 && view->height > 0 && view->frames > 0) {
             // Letterbox to the mirror's true aspect.
             UINT sw = view->width, sh = view->height;
-            ShownSize(tile.key, sw, sh);
-            const auto picture = PictureRect(tile);   // Also used for remote pointer mapping.
+            ShownSizeOf(view, mirror, sw, sh);
+            const auto picture = PictureRect(tile, sw, sh);   // Also used for remote pointer mapping.
             const float scale = (picture.right - picture.left) / sw;
             if (ID2D1Bitmap1* bitmap = BitmapFor(dc, view->texture.get())) {
                 dc->DrawBitmap(bitmap, picture, 1.0f,

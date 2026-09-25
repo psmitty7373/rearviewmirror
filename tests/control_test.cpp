@@ -132,10 +132,23 @@ void InjectionFailure() {
     Reply(client, Deliver(host, 1, client.Poll(now + 8), now + 8), now + 8);
     Check(client.State() == ControlState::Lost && calls == 3, "injection failure ends control and attempts held-key release");
 }
+void LostRepliesAndClockSkew() {
+    ControlHost host([](const RemoteInput&) { return true; });
+    ControlClient a, b, c;
+    const uint64_t now = ControlNowMs();
+    Connect(a, host, 1, now);
+    b.Begin(7, now);
+    Deliver(host, 2, b.Poll(now), now);   // Lose the Busy reply, then repeat the request.
+    Reply(b, Deliver(host, 2, b.Poll(now + 100), now + 100), now + 100);
+    Check(b.State() == ControlState::Busy, "repeated request after a lost busy reply stays busy");
+    c.Begin(7, now + 5);   // The UI thread stamps a time newer than the net thread read.
+    c.Poll(now + 4);
+    Check(c.State() == ControlState::Pending, "poll time read before a newer stamp does not expire control");
+}
 }
 int main() {
     static_assert(RVM_REMOTE_CONTROL, "Control tests require the feature to be enabled");
-    Reliability(); Admission(); BoundsAndReordering(); InjectionFailure();
+    Reliability(); Admission(); BoundsAndReordering(); InjectionFailure(); LostRepliesAndClockSkew();
     printf("%s\n", failures ? "FAILED" : "All control checks passed");
     return failures ? 1 : 0;
 }
