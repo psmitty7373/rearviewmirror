@@ -367,6 +367,41 @@ static void TestEncoderSizes() {
     Check(allInit, "every size at or above the 256 px floor can be encoded");
 }
 
+// Every choice in the Streaming dialog's encoder preset list starts an
+// encoder that produces frames. `--presets` measures what each one costs.
+static void TestEncoderPresets() {
+    printf("encoder presets\n");
+    if (HardwareEncoderName().empty()) {
+        printf("  SKIP  no hardware encoder\n");
+        return;
+    }
+    auto& g = Gfx::Get();
+    D3D11_TEXTURE2D_DESC nd{};
+    nd.Width = 1280; nd.Height = 720; nd.MipLevels = 1; nd.ArraySize = 1;
+    nd.Format = DXGI_FORMAT_NV12; nd.SampleDesc = { 1, 0 }; nd.Usage = D3D11_USAGE_DEFAULT;
+    nd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    winrt::com_ptr<ID3D11Texture2D> nv12;
+    if (!SUCCEEDED(g.d3d->CreateTexture2D(&nd, nullptr, nv12.put()))) {
+        Check(false, "NV12 texture for the preset check");
+        return;
+    }
+    const struct { UINT value; const char* name; } presets[] = {
+        { 0, "Fastest" }, { H264Encoder::kEncoderDefault, "Balanced" }, { 100, "Quality" },
+    };
+    for (const auto& p : presets) {
+        H264Encoder enc;
+        bool encoded = false;
+        if (enc.Init(1280, 720, 60, 4'000'000, p.value)) {
+            std::vector<EncodedFrame> out;
+            enc.EncodeSync(nv12.get(), out, 500);
+            encoded = !out.empty();
+        }
+        char what[96];
+        snprintf(what, sizeof what, "the %s preset encodes", p.name);
+        Check(encoded, what);
+    }
+}
+
 // The whole desktop as one texture the size of the virtual screen. Capture
 // sends every monitor's current picture as soon as it starts, so frames come
 // without anything on screen changing. Only frames are counted; no pixel is
@@ -405,6 +440,129 @@ static void TestDesktopCapture() {
     const int stopped = frames.load();
     Sleep(250);
     Check(frames.load() == stopped, "no frames after Stop");
+}
+
+// What the encoder spends. A mirror sends a frame whenever anything changes,
+// so a pointer moving over a still desktop is the common case and must cost
+// little; a whole screen scrolling must stay within the bitrate; and full
+// pictures come only on request, never on a timer. The picture is text-like
+// detail at 1080p, the kind a real desktop is made of.
+static void TestRateControl() {
+    printf("rate control\n");
+    if (HardwareEncoderName().empty()) {
+        printf("  SKIP  no hardware encoder\n");
+        return;
+    }
+    auto& g = Gfx::Get();
+    constexpr UINT W = 1920, H = 1080, kFps = 60, kBitrate = 8'000'000;
+
+    // Dark "glyphs" in rows on a light page: detail that does not compress
+    // away, like text. Deterministic, so every run sees the same picture.
+    std::vector<uint32_t> page(static_cast<size_t>(W) * H);
+    for (UINT y = 0; y < H; ++y) {
+        for (UINT x = 0; x < W; ++x) {
+            const bool glyphRow = (y % 18) < 12 && (x % 9) < 7;
+            uint32_t h = (x / 2) * 73856093u ^ (y / 2) * 19349663u;
+            h ^= h >> 13;
+            h *= 0x5bd1e995u;
+            const bool ink = glyphRow && (h & 0x100u);
+            page[static_cast<size_t>(y) * W + x] = ink ? 0xFF202428u : 0xFFF2F2F0u;
+        }
+    }
+    D3D11_TEXTURE2D_DESC bd{};
+    bd.Width = W; bd.Height = H; bd.MipLevels = 1; bd.ArraySize = 1;
+    bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; bd.SampleDesc = { 1, 0 };
+    bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    const D3D11_SUBRESOURCE_DATA init{ page.data(), W * 4, 0 };
+    winrt::com_ptr<ID3D11Texture2D> background, work, pointer, nv12;
+    // A second, unrelated page: alternating the two defeats prediction, the
+    // worst case an encoder can be handed.
+    std::vector<uint32_t> other(page.size());
+    for (size_t i = 0; i < other.size(); ++i) {
+        uint32_t h = static_cast<uint32_t>(i) * 2654435761u;
+        h ^= h >> 15;
+        other[i] = (h & 0x40u) ? 0xFF303438u : 0xFFE8E8E4u;
+    }
+    const D3D11_SUBRESOURCE_DATA otherInit{ other.data(), W * 4, 0 };
+    winrt::com_ptr<ID3D11Texture2D> background2;
+    D3D11_TEXTURE2D_DESC pd = bd;
+    pd.Width = 24; pd.Height = 24;
+    std::vector<uint32_t> white(24 * 24, 0xFFFFFFFFu);
+    const D3D11_SUBRESOURCE_DATA pinit{ white.data(), 24 * 4, 0 };
+    D3D11_TEXTURE2D_DESC nd = bd;
+    nd.Format = DXGI_FORMAT_NV12;
+    const bool made = SUCCEEDED(g.d3d->CreateTexture2D(&bd, &init, background.put())) &&
+                      SUCCEEDED(g.d3d->CreateTexture2D(&bd, &otherInit, background2.put())) &&
+                      SUCCEEDED(g.d3d->CreateTexture2D(&bd, nullptr, work.put())) &&
+                      SUCCEEDED(g.d3d->CreateTexture2D(&pd, &pinit, pointer.put())) &&
+                      SUCCEEDED(g.d3d->CreateTexture2D(&nd, nullptr, nv12.put()));
+    VideoConverter conv;
+    H264Encoder enc;
+    Check(made && conv.Init() && enc.Init(W, H, kFps, kBitrate), "encoder at 1920x1080, 60 fps, 8 Mbps");
+    if (!made || !enc.Ready()) return;
+
+    int keyframes = 0;
+    size_t keyBytes = 0;
+    // Draws frame `i`: the page scrolled by `scroll` pixels, a pointer at `px`.
+    auto encode = [&](UINT scroll, UINT px, size_t& bytes, ID3D11Texture2D* source = nullptr) {
+        ID3D11Texture2D* src = source ? source : background.get();
+        {
+            std::lock_guard<std::mutex> device(g.deviceMutex);
+            const UINT s = scroll % W;
+            const D3D11_BOX right{ s, 0, 0, W, H, 1 };
+            g.ctx->CopySubresourceRegion(work.get(), 0, 0, 0, 0, src, 0, &right);
+            if (s > 0) {
+                const D3D11_BOX left{ 0, 0, 0, s, H, 1 };
+                g.ctx->CopySubresourceRegion(work.get(), 0, W - s, 0, 0, src, 0, &left);
+            }
+            g.ctx->CopySubresourceRegion(work.get(), 0, px % (W - 24), 500, 0, pointer.get(), 0, nullptr);
+            conv.Convert(work.get(), 0, nullptr, nv12.get());
+        }
+        std::vector<EncodedFrame> out;
+        enc.EncodeSync(nv12.get(), out, 500);
+        for (const auto& f : out) {
+            bytes += f.data.size();
+            if (f.keyframe) {
+                ++keyframes;
+                keyBytes += f.data.size();
+            }
+        }
+    };
+
+    // The pointer wandering over a still page, for longer than the old
+    // four-second keyframe interval.
+    constexpr int kPointerFrames = kFps * 5;
+    size_t first = 0, pointerBytes = 0;
+    encode(0, 0, first);   // The opening keyframe.
+    keyBytes = 0;
+    for (int i = 1; i <= kPointerFrames; ++i) encode(0, static_cast<UINT>(i * 7), pointerBytes);
+    const int timedKeyframes = keyframes - 1;
+    const double perPointerFrame =
+        static_cast<double>(pointerBytes - keyBytes) / (kPointerFrames - timedKeyframes);
+    const double budgetPerFrame = kBitrate / 8.0 / kFps;   // What constant bitrate spends.
+    printf("  opening keyframe %zu bytes; %d more on a timer in 5 s; pointer-only frames "
+           "average %.0f bytes (constant-bitrate budget %.0f)\n",
+           first, timedKeyframes, perPointerFrame, budgetPerFrame);
+    Check(keyframes == 1, "no keyframes on a timer: only the opening one in 5 s of frames");
+    Check(perPointerFrame < budgetPerFrame / 4, "a pointer moving over a still page costs little");
+
+    // One second of the whole page scrolling: everything changes, every frame.
+    size_t scrollBytes = 0;
+    for (int i = 1; i <= static_cast<int>(kFps); ++i) encode(static_cast<UINT>(i * 6), 0, scrollBytes);
+    const double scrollMbps = scrollBytes * 8.0 / 1e6;
+    printf("  one second of scrolling: %.2f Mbps (limit %.0f)\n", scrollMbps, kBitrate / 1e6);
+    Check(scrollMbps <= kBitrate / 1e6 * 1.25, "a whole screen scrolling stays within the bitrate");
+
+    // The worst case, reported rather than checked: every frame unrelated to
+    // the one before. No rate-control mode holds this to the limit: the
+    // encoder will not drop quality further, so each frame stays large.
+    // Only sending fewer frames could, which the frame-rate cap does.
+    size_t worstBytes = 0;
+    for (int i = 1; i <= static_cast<int>(kFps); ++i) {
+        encode(static_cast<UINT>(i * 37), 0, worstBytes, (i & 1) ? background2.get() : background.get());
+    }
+    const double worstMbps = worstBytes * 8.0 / 1e6;
+    printf("  one second of unrelated pictures: %.2f Mbps (limit %.0f)\n", worstMbps, kBitrate / 1e6);
 }
 
 // The mirror renderer hands the server its cache texture, which is bound as a
@@ -1153,6 +1311,137 @@ static int Bench() {
 // `--live`: connect a headless client to the app's own running server, using
 // the key from its settings file, and report what arrives. Splits a "no
 // frames" report into a server-side or client-side problem.
+// Luma PSNR between two NV12 pictures of the same size, read back through
+// staging copies. Only the Y plane: text sharpness lives there.
+static double LumaPsnr(ID3D11Texture2D* a, UINT aSlice, ID3D11Texture2D* b, UINT w, UINT h) {
+    auto& g = Gfx::Get();
+    D3D11_TEXTURE2D_DESC sd{};
+    sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Format = DXGI_FORMAT_NV12; sd.SampleDesc = { 1, 0 };
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    winrt::com_ptr<ID3D11Texture2D> sa, sb;
+    if (FAILED(g.d3d->CreateTexture2D(&sd, nullptr, sa.put())) ||
+        FAILED(g.d3d->CreateTexture2D(&sd, nullptr, sb.put()))) {
+        return 0.0;
+    }
+    std::lock_guard<std::mutex> device(g.deviceMutex);
+    const D3D11_BOX box{ 0, 0, 0, w, h, 1 };
+    g.ctx->CopySubresourceRegion(sa.get(), 0, 0, 0, 0, a, aSlice, &box);
+    g.ctx->CopySubresourceRegion(sb.get(), 0, 0, 0, 0, b, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE ma{}, mb{};
+    if (FAILED(g.ctx->Map(sa.get(), 0, D3D11_MAP_READ, 0, &ma))) return 0.0;
+    if (FAILED(g.ctx->Map(sb.get(), 0, D3D11_MAP_READ, 0, &mb))) {
+        g.ctx->Unmap(sa.get(), 0);
+        return 0.0;
+    }
+    double sse = 0.0;
+    for (UINT y = 0; y < h; ++y) {
+        const auto* ra = static_cast<const uint8_t*>(ma.pData) + static_cast<size_t>(y) * ma.RowPitch;
+        const auto* rb = static_cast<const uint8_t*>(mb.pData) + static_cast<size_t>(y) * mb.RowPitch;
+        for (UINT x = 0; x < w; ++x) {
+            const double d = static_cast<double>(ra[x]) - rb[x];
+            sse += d * d;
+        }
+    }
+    g.ctx->Unmap(sa.get(), 0);
+    g.ctx->Unmap(sb.get(), 0);
+    const double mse = sse / (static_cast<double>(w) * h);
+    return mse <= 0.0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
+}
+
+// `--presets`: what the encoder's quality-vs-speed setting does here. A
+// desktop-sized, text-like page scrolls for 240 frames at 240 fps; each
+// setting reports its time per frame (how busy the video engine is kept) and
+// the text quality it delivers at the same bitrate.
+static int PresetBench() {
+    Gfx::Get().Init();
+    auto& g = Gfx::Get();
+    constexpr UINT W = 4096, H = 1152, kFps = 240, kBitrate = 20'000'000;
+    constexpr int kFrames = 240;
+
+    std::vector<uint32_t> page(static_cast<size_t>(W) * H);
+    for (UINT y = 0; y < H; ++y) {
+        for (UINT x = 0; x < W; ++x) {
+            const bool glyphRow = (y % 18) < 12 && (x % 9) < 7;
+            uint32_t hsh = (x / 2) * 73856093u ^ (y / 2) * 19349663u;
+            hsh ^= hsh >> 13;
+            hsh *= 0x5bd1e995u;
+            page[static_cast<size_t>(y) * W + x] = (glyphRow && (hsh & 0x100u)) ? 0xFF202428u : 0xFFF2F2F0u;
+        }
+    }
+    D3D11_TEXTURE2D_DESC bd{};
+    bd.Width = W; bd.Height = H; bd.MipLevels = 1; bd.ArraySize = 1;
+    bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; bd.SampleDesc = { 1, 0 };
+    bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    const D3D11_SUBRESOURCE_DATA init{ page.data(), W * 4, 0 };
+    D3D11_TEXTURE2D_DESC nd = bd;
+    nd.Format = DXGI_FORMAT_NV12;
+    winrt::com_ptr<ID3D11Texture2D> background, work, nv12;
+    if (FAILED(g.d3d->CreateTexture2D(&bd, &init, background.put())) ||
+        FAILED(g.d3d->CreateTexture2D(&bd, nullptr, work.put())) ||
+        FAILED(g.d3d->CreateTexture2D(&nd, nullptr, nv12.put()))) {
+        printf("textures unavailable\n");
+        return 1;
+    }
+    VideoConverter conv;
+    if (!conv.Init()) return 1;
+
+    LARGE_INTEGER f{};
+    QueryPerformanceFrequency(&f);
+    printf("%ux%u at %u fps, %u Mbps, %d frames of scrolling text\n", W, H, kFps, kBitrate / 1'000'000,
+           kFrames);
+    printf("  setting   ms/frame  slowest  serial fps  Mbps   text PSNR\n");
+    const UINT settings[] = { H264Encoder::kEncoderDefault, 0, 25, 33, 50, 66, 75, 100 };
+    for (const UINT q : settings) {
+        H264Encoder enc;
+        H264Decoder dec;
+        if (!enc.Init(W, H, kFps, kBitrate, q) || !dec.Init()) {
+            printf("  %7s   encoder unavailable\n", q == H264Encoder::kEncoderDefault ? "default" : std::to_string(q).c_str());
+            continue;
+        }
+        double total = 0, slowest = 0, psnrSum = 0;
+        int psnrCount = 0;
+        size_t bytes = 0;
+        for (int i = 0; i < kFrames; ++i) {
+            {
+                std::lock_guard<std::mutex> device(g.deviceMutex);
+                const UINT s = static_cast<UINT>(i * 6) % W;
+                const D3D11_BOX right{ s, 0, 0, W, H, 1 };
+                g.ctx->CopySubresourceRegion(work.get(), 0, 0, 0, 0, background.get(), 0, &right);
+                if (s > 0) {
+                    const D3D11_BOX left{ 0, 0, 0, s, H, 1 };
+                    g.ctx->CopySubresourceRegion(work.get(), 0, W - s, 0, 0, background.get(), 0, &left);
+                }
+                conv.Convert(work.get(), 0, nullptr, nv12.get());
+            }
+            std::vector<EncodedFrame> out;
+            LARGE_INTEGER a{}, b{};
+            QueryPerformanceCounter(&a);
+            enc.EncodeSync(nv12.get(), out, 500);
+            QueryPerformanceCounter(&b);
+            const double ms = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+            total += ms;
+            slowest = (std::max)(slowest, ms);
+            for (const auto& frame : out) {
+                bytes += frame.data.size();
+                std::vector<DecodedFrame> decoded;
+                if (dec.Decode(frame.data.data(), frame.data.size(), decoded) && !decoded.empty() &&
+                    i % 30 == 29) {
+                    psnrSum += LumaPsnr(decoded.back().texture.get(), decoded.back().subresource,
+                                        nv12.get(), W, H);
+                    ++psnrCount;
+                }
+            }
+        }
+        const double perFrame = total / kFrames;
+        printf("  %7s   %8.2f  %7.2f  %10.0f  %5.1f   %6.2f dB\n",
+               q == H264Encoder::kEncoderDefault ? "default" : std::to_string(q).c_str(), perFrame,
+               slowest, 1000.0 / perFrame, bytes * 8.0 / 1e6 * kFps / kFrames,
+               psnrCount ? psnrSum / psnrCount : 0.0);
+    }
+    return 0;
+}
+
 static int LiveProbe() {
     const std::wstring path = ConfigDir() + L"\\stream.ini";
     const int port = static_cast<int>(GetPrivateProfileIntW(L"Stream", L"Port", 5901, path.c_str()));
@@ -1202,6 +1491,11 @@ static int LiveProbe() {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && strcmp(argv[1], "--presets") == 0) {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        LogOpen(L"test");
+        return PresetBench();
+    }
     if (argc > 1 && strcmp(argv[1], "--bench") == 0) {
         winrt::init_apartment(winrt::apartment_type::single_threaded);
         return Bench();
@@ -1242,6 +1536,8 @@ int main(int argc, char** argv) {
         Gfx::Get().Init();
         TestCodec();
         TestEncoderSizes();
+        TestRateControl();
+        TestEncoderPresets();
         TestConverterSources();
         TestDesktopCapture();
         TestLoopback();

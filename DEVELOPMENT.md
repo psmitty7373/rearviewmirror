@@ -181,6 +181,44 @@ carries everything.
   few textures that come round every frame, and turns off the driver's
   automatic processing so the conversion is a plain one.
 
+### Rate control and keyframes
+
+The encoder runs at a constant bitrate with no B-frames, in low-latency mode,
+and sends full pictures only when asked: a new viewer, or a frame lost for
+good. It never sends them on a timer, which at desktop sizes would cost several
+hundred KB every few seconds. It asks for the longest keyframe interval the
+encoder accepts, falling back to shorter ones for encoders that cap it.
+
+Constant bitrate was kept after measuring the alternatives on NVENC with
+text-like 1080p content at 8 Mbps:
+
+| Mode | Pointer-only frame | Every frame unrelated |
+| --- | --- | --- |
+| Constant | 2.3 KB | 56 Mbps |
+| Peak-constrained VBR | identical to constant | identical |
+| Quality-based | 0.2 KB | 340 to 600 Mbps, peak limit ignored |
+
+Constant bitrate already spends little on small changes. Quality mode would
+save more, but it has no ceiling, and bursts that large would flood the link
+and lose packets. No mode keeps a stream of unrelated pictures within the
+limit, because the encoder will not drop quality any further. Only sending
+fewer frames could. The rate-control test reports all of this on whatever
+encoder it runs on.
+
+The *Encoder preset* setting maps to `CODECAPI_AVEncCommonQualityVsSpeed`:
+*Fastest* is 0, *Quality* is 100, and *Balanced* leaves the encoder's own
+default. NVENC has three steps, at 0 to 32, 33 to 65 and 66 to 100. At 4096x1152
+and 20 Mbps on scrolling text (`rvmnet_test --presets`):
+
+| Preset | Encode time per frame | Text PSNR |
+| --- | --- | --- |
+| Fastest | 2.4 ms | 33.0 dB |
+| Balanced (default) | 4.8 ms | 31.9 dB |
+| Quality | 6.4 ms | 31.3 dB |
+
+On this content the fastest preset was also the sharpest; the slower presets
+spend their effort on motion search, which text does not reward.
+
 ### Encoder quirks
 
 - Intel Quick Sync changes its output type on the first frame
@@ -268,7 +306,8 @@ with a warning. Nothing is stored in the repository.
 packetisation with loss, GPU encode/decode round trips, encoder size limits
 (including whole-desktop sizes), desktop capture (frames counted, never read
 back), a full server-to-client loopback, reconnects, hostile-client limits, the
-frame-rate cap and a 120 fps end-to-end stream. It logs to `test.log` beside the
+frame-rate cap, rate control and keyframe policy, and a 120 fps end-to-end
+stream. It logs to `test.log` beside the
 app's logs. Timing checks leave room for a busy machine; servers bind port 0
 so a running copy of the app doesn't get in the way.
 
@@ -276,4 +315,5 @@ so a running copy of the app doesn't get in the way.
 | --- | --- |
 | `rvmnet_test.exe` | Run every test |
 | `--bench` | Time the encoder path on this machine |
+| `--presets` | Time and quality of each encoder preset at desktop size |
 | `--live` | Connect to this PC's running app and report what arrives |

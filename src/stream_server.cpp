@@ -34,6 +34,16 @@ constexpr uint64_t kKeyframeGapMs = 250;
 // rebuilt once the size has held this long.
 constexpr uint64_t kResizeSettleMs = 250;
 
+// The encoder's 0 to 100 scale for a preset. NVIDIA's encoder steps at 33 and
+// 66; Balanced leaves every encoder its own default.
+UINT QualityVsSpeed(EncoderPreset preset) {
+    switch (preset) {
+    case EncoderPreset::Fastest: return 0;
+    case EncoderPreset::Quality: return 100;
+    default:                     return H264Encoder::kEncoderDefault;
+    }
+}
+
 uint64_t NowMs() {
     return GetTickCount64();
 }
@@ -169,8 +179,9 @@ bool StreamServer::Start(const StreamSettings& settings) {
     running_ = true;
     netThread_ = std::thread([this] { NetLoop(); });
     encodeThread_ = std::thread([this] { EncodeLoop(); });
-    Log(L"server: started on udp %u, %u kbps, %u fps, encoder '%s'", Port(),
-        settings.bitrateKbps, settings.fps, HardwareEncoderName().c_str());
+    Log(L"server: started on udp %u, %u kbps, %u fps, preset %d, encoder '%s'", Port(),
+        settings.bitrateKbps, settings.fps, static_cast<int>(settings.preset),
+        HardwareEncoderName().c_str());
     return true;
 }
 
@@ -586,7 +597,8 @@ void StreamServer::EncodeStream(Stream& s) {
         bool ok = false;
         if (now >= s.nextInitMs) {
             s.encoder.SetWakeEvent(frameEvent_);
-            ok = s.encoder.Init(w, h, settings_.fps, settings_.bitrateKbps * 1000);
+            ok = s.encoder.Init(w, h, settings_.fps, settings_.bitrateKbps * 1000,
+                                QualityVsSpeed(settings_.preset));
             Log(L"server: encoder init %ux%u for mirror %u -> %s", w, h, s.mirrorId,
                 ok ? L"ok" : L"FAILED");
             {

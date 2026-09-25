@@ -38,28 +38,26 @@ monitors, the stream is scaled to at most 4096 pixels wide.
 **When source resizes** (right-click): *Stay at fixed offset* suits toolbars and
 side panels; *Scale with the window* suits videos and charts that reflow.
 
-**Click-through** lets clicks pass straight through a mirror. Undo it from the
-manager, the tray, or `Ctrl+Alt+T`.
+**Click-through** lets clicks pass straight through a mirror. It is set for each
+mirror on its own; undo it from that mirror's manager card.
 
 **Hide** removes the window but keeps capturing, for mirrors that are only
-streamed. **Off** (manager switch or tray list) stops capturing entirely.
+streamed. **Off** (the manager card's switch) stops capturing entirely.
 
 ## Hotkeys
 
 | Key | Action |
 | --- | --- |
 | `Ctrl+Alt+M` | New mirror |
-| `Ctrl+Alt+T` | Click-through on for all mirrors, or off if all are on |
 | `Ctrl+Alt+X` | Close all mirrors and forget them (asks first) |
 
 ## Tray and manager
 
 - **Double-click the tray icon** for the manager: one card per mirror with an
   on/off switch, opacity and size sliders, *Region…*, *Remove*,
-  *Click-through* and *Hide*. The header has *Streaming*, *Click-through all*
-  and *New mirror*.
-- **Right-click the tray icon** for the menu. Its *Mirrors* list toggles a
-  mirror on or off with a click, and removes it with a right-click.
+  *Click-through* and *Hide*. The header has *Streaming* and *New mirror*.
+- **Right-click the tray icon** for *Manage mirrors…*, *New mirror…*, *Close
+  and forget all* and *Exit*. Everything else is in the manager.
 
 If a mirror's source window closes, the mirror waits and comes back when the
 window reopens. Only *Close*, *Remove* and `Ctrl+Alt+X` discard a mirror.
@@ -70,11 +68,13 @@ pick up where they left off.
 
 ## Streaming
 
-**On the PC with the mirrors:** open *Streaming* (tray menu or manager header).
+**On the PC with the mirrors:** open *Streaming* in the manager's header.
 
 1. Pick a UDP port and press *Generate* for a shared key. The key is shown so
    you can copy it; *Show* reveals or hides it.
-2. Set *Bitrate* and *Frame rate* (an upper limit, 1 to 240 fps).
+2. Set *Bitrate*, *Frame rate* (an upper limit, 1 to 240 fps) and *Encoder
+   preset*. *Fastest* uses the least GPU time and suits high frame rates;
+   *Balanced* is the encoder's default.
 3. Press *Start*. Forward the UDP port on your router to this PC, and allow the
    app through Windows Firewall when asked.
 

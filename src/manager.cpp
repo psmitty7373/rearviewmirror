@@ -134,7 +134,6 @@ void ManagerWindow::PrepareDraw() {
     cards_.clear();
     if (!app_) return;
 
-    allClickThrough_ = app_->AllClickThrough();
     streamingOn_     = app_->StreamingOn();
     streamClients_   = app_->StreamClients();
     for (size_t i = 0; i < app_->MirrorCount(); ++i) {
@@ -193,14 +192,8 @@ D2D1_RECT_F ManagerWindow::NewMirrorButton() const {
     return D2D1::RectF(right - w, cy - S(kButtonH) * 0.5f, right, cy + S(kButtonH) * 0.5f);
 }
 
-D2D1_RECT_F ManagerWindow::AllClickThroughButton() const {
-    const D2D1_RECT_F next = NewMirrorButton();
-    const float w = S(128.0f);
-    return D2D1::RectF(next.left - S(8.0f) - w, next.top, next.left - S(8.0f), next.bottom);
-}
-
 D2D1_RECT_F ManagerWindow::StreamingButton() const {
-    const D2D1_RECT_F next = AllClickThroughButton();
+    const D2D1_RECT_F next = NewMirrorButton();
     const float w = S(104.0f);
     return D2D1::RectF(next.left - S(8.0f) - w, next.top, next.left - S(8.0f), next.bottom);
 }
@@ -256,10 +249,6 @@ ManagerWindow::Hit ManagerWindow::HitTest(POINT pt) const {
     Hit hit;
     if (Contains(NewMirrorButton(), pt)) {
         hit.part = Part::NewMirror;
-        return hit;
-    }
-    if (Contains(AllClickThroughButton(), pt)) {
-        hit.part = Part::AllClickThrough;
         return hit;
     }
     if (Contains(StreamingButton(), pt)) {
@@ -421,9 +410,6 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             switch (hit.part) {
             case Part::NewMirror:
                 app_->RequestNewMirror();
-                break;
-            case Part::AllClickThrough:
-                app_->SetClickThroughAll(!app_->AllClickThrough());
                 break;
             case Part::Streaming:
                 app_->ShowStreamSettings();
@@ -643,8 +629,6 @@ void ManagerWindow::OnDraw(ID2D1DeviceContext* dc) {
         streaming += L" (" + std::to_wstring(streamClients_) + L")";
     }
     DrawButton(dc, StreamingButton(), streaming, hot_.part == Part::Streaming, false, streamingOn_);
-    DrawButton(dc, AllClickThroughButton(), L"Click-through all",
-               hot_.part == Part::AllClickThrough, false, allClickThrough_);
     DrawButton(dc, NewMirrorButton(), L"New mirror", hot_.part == Part::NewMirror, false);
 
     const float overflow = ContentHeight() - ViewportHeight();

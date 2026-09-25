@@ -13,6 +13,7 @@
 #define IDC_STREAM_TOGGLE   209
 #define IDC_STREAM_HELP     210
 #define IDC_STREAM_SHOWKEY  211
+#define IDC_STREAM_PRESET   212
 
 #define IDD_CONNECT         300
 #define IDC_CONNECT_HOST    301

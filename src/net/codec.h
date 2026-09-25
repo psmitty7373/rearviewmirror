@@ -39,7 +39,11 @@ public:
     // caller may close its handle whenever it likes. Set before Init().
     void SetWakeEvent(HANDLE wake) { wake_ = wake; }
 
-    bool Init(UINT width, UINT height, UINT fps, UINT bitrateBps);
+    // `qualityVsSpeed`: 0 fastest to 100 best, as the encoder's presets see
+    // it; kEncoderDefault leaves the encoder's own choice.
+    static constexpr UINT kEncoderDefault = 0xFFFFFFFFu;
+    bool Init(UINT width, UINT height, UINT fps, UINT bitrateBps,
+              UINT qualityVsSpeed = kEncoderDefault);
     void Shutdown();
     bool Ready() const { return mft_ != nullptr; }
 
@@ -107,6 +111,8 @@ private:
     int   inputsWanted_ = 0;
     std::atomic<bool> forceKeyframe_{ false };
     UINT  width_ = 0, height_ = 0, fps_ = 60, bitrate_ = 0;
+    ULONG gopSize_ = 0;   // Frames between keyframes the encoder accepted; 0 if none.
+    UINT  qualityVsSpeed_ = kEncoderDefault;
     LONGLONG frameIndex_ = 0;
     std::wstring name_;
 

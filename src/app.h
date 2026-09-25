@@ -17,11 +17,6 @@ public:
     void    CloseMirror(uint32_t id);
     void    RequestNewMirror();
 
-    // Click-through is per mirror; these act on all of them at once, which is
-    // the way out when every mirror is ignoring the mouse.
-    bool AllClickThrough() const;
-    void SetClickThroughAll(bool on);
-
     // The streaming server, for the manager's header button, which opens the
     // settings dialog where it is started and stopped.
     bool   StreamingOn() const { return server_.Running(); }
@@ -42,7 +37,6 @@ private:
 
     void NewMirror();
     void NewDesktopMirror();
-    void ConfirmCloseMirror(uint32_t id);
     void CloseAll();
     void ConfirmCloseAll();
     void OnDeviceLost();
@@ -92,11 +86,6 @@ private:
     // Reopening an app brings its window to the foreground, so that event is
     // the cue to rebind right away instead of waiting for the next poll.
     HWINEVENTHOOK foregroundHook_ = nullptr;
-
-    // WM_MENURBUTTONUP reports a right-click while the menu is still up, so it
-    // is stashed here and acted on once the menu closes.
-    HMENU    mirrorListMenu_ = nullptr;
-    uint32_t rightClickedId_ = 0;
 
     uint32_t nextId_ = 1;
     HICON iconLarge_ = nullptr;

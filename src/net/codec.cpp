@@ -321,9 +321,10 @@ void H264Encoder::Shutdown() {
 
 // Tries each hardware encoder in turn, the one on our own GPU first, and
 // logs exactly where any of them refused.
-bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps) {
+bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps, UINT qualityVsSpeed) {
     EnsureMf();
     Shutdown();
+    qualityVsSpeed_ = qualityVsSpeed;
     width_ = width & ~1u;
     height_ = height & ~1u;
     fps_ = (std::max)(fps, 1u);
@@ -346,8 +347,9 @@ bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps) {
                 if (now >= deadline) break;
                 WaitForEvents(static_cast<DWORD>(deadline - now));
             }
-            Log(L"encoder: '%s' ready at %ux%u, %u fps, %u kbps%s", name_.c_str(), width_, height_,
-                fps_, bitrate_ / 1000, WantsInput() ? L"" : L" (no input request yet)");
+            Log(L"encoder: '%s' ready at %ux%u, %u fps, %u kbps, keyframe interval %lu%s",
+                name_.c_str(), width_, height_, fps_, bitrate_ / 1000, gopSize_,
+                WantsInput() ? L"" : L" (no input request yet)");
             return true;
         }
         Shutdown();
@@ -393,14 +395,39 @@ bool H264Encoder::TryInit(IMFActivate* activate) {
         VARIANT v;
         VariantInit(&v);
         v.vt = VT_UI4;
+        // Constant bitrate, measured against the alternatives on NVENC: a
+        // pointer moving over a still desktop costs about 2 KB a frame, far
+        // under the budget, so there is little to save. Peak-constrained VBR
+        // behaved identically, and quality-based modes ignored any peak
+        // limit and ran to hundreds of Mbps on heavy motion.
         v.ulVal = eAVEncCommonRateControlMode_CBR;
         codec_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
         v.ulVal = bitrate_;
         codec_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
         v.ulVal = 0;
         codec_->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
-        v.ulVal = fps_ * 4;
-        codec_->SetValue(&CODECAPI_AVEncMPVGOPSize, &v);
+        // No keyframes on a timer. A full picture costs hundreds of KB at
+        // desktop sizes, and the stream already asks for one whenever it
+        // needs it: a new viewer, or a frame lost for good. The longest
+        // interval the encoder accepts; some cap it.
+        gopSize_ = 0;
+        for (const ULONG gop : { 0xFFFFFFFFul, 65535ul, fps_ * 60ul }) {
+            v.ulVal = gop;
+            if (SUCCEEDED(codec_->SetValue(&CODECAPI_AVEncMPVGOPSize, &v))) {
+                gopSize_ = gop;
+                break;
+            }
+        }
+        // Quality against speed: NVENC maps this onto its presets. How much
+        // work each frame gets, and so how busy the video engine runs.
+        if (qualityVsSpeed_ != kEncoderDefault) {
+            v.ulVal = (std::min)(qualityVsSpeed_, 100u);
+            const HRESULT q = codec_->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &v);
+            if (FAILED(q)) {
+                Log(L"encoder: '%s' refused quality-vs-speed %u (0x%08X)", name_.c_str(), v.ulVal,
+                    static_cast<unsigned>(q));
+            }
+        }
         v.vt = VT_BOOL;
         v.boolVal = VARIANT_TRUE;
         codec_->SetValue(&CODECAPI_AVLowLatencyMode, &v);

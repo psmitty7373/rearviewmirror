@@ -72,6 +72,11 @@ bool ReadFields(HWND dlg, const StreamSettings& base, bool needKey, StreamSettin
     out.port = static_cast<uint16_t>(port);
     out.bitrateKbps = mbps * 1000;
     out.fps = fps;
+    const LRESULT pick = SendDlgItemMessageW(dlg, IDC_STREAM_PRESET, CB_GETCURSEL, 0, 0);
+    if (pick != CB_ERR) {
+        out.preset = static_cast<EncoderPreset>(
+            SendDlgItemMessageW(dlg, IDC_STREAM_PRESET, CB_GETITEMDATA, static_cast<WPARAM>(pick), 0));
+    }
     out.key = GetSecretText(dlg, IDC_STREAM_KEY);
     if (needKey && out.key.size() < 8) {
         MessageBoxW(dlg, L"The shared key needs at least 8 characters. Generate one, or type your own.",
@@ -102,6 +107,19 @@ INT_PTR CALLBACK StreamDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         SetDlgItemTextW(dlg, IDC_STREAM_KEY, s.key.c_str());
         SetDlgItemInt(dlg, IDC_STREAM_BITRATE, (std::max)(s.bitrateKbps / 1000, 1u), FALSE);
         SetDlgItemInt(dlg, IDC_STREAM_FPS, s.fps, FALSE);
+        {
+            const HWND combo = GetDlgItem(dlg, IDC_STREAM_PRESET);
+            const struct { EncoderPreset preset; const wchar_t* label; } presets[] = {
+                { EncoderPreset::Fastest,  L"Fastest: least GPU time" },
+                { EncoderPreset::Balanced, L"Balanced (default)" },
+                { EncoderPreset::Quality,  L"Quality: most GPU time" },
+            };
+            for (const auto& p : presets) {
+                const LRESULT i = SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(p.label));
+                SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(i), static_cast<LPARAM>(p.preset));
+                if (p.preset == s.preset) SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(i), 0);
+            }
+        }
 
         const std::wstring encoder = net::HardwareEncoderName();
         state->encoderAvailable = !encoder.empty();
@@ -198,6 +216,7 @@ StreamSettings LoadStreamSettings() {
     s.bitrateKbps = static_cast<UINT>(ClampI(ReadInt(L"BitrateKbps", 8000, path), 1000, 100000));
     s.fps         = static_cast<UINT>(ClampI(ReadInt(L"Fps", 60, path), static_cast<int>(kMinStreamFps),
                                                    static_cast<int>(kMaxStreamFps)));
+    s.preset      = static_cast<EncoderPreset>(ClampI(ReadInt(L"Preset", 0, path), 0, 2));
 
     const std::vector<uint8_t> blob = net::FromHex(ReadStr(L"KeyBlob", path));
     std::wstring secret;
@@ -219,6 +238,7 @@ bool SaveStreamSettings(const StreamSettings& s) {
     text += L"Port=" + std::to_wstring(s.port) + L"\r\n";
     text += L"BitrateKbps=" + std::to_wstring(s.bitrateKbps) + L"\r\n";
     text += L"Fps=" + std::to_wstring(s.fps) + L"\r\n";
+    text += L"Preset=" + std::to_wstring(static_cast<int>(s.preset)) + L"\r\n";
     text += L"KeyBlob=" + net::ToHex(blob) + L"\r\n";
     return WriteTextAtomically(SettingsPath(), text);
 }

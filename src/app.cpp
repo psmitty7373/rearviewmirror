@@ -25,21 +25,15 @@ void CALLBACK ForegroundChanged(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, D
 
 enum HotkeyId : int {
     kHotkeyNewMirror = 1,
-    kHotkeyClickThrough,
     kHotkeyCloseAll,
 };
 
 enum TrayMenuId : UINT {
     kTrayNewMirror = 1,
-    kTrayClickThrough,
     kTrayCloseAll,
     kTrayExit,
     kTrayManager,
-    kTrayStreaming,
 };
-
-// Menu command ids for the mirror list are offset mirror ids, never positions.
-constexpr UINT kMirrorMenuBase = 1000;
 
 }  // namespace
 
@@ -104,37 +98,13 @@ void App::ShowBalloon(const std::wstring& text) {
 }
 
 void App::ShowTrayMenu() {
-    // A plain list, one line per mirror, checked when it is switched on.
-    // Clicking toggles it; right-clicking offers to remove it.
-    HMENU mirrorList = CreatePopupMenu();
-    if (mirrors_.empty()) {
-        AppendMenuW(mirrorList, MF_STRING | MF_GRAYED, 0, L"(no mirrors)");
-    } else {
-        for (const auto& m : mirrors_) {
-            std::wstring label = m->DisplayName();
-            if (m->Enabled() && m->Hidden()) label += L"   (hidden)";
-            AppendMenuW(mirrorList, MF_STRING | (m->Enabled() ? MF_CHECKED : 0),
-                        kMirrorMenuBase + m->Id(), label.c_str());
-        }
-    }
-    mirrorListMenu_ = mirrorList;
-    rightClickedId_ = 0;
-
+    // Mirrors and streaming are managed from the manager window; the menu is
+    // just the way in, plus the actions that must work without it.
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kTrayManager, L"Manage mirrors…");
     SetMenuDefaultItem(menu, kTrayManager, FALSE);   // Matches the double-click.
     AppendMenuW(menu, MF_STRING, kTrayNewMirror, L"New mirror…\tCtrl+Alt+M");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(mirrorList), L"Mirrors");
-    std::wstring streaming = L"Streaming…";
-    if (server_.Running()) {
-        streaming = L"Streaming (on, " +
-                    Plural(static_cast<int>(server_.ClientCount()), L"client", L"clients") + L")…";
-    }
-    AppendMenuW(menu, MF_STRING, kTrayStreaming, streaming.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    const bool allThrough = AllClickThrough();
-    AppendMenuW(menu, MF_STRING | (allThrough ? MF_CHECKED : 0) | (mirrors_.empty() ? MF_GRAYED : 0),
-                kTrayClickThrough, L"Click-through, all mirrors\tCtrl+Alt+T");
     const bool anything = !mirrors_.empty() || !pending_.empty();
     AppendMenuW(menu, MF_STRING | (anything ? 0 : MF_GRAYED), kTrayCloseAll,
                 L"Close and forget all\tCtrl+Alt+X");
@@ -144,56 +114,18 @@ void App::ShowTrayMenu() {
     POINT pt{};
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd_);
-    // No TPM_NONOTIFY: WM_MENURBUTTONUP is how a right-click on an entry is
-    // reported. No TPM_RIGHTBUTTON either, so a right-click does not also
-    // activate the item it lands on.
     const UINT cmd = static_cast<UINT>(TrackPopupMenu(
-        menu, TPM_RETURNCMD, pt.x, pt.y, 0, hwnd_, nullptr));
+        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd_, nullptr));
     PostMessageW(hwnd_, WM_NULL, 0, 0);
     DestroyMenu(menu);
-    mirrorListMenu_ = nullptr;
-
-    if (rightClickedId_ != 0) {
-        const uint32_t id = rightClickedId_;
-        rightClickedId_ = 0;
-        ConfirmCloseMirror(id);
-        return;
-    }
-
-    if (cmd >= kMirrorMenuBase) {
-        if (Mirror* m = FindMirror(cmd - kMirrorMenuBase)) {
-            if (m->Enabled() && m->Hidden()) {
-                m->SetHidden(false);   // Listed as "(hidden)": the click shows it.
-                return;
-            }
-            if (!SetMirrorEnabled(*m, !m->Enabled())) {
-                ShowBalloon(m->IsDesktop()
-                    ? L"Could not switch that mirror back on: the desktop could not be captured."
-                    : L"Could not switch that mirror back on: its source window is not open.");
-            }
-        }
-        return;
-    }
 
     switch (cmd) {
-    case kTrayManager:      manager_.Open(this); break;
-    case kTrayStreaming:    ShowStreamSettings(); break;
-    case kTrayNewMirror:    RequestNewMirror(); break;
-    case kTrayClickThrough: SetClickThroughAll(!allThrough); break;
-    case kTrayCloseAll:     ConfirmCloseAll(); break;
-    case kTrayExit:         PostMessageW(hwnd_, WM_CLOSE, 0, 0); break;
+    case kTrayManager:   manager_.Open(this); break;
+    case kTrayNewMirror: RequestNewMirror(); break;
+    case kTrayCloseAll:  ConfirmCloseAll(); break;
+    case kTrayExit:      PostMessageW(hwnd_, WM_CLOSE, 0, 0); break;
     default: break;
     }
-}
-
-void App::ConfirmCloseMirror(uint32_t id) {
-    Mirror* m = FindMirror(id);
-    if (!m) return;
-    const std::wstring text = L"Close this mirror?\n\n" + m->DisplayName();
-    SetForegroundWindow(hwnd_);
-    const int answer = MessageBoxW(nullptr, text.c_str(), kAppName,
-                                   MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-    if (answer == IDYES) CloseMirror(id);   // Re-resolved: the box ran a nested loop.
 }
 
 void App::NewMirror() {
@@ -356,17 +288,6 @@ void App::CloseAll() {
     manager_.Refresh();
 }
 
-bool App::AllClickThrough() const {
-    if (mirrors_.empty()) return false;
-    return std::all_of(mirrors_.begin(), mirrors_.end(),
-                       [](const auto& m) { return m->ClickThrough(); });
-}
-
-void App::SetClickThroughAll(bool on) {
-    for (auto& m : mirrors_) m->SetClickThrough(on);   // Each posts a state change.
-    manager_.Refresh();
-}
-
 void App::MarkDirty() {
     dirty_ = true;
     SetTimer(hwnd_, kTimerSave, kSaveDelayMs, nullptr);
@@ -437,7 +358,8 @@ void App::ShowStreamSettings() {
     streamSettings_ = edited;
     SaveStreamSettings(streamSettings_);
     const bool changed = before.port != edited.port || before.key != edited.key ||
-                         before.bitrateKbps != edited.bitrateKbps || before.fps != edited.fps;
+                         before.bitrateKbps != edited.bitrateKbps || before.fps != edited.fps ||
+                         before.preset != edited.preset;
     if (server_.Running() && changed && !ApplyStreamSettings()) {
         ShowBalloon(L"Streaming could not restart on UDP port " +
                     std::to_wstring(streamSettings_.port) + L". Is another program using it?");
@@ -648,18 +570,6 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_MENURBUTTONUP:
-        // Right-click on a mirror entry: note which, then close the menu so the
-        // confirmation is not competing with it for input.
-        if (reinterpret_cast<HMENU>(lp) == mirrorListMenu_) {
-            const UINT item = GetMenuItemID(mirrorListMenu_, static_cast<int>(wp));
-            if (item != static_cast<UINT>(-1) && item >= kMirrorMenuBase) {
-                rightClickedId_ = item - kMirrorMenuBase;
-                EndMenu();
-            }
-        }
-        return 0;
-
     case WM_TIMER:
         if (wp == kTimerSave) {
             SaveNow();
@@ -687,7 +597,6 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         switch (static_cast<int>(wp)) {
         case kHotkeyNewMirror:    RequestNewMirror(); break;
-        case kHotkeyClickThrough: SetClickThroughAll(!AllClickThrough()); break;
         case kHotkeyCloseAll:     ConfirmCloseAll(); break;
         default: break;
         }
@@ -737,7 +646,6 @@ int App::Run(bool relaunched) {
 
     const struct { int id; UINT key; const wchar_t* name; } hotkeys[] = {
         { kHotkeyNewMirror, 'M', L"Ctrl+Alt+M" },
-        { kHotkeyClickThrough, 'T', L"Ctrl+Alt+T" },
         { kHotkeyCloseAll, 'X', L"Ctrl+Alt+X" },
     };
     for (const auto& h : hotkeys) {
@@ -774,7 +682,6 @@ int App::Run(bool relaunched) {
     if (foregroundHook_) UnhookWinEvent(foregroundHook_);
     g_appWindow = nullptr;
     UnregisterHotKey(hwnd_, kHotkeyNewMirror);
-    UnregisterHotKey(hwnd_, kHotkeyClickThrough);
     UnregisterHotKey(hwnd_, kHotkeyCloseAll);
     RemoveTrayIcon();
     return static_cast<int>(msg.wParam);

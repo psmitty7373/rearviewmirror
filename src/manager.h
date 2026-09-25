@@ -24,7 +24,7 @@ protected:
 private:
     enum class Part {
         None, Toggle, Opacity, Scale, Region, Close, ClickThrough, Hidden,   // On a card.
-        NewMirror, AllClickThrough, Streaming,                                // In the header.
+        NewMirror, Streaming,                                                 // In the header.
     };
 
     // A control on a card. Cards are addressed by mirror id, never by position:
@@ -65,7 +65,6 @@ private:
 
     CardRects   LayoutCard(int index) const;
     D2D1_RECT_F NewMirrorButton() const;
-    D2D1_RECT_F AllClickThroughButton() const;
     D2D1_RECT_F StreamingButton() const;
     Hit  HitTest(POINT pt) const;
 
@@ -82,7 +81,6 @@ private:
     App* app_ = nullptr;
 
     std::vector<CardView> cards_;
-    bool   allClickThrough_ = false;
     bool   streamingOn_ = false;
     size_t streamClients_ = 0;
 
