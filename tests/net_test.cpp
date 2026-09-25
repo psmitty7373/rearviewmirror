@@ -679,6 +679,31 @@ static void TestLoopback() {
     Check(WaitFor([&] { return client.IsSubscribed(1); }, 500), "subscription recorded");
     Sleep(100);   // Let the subscribe reach the server before the first frame.
 
+    Check(!client.Mirrors()[0].controllable, "ordinary mirror is advertised as view-only");
+#if RVM_REMOTE_CONTROL
+    {
+        client.Control().Begin(1, ControlNowMs());
+        Check(WaitFor([&] { return client.Control().State() == ControlState::Denied; }, 1000),
+              "authenticated subscriber cannot control a view-only mirror");
+        client.Control().End(ControlNowMs());
+
+        // Exercise real authenticated control messages, without ever sending
+        // input to the test machine. Synthetic full-desktop capability only.
+        server.SetMirrorList({ { 1, L"Test mirror", 640, 360, true } });
+        Check(WaitFor([&] {
+            const auto list = client.Mirrors();
+            return list.size() == 1 && list[0].controllable;
+        }, 1000), "desktop control capability crosses the encrypted mirror list");
+        client.Control().Begin(1, ControlNowMs());
+        Check(WaitFor([&] { return client.Control().State() == ControlState::Active; }, 1000),
+              "subscribed full desktop grants a control lease");
+        server.SetMirrorList({ { 1, L"Test mirror", 640, 360 } });
+        Check(WaitFor([&] { return client.Control().State() == ControlState::Denied; }, 1000),
+              "revoked desktop capability ends the lease over UDP");
+        client.Control().End(ControlNowMs());
+    }
+#endif
+
     // An 800x500 source; the crop selects a 640x360 window of it.
     const UINT SW = 800, SH = 500;
     const RECT crop{ 80, 70, 720, 430 };

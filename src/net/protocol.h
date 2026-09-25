@@ -14,7 +14,7 @@
 namespace rvm::net {
 
 constexpr uint8_t  kMagic   = 0xA5;
-constexpr uint8_t  kVersion = 2;   // 2: per-direction keys, bound WELCOME, 600k PBKDF2.
+constexpr uint8_t  kVersion = 3;   // 3: mirror control capability and focused input.
 constexpr uint16_t kDefaultPort = 5901;
 
 constexpr size_t kKeyBytes    = 32;
@@ -76,7 +76,7 @@ enum class Msg : uint8_t {
     Hello = 1,       // client -> server  {version u16, clientRandom[16]}
     Welcome,         // server -> client  {serverRandom[16], clientRandom[16] echoed}
     ListReq,         // client -> server
-    ListResp,        // server -> client  {count u8, {id u32, w u16, h u16, name str}...}
+    ListResp,        // server -> client  {count u8, {id u32, w u16, h u16, flags u8, name str}...}
     Subscribe,       // client -> server  {mirrorId u32}
     Unsubscribe,     // client -> server  {mirrorId u32}
     Frame,           // server -> client  FrameHeader + chunk
@@ -87,7 +87,10 @@ enum class Msg : uint8_t {
     MirrorsChanged,  // server -> client  (re-list)
     Bye,             // either
     StreamStatus,    // server -> client  {mirrorId u32, state u8}: why a stream is not coming
+    Control,         // client -> server  {id u32, token u64, op u8, firstSeq u32, count u8, inputs...}
+    ControlReply,    // server -> client  {token u64, acknowledgedSeq u32, ControlState u8}
 };
+constexpr uint8_t kMirrorControllable = 1;
 
 // What a StreamStatus message reports. A client that does not know the message
 // ignores it and simply keeps waiting for frames.

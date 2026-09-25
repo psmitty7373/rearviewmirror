@@ -104,6 +104,29 @@ local mirror. Close it, or click its placeholder, to return it to the canvas.
 The client remembers servers, keys and layout, and reconnects on its own.
 Starting it again brings the open client to the front.
 
+### Desktop control (optional build)
+
+Build both PCs with `RVM_REMOTE_CONTROL=ON` to send mouse and keyboard input to
+**full-desktop mirrors**. It is off by default and requires streaming. Window
+mirrors and desktop regions remain view-only. With this feature enabled, viewers
+with the streaming key can control the shared desktop.
+
+Add desktops from several servers to the canvas as usual. Right-click a desktop
+tile and choose **Control desktop**. Its blue border and label show which desktop
+has input focus; the tile can stay beside the other desktops, or be enlarged with
+the existing double-click view before entering control. Mouse clicks, drags,
+vertical/horizontal scrolling, and keyboard shortcuts go to that PC.
+
+Press **Ctrl+Alt+F12** to release control and move or resize tiles again. Clicking
+outside the desktop picture or switching away from the client also releases it.
+Only one viewer controls a server at a time. Control is released on disconnect
+and must be selected again after reconnecting. Pop-out windows are view-only;
+return one to the canvas to control it.
+
+Input uses the server's keyboard layout and Windows input permissions. Secure
+desktops (including UAC prompts), Ctrl+Alt+Delete, and applications running at a
+higher privilege level cannot be controlled by an ordinary unelevated server.
+
 **Frame rate:** a stream can't exceed the refresh rate of the monitor showing
 the source window, and a window that isn't changing sends few frames. For high
 frame rates, hide the local mirror and raise the bitrate.
@@ -121,12 +144,29 @@ This produces `build\RearViewMirror.exe` and `build\RearViewMirrorClient.exe`,
 both self-contained. They are signed with a self-signed certificate that the
 first build creates in your certificate store. Run
 `powershell -File tools\sign.ps1 -Trust` to have this PC treat it as a trusted
-publisher, or build with `-DRVM_SIGN=OFF` to skip signing. Without the SDK's
+publisher, or run `build.bat --no-sign` to skip signing. Without the SDK's
 signtool, the build skips signing with a warning.
 
-For mirrors only, build with `-DRVM_STREAMING=OFF`. The app then has no
+For mirrors only, run `build.bat --mirrors-only`. The app then has no
 streaming and no network code, the manager shows no *Streaming* button, and
 desktop mirrors start with a window. The client is not built.
+
+To enable desktop control on the server and client:
+
+```
+build.bat --remote-control
+```
+
+Run `build.bat --streaming-only` to return to viewing-only streaming. The
+selection is remembered; plain `build.bat` rebuilds the selected features.
+A fresh build defaults to streaming without control. Existing configuration
+and target arguments still work, for example
+`build.bat Debug rvmclient --remote-control`. Use `--no-pause` for unattended
+builds, or `--help` to list the options. These options set the corresponding
+`RVM_STREAMING`, `RVM_REMOTE_CONTROL`, and `RVM_SIGN` CMake cache variables.
+
+Protocol version 3 adds desktop-control capabilities; update the server and client
+together, including when control is disabled.
 
 ## Files
 

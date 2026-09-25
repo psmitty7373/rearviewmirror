@@ -21,6 +21,9 @@ constexpr float kSnapPx   = 8.0f;    // Edges this close to another edge line up
 constexpr uint64_t kChipHoldMs = 2500;   // Name chip stays this long after the mouse leaves,
 constexpr uint64_t kChipFadeMs = 500;    // then fades out over this.
 constexpr UINT_PTR kChipTimer  = 2;
+#if RVM_REMOTE_CONTROL
+constexpr UINT_PTR kControlTimer = 3;
+#endif
 
 const D2D1_COLOR_F kBg      = { 0.067f, 0.075f, 0.094f, 1.0f };
 const D2D1_COLOR_F kPanel   = { 0.086f, 0.098f, 0.122f, 1.0f };
@@ -36,6 +39,9 @@ const D2D1_COLOR_F kTileBg  = { 0.0f, 0.0f, 0.0f, 1.0f };
 
 enum TileMenuId : UINT {
     kMenuPopOut = 1, kMenuReturn, kMenuClickThrough, kMenuFront, kMenuBack, kMenuFit, kMenuRemove,
+#if RVM_REMOTE_CONTROL
+    kMenuControl,
+#endif
 };
 
 // "0.4 ms" on a LAN, "38 ms" over the internet: a decimal only where it says
@@ -189,6 +195,9 @@ void ClientWindow::AddServer(const ConnectSettings& settings) {
 }
 
 void ClientWindow::RemoveServer(uint32_t tag) {
+#if RVM_REMOTE_CONTROL
+    if (controlKey_.server == tag) EndControl();
+#endif
     auto it = std::find_if(servers_.begin(), servers_.end(),
                            [&](const auto& s) { return s->tag == tag; });
     if (it == servers_.end()) return;
@@ -329,6 +338,9 @@ void ClientWindow::AddTile(TileKey key) {
 }
 
 void ClientWindow::RemoveTile(TileKey key, bool remember) {
+#if RVM_REMOTE_CONTROL
+    if (controlKey_ == key) EndControl();
+#endif
     auto it = std::find_if(tiles_.begin(), tiles_.end(), [&](const Tile& t) { return t.key == key; });
     if (it == tiles_.end()) return;
     if (remember) pendingTiles_.push_back(ToLayout(*it));
@@ -440,6 +452,9 @@ bool ClientWindow::ShownSizeOf(const StreamView* v, const RemoteMirror* m, UINT&
 }
 
 void ClientWindow::PopOut(Tile& tile) {
+#if RVM_REMOTE_CONTROL
+    if (controlKey_ == tile.key) EndControl();
+#endif
     if (tile.popout) return;
     UINT nativeW = 0, nativeH = 0;
     if (!ShownSize(tile.key, nativeW, nativeH)) {
@@ -533,6 +548,16 @@ void ClientWindow::ShowTileMenu(TileKey key, POINT screenPt) {
     const bool popped = tile->popout != nullptr;
 
     HMENU menu = CreatePopupMenu();
+#if RVM_REMOTE_CONTROL
+    const RemoteMirror* mirror = MirrorFor(key);
+    if (!popped && mirror && mirror->controllable) {
+        const StreamView* view = ViewFor(key);
+        const ServerView* server = FindView(key.server);
+        const bool ready = view && view->frames && server && server->connected;
+        AppendMenuW(menu, MF_STRING | (ready ? 0 : MF_GRAYED), kMenuControl, L"Control desktop");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+#endif
     if (popped) {
         AppendMenuW(menu, MF_STRING, kMenuReturn, L"Return to grid");
         AppendMenuW(menu, MF_STRING | (tile->popout->ClickThrough() ? MF_CHECKED : 0),
@@ -557,6 +582,9 @@ void ClientWindow::ShowTileMenu(TileKey key, POINT screenPt) {
     if (!tile) return;
 
     switch (cmd) {
+#if RVM_REMOTE_CONTROL
+    case kMenuControl: BeginControl(key); break;
+#endif
     case kMenuPopOut: PopOut(*tile); break;
     case kMenuReturn: Dock(*tile); break;
     case kMenuClickThrough:
@@ -636,6 +664,16 @@ D2D1_RECT_F ClientWindow::TileRect(const Tile& tile) const {
     if (focused_ == tile.key) return c;
     const Box b = Shown(tile);
     return D2D1::RectF(c.left + S(b.x), c.top + S(b.y), c.left + S(b.x + b.w), c.top + S(b.y + b.h));
+}
+
+D2D1_RECT_F ClientWindow::PictureRect(const Tile& tile) const {
+    const auto cell = TileRect(tile);
+    UINT w = 0, h = 0;
+    if (!ShownSize(tile.key, w, h) || !w || !h) return {};
+    const float scale = (std::min)((cell.right - cell.left) / w, (cell.bottom - cell.top) / h);
+    const float x = (cell.left + cell.right - w * scale) * 0.5f;
+    const float y = (cell.top + cell.bottom - h * scale) * 0.5f;
+    return D2D1::RectF(x, y, x + w * scale, y + h * scale);
 }
 
 // Candidates are the canvas edges and every other box's edges, plus those
@@ -862,6 +900,11 @@ void ClientWindow::ScheduleChipTimer() {
 // Messages
 
 LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
+#if RVM_REMOTE_CONTROL
+    if (ControlMessage(msg, wp, lp)) {
+        return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP || msg == WM_XBUTTONDBLCLK ? TRUE : 0;
+    }
+#endif
     switch (msg) {
     case WM_COMMAND:
         if (LOWORD(wp) == 1) AddServerFlow();
@@ -873,6 +916,9 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const ClientEvent event = ClientEventOf(wp);
         if (event == ClientEvent::FrameReady) server->client->AckFrameReady();
         if (event == ClientEvent::ListUpdated) MirrorsChanged(*server);
+#if RVM_REMOTE_CONTROL
+        if (controlKey_.server == server->tag) PollControl();
+#endif
         // A new frame only changes the canvas if one of this server's boxes
         // is on it; streams shown only in pop-outs leave the canvas alone.
         bool redraw = event != ClientEvent::FrameReady;
@@ -943,6 +989,12 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
+#if RVM_REMOTE_CONTROL
+            if (controlKey_.server) {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                return TRUE;
+            }
+#endif
             int edges = 0;
             if (drag_.active)                edges = drag_.edges;
             else if (hot_.part == Part::Tile) edges = hot_.edges;
@@ -984,6 +1036,9 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER:
+#if RVM_REMOTE_CONTROL
+        if (wp == kControlTimer) { PollControl(); return 0; }
+#endif
         if (wp == kChipTimer) {
             KillTimer(Hwnd(), kChipTimer);
             Render();   // Re-arms itself while a chip is still fading.
@@ -1129,6 +1184,9 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_CLOSE:
+#if RVM_REMOTE_CONTROL
+        EndControl();
+#endif
         SaveConfig();
         for (auto& t : tiles_) Retire(std::move(t.popout));   // Pop-out windows first,
         tiles_.clear();
@@ -1236,12 +1294,10 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
             // Letterbox to the mirror's true aspect.
             UINT sw = view->width, sh = view->height;
             ShownSize(tile.key, sw, sh);
-            const float cw = cell.right - cell.left, ch = cell.bottom - cell.top;
-            const float scale = (std::min)(cw / sw, ch / sh);
-            const float dw = sw * scale, dh = sh * scale;
-            const float dx = cell.left + (cw - dw) * 0.5f, dy = cell.top + (ch - dh) * 0.5f;
+            const auto picture = PictureRect(tile);   // Also used for remote pointer mapping.
+            const float scale = (picture.right - picture.left) / sw;
             if (ID2D1Bitmap1* bitmap = BitmapFor(dc, view->texture.get())) {
-                dc->DrawBitmap(bitmap, D2D1::RectF(dx, dy, dx + dw, dy + dh), 1.0f,
+                dc->DrawBitmap(bitmap, picture, 1.0f,
                                scale < 1.0f ? D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR
                                             : D2D1_INTERPOLATION_MODE_LINEAR);
             }
@@ -1254,6 +1310,9 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
         }
     }
 
+#if RVM_REMOTE_CONTROL
+    if (DrawControlTile(dc, tile, cell)) return;
+#endif
     const float chipAlpha = ChipAlpha(tile);
     if (!name.empty() && chipAlpha > 0.0f) {
         const bool fading = chipAlpha < 1.0f;

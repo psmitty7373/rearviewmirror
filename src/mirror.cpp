@@ -333,6 +333,20 @@ std::wstring Mirror::DisplayName() const {
     return Ellipsize(std::move(name), 48);
 }
 
+#if RVM_REMOTE_CONTROL
+bool Mirror::IsFullDesktop() const {
+    if (!IsDesktop() || !Enabled() || Orphaned()) return false;
+    const SIZE size = desktop_.ContentSize();
+    const RECT bounds = DesktopCapture::Bounds();
+    const bool whole = state_.baseSize.cx > 0 && state_.baseSize.cy > 0 &&
+        state_.crop.left == 0 && state_.crop.top == 0 && state_.crop.right == state_.baseSize.cx &&
+        state_.crop.bottom == state_.baseSize.cy;
+    return size.cx > 0 && size.cy > 0 && size.cx == RectW(bounds) && size.cy == RectH(bounds) &&
+           whole && (state_.track == TrackMode::Proportional ||
+                     (state_.crop.right == size.cx && state_.crop.bottom == size.cy));
+}
+#endif
+
 void Mirror::Destroy() {
     StopCapture();
     renderer_.Shutdown();

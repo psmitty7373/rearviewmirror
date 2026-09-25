@@ -93,6 +93,9 @@ void StreamClient::Connect(const std::wstring& host, uint16_t port, const std::w
 }
 
 void StreamClient::Disconnect() {
+#if RVM_REMOTE_CONTROL
+    control_.Reset();
+#endif
     if (running_.exchange(false)) {
         if (connected_) {
             Writer w;
@@ -130,6 +133,9 @@ void StreamClient::BeginSession() {
 // The link is gone but the wish list stays: the next session re-subscribes.
 // Net thread. Textures are kept so tiles show the last frame meanwhile.
 void StreamClient::DropSession(std::wstring status) {
+#if RVM_REMOTE_CONTROL
+    control_.Reset();
+#endif
     Log(L"client: session with %s dropped: %s", server_.ToString().c_str(), status.c_str());
     connected_ = false;
     rttUs_ = -1;
@@ -318,6 +324,10 @@ void StreamClient::NetLoop() {
             const uint64_t listEvery = listPending_ ? kListRetryMs : kListRefreshMs;
             if (now - lastListReqMs_ >= listEvery) RequestList(now);
             PollStreams(now);
+#if RVM_REMOTE_CONTROL
+            const auto input = control_.Poll(net::ControlNowMs());
+            if (!input.empty()) Send(input);
+#endif
         }
 
         Endpoint from;
@@ -390,6 +400,11 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
     if (!r.U8(type)) return;
 
     switch (static_cast<Msg>(type)) {
+#if RVM_REMOTE_CONTROL
+    case Msg::ControlReply:
+        control_.Reply(r, net::ControlNowMs());
+        break;
+#endif
     case Msg::Frame: {
         FrameHeader h;
         if (!ReadFrameHeader(r, h)) return;
@@ -441,8 +456,12 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
         for (uint8_t i = 0; i < count; ++i) {
             RemoteMirror m;
             uint16_t w = 0, h = 0;
+            uint8_t flags = 0;
             std::string name;
-            if (!r.U32(m.id) || !r.U16(w) || !r.U16(h) || !r.Str(name)) break;
+            if (!r.U32(m.id) || !r.U16(w) || !r.U16(h) || !r.U8(flags) || !r.Str(name)) return;
+#if RVM_REMOTE_CONTROL
+            m.controllable = (flags & kMirrorControllable) != 0;
+#endif
             m.width = w;
             m.height = h;
             m.name = FromUtf8(name);

@@ -22,9 +22,13 @@ struct Streaming::Impl {
         for (const auto& m : *hooks.mirrors) {
             if (!m->Enabled() || m->Orphaned()) continue;
             const SIZE native = m->NativeSize();
-            list.push_back({ m->Id(), m->DisplayName(),
+            MirrorInfo info{ m->Id(), m->DisplayName(),
                              static_cast<UINT>((std::max)(native.cx, 0L)),
-                             static_cast<UINT>((std::max)(native.cy, 0L)) });
+                             static_cast<UINT>((std::max)(native.cy, 0L)) };
+#if RVM_REMOTE_CONTROL
+            info.controllable = m->IsFullDesktop();
+#endif
+            list.push_back(std::move(info));
         }
         server.SetMirrorList(std::move(list));
     }

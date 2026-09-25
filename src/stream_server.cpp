@@ -223,6 +223,9 @@ void StreamServer::Stop() {
     }
     if (frameEvent_) SetEvent(frameEvent_);
     if (netThread_.joinable()) netThread_.join();
+#if RVM_REMOTE_CONTROL
+    control_.Reset();
+#endif
     if (encodeThread_.joinable()) encodeThread_.join();
 
     {
@@ -814,6 +817,9 @@ void StreamServer::NetLoop() {
         const uint64_t now = NowMs();
         if (n > 0) HandleDatagram(from, buffer.data(), static_cast<size_t>(n), now);
         if (now - lastKeyframeService >= 25) {
+#if RVM_REMOTE_CONTROL
+            control_.Poll(now, [this](uintptr_t peer, uint32_t id) { return ControlAllowed(peer, id); });
+#endif
             ServiceDeferredKeyframes(now);
             lastKeyframeService = now;
         }
@@ -1008,7 +1014,7 @@ void StreamServer::ExpireRecentHellos(uint64_t nowMs) {
 // Every name is cut, evenly and on character boundaries, until the whole
 // list fits one datagram; a list too long for even bare entries is cut short.
 void StreamServer::SendListTo(Client& client) {
-    constexpr size_t kEntryFixed = 4 + 2 + 2 + 1;   // id, w, h, name length.
+    constexpr size_t kEntryFixed = 4 + 2 + 2 + 1 + 1;   // id, w, h, flags, name length.
     constexpr size_t kListFixed = 1 + 1;            // Msg, count.
 
     std::vector<MirrorInfo> list;
@@ -1039,6 +1045,11 @@ void StreamServer::SendListTo(Client& client) {
         w.U32(list[i].id);
         w.U16(static_cast<uint16_t>((std::min)(list[i].width, 65535u)));
         w.U16(static_cast<uint16_t>((std::min)(list[i].height, 65535u)));
+#if RVM_REMOTE_CONTROL
+        w.U8(list[i].controllable ? kMirrorControllable : 0);
+#else
+        w.U8(0);   // Keep the protocol layout; this build advertises no control capability.
+#endif
         w.Str(TruncateUtf8(names[i], cap));
     }
     SendTo(client, w.Data());
@@ -1049,6 +1060,17 @@ void StreamServer::HandleMessage(const std::shared_ptr<Client>& client, Reader& 
     if (!r.U8(type)) return;
 
     switch (static_cast<Msg>(type)) {
+#if RVM_REMOTE_CONTROL
+    case Msg::Control: {
+        Reader peek = r;
+        uint32_t id = 0;
+        if (!peek.U32(id)) break;
+        const uintptr_t peer = reinterpret_cast<uintptr_t>(client.get());
+        const auto reply = control_.Handle(peer, r, nowMs, ControlAllowed(peer, id));
+        if (!reply.empty()) SendTo(*client, reply);
+        break;
+    }
+#endif
     case Msg::ListReq:
         SendListTo(*client);
         break;
@@ -1138,6 +1160,9 @@ void StreamServer::HandleNack(Client& client, Reader& r, uint64_t nowMs) {
 
 void StreamServer::DropSubscription(const std::shared_ptr<Client>& client, uint32_t mirrorId) {
     if (!client->subscriptions.erase(mirrorId)) return;
+#if RVM_REMOTE_CONTROL
+    control_.Poll(NowMs(), [this](uintptr_t peer, uint32_t id) { return ControlAllowed(peer, id); });
+#endif
     if (auto s = FindStream(mirrorId)) {
         {
             std::lock_guard lock(s->subsMutex);
@@ -1174,12 +1199,30 @@ void StreamServer::DropUnlistedSubscriptions() {
 }
 
 void StreamServer::RemoveClient(const std::shared_ptr<Client>& client) {
+#if RVM_REMOTE_CONTROL
+    control_.Drop(reinterpret_cast<uintptr_t>(client.get()));
+#endif
     const std::vector<uint32_t> ids(client->subscriptions.begin(), client->subscriptions.end());
     for (uint32_t id : ids) DropSubscription(client, id);
 
     std::lock_guard lock(clientsMutex_);
     clients_.erase(std::remove(clients_.begin(), clients_.end(), client), clients_.end());
 }
+
+#if RVM_REMOTE_CONTROL
+bool StreamServer::ControlAllowed(uintptr_t peer, uint32_t mirrorId) {
+    {
+        std::lock_guard lock(clientsMutex_);
+        const auto c = std::find_if(clients_.begin(), clients_.end(),
+            [peer](const auto& client) { return reinterpret_cast<uintptr_t>(client.get()) == peer; });
+        if (c == clients_.end() || !(*c)->subscriptions.count(mirrorId)) return false;
+    }
+    std::lock_guard lock(listMutex_);
+    const auto m = std::find_if(mirrorList_.begin(), mirrorList_.end(),
+        [mirrorId](const MirrorInfo& info) { return info.id == mirrorId; });
+    return m != mirrorList_.end() && m->controllable;
+}
+#endif
 
 void StreamServer::ExpireClients(uint64_t nowMs) {
     std::vector<std::shared_ptr<Client>> stale;

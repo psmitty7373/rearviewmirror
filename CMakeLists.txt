@@ -68,6 +68,13 @@ target_link_libraries(rvmcore PUBLIC rvm_options
 # both. Off builds a mirrors-only app with nothing on the network; the app then
 # compiles src/streaming_off.cpp in place of src/streaming.cpp.
 option(RVM_STREAMING "Build streaming: the app's server, the client and their tests" ON)
+option(RVM_REMOTE_CONTROL "Allow focused mouse and keyboard control of full-desktop streams" OFF)
+if(RVM_REMOTE_CONTROL AND NOT RVM_STREAMING)
+    message(FATAL_ERROR "RVM_REMOTE_CONTROL requires RVM_STREAMING=ON")
+endif()
+# A numeric definition, shared by every target so public class layouts agree.
+# Use #if RVM_REMOTE_CONTROL: the macro is defined as 0 in disabled builds.
+target_compile_definitions(rvm_options INTERFACE RVM_REMOTE_CONTROL=$<BOOL:${RVM_REMOTE_CONTROL}>)
 
 set(RVM_APP_SOURCES
     src/main.cpp
@@ -94,6 +101,11 @@ if(RVM_STREAMING)
         src/net/codec.cpp
     )
     target_link_libraries(rvmnet PUBLIC rvmcore bcrypt ws2_32 crypt32 mfplat mf mfuuid)
+    if(RVM_REMOTE_CONTROL)
+        target_sources(rvmnet PRIVATE src/net/control.cpp)
+        add_executable(rvmcontrol_test tests/control_test.cpp)
+        target_link_libraries(rvmcontrol_test PRIVATE rvmnet)
+    endif()
 
     add_library(rvmserver STATIC src/stream_server.cpp)
     target_link_libraries(rvmserver PUBLIC rvmnet)
@@ -127,6 +139,9 @@ if(RVM_STREAMING)
         client/client.rc
     )
     target_link_libraries(rvmclient PRIVATE rvmclientnet)
+    if(RVM_REMOTE_CONTROL)
+        target_sources(rvmclient PRIVATE client/control_ui.cpp)
+    endif()
     set_target_properties(rvmclient PROPERTIES OUTPUT_NAME "RearViewMirrorClient")
     rvm_sign(rvmclient)
 

@@ -60,6 +60,9 @@ public:
     // The application a window mirror watches, or "Desktop".
     std::wstring SourceName() const { return IsDesktop() ? L"Desktop" : state_.exeName; }
     bool IsDesktop() const { return state_.source == SourceKind::Desktop; }
+#if RVM_REMOTE_CONTROL
+    bool IsFullDesktop() const;
+#endif
 
     // Monitors were added, removed or changed resolution: a desktop mirror
     // starts over on the new layout. False if that failed; it then waits and

@@ -21,6 +21,8 @@ How Rear View Mirror works inside, and why. For using and building it, see
 | `src/net/crypto.*`, `channel.*` | PBKDF2/HMAC key derivation, AES-GCM, replay-protected datagrams |
 | `src/net/udp.*`, `packetizer.*` | Dual-stack UDP socket; frame splitting, reassembly, NACK |
 | `src/net/codec.*`, `converter.*` | Media Foundation H.264 encode/decode; D3D11 colour conversion |
+| `src/net/control.*` | Optional focused input, reliable delivery, exclusive server lease, keyboard hook |
+| `client/control_ui.cpp` | Desktop control mode, focus lifetime and letterboxed pointer mapping |
 | `src/streaming.*` | The app's one seam to streaming; `streaming_off.cpp` is the empty stand-in |
 | `src/stream_server.*` | Serves mirrors: encoders, sessions, retransmits, limits |
 | `src/stream_settings.*` | Streaming settings file and dialog |
@@ -160,7 +162,8 @@ to the app window, and it runs the settings dialog. Mirrors and the renderer
 know nothing of streaming: a mirror offers a generic frame hook and a way to
 resend its last frame. `-DRVM_STREAMING=OFF` compiles `streaming_off.cpp`, which
 does nothing and reports streaming unavailable, and leaves out the libraries,
-the client and the tests. There is no conditional compilation in the code.
+the client and the tests. The streaming seam needs no conditional compilation
+at its call sites.
 
 | Library | Contents | Used by |
 | --- | --- | --- |
@@ -284,7 +287,7 @@ passphrase (PBKDF2-SHA256, 600k rounds). Each session derives two keys from a
 two-random handshake, one per direction, so neither side's traffic can be
 reflected back at it. Per-direction counters are the nonces, and a 64-packet
 window rejects replays. Probes of the port see ciphertext and get no reply.
-This is protocol version 2, which doesn't interoperate with version 1.
+This is protocol version 3, which doesn't interoperate with earlier versions.
 
 The WELCOME echoes the client's random, so a client ignores any WELCOME that
 isn't the answer to its own HELLO. A HELLO only earns a pending handshake; a
@@ -308,6 +311,48 @@ threads. Keys are stored DPAPI-protected to the Windows account on both ends.
 A saved key that can't be decrypted, because the file came from another
 account or PC, is kept as it is rather than erased on the next save, and the
 user is told to enter it again. Key fields are masked, with a *Show* box.
+
+## Optional desktop control
+
+`RVM_REMOTE_CONTROL` defaults to `OFF` and requires `RVM_STREAMING`. CMake
+exports it as a numeric `0` or `1` definition through `rvm_options` to every
+target, so public class layouts agree. `#if RVM_REMOTE_CONTROL` gates control
+members, UI integration, network handlers, and desktop eligibility code.
+CMake adds `net/control.cpp`, `client/control_ui.cpp`, and the control test
+target only when enabled. OFF builds contain no input implementation or
+no-op substitute. Use `#if`, not `#ifdef`: the macro is defined in both builds.
+
+Both builds use protocol 3 and retain its capability byte and message IDs for
+viewing compatibility. An OFF server always advertises zero capability and
+ignores control messages; an OFF client ignores advertised control support.
+The server advertises control only for enabled, bound,
+uncropped desktop mirrors covering the current virtual screen. The server
+checks the capability and the viewer's subscription again for every input
+packet and while servicing a lease.
+
+Control is explicit from a canvas tile's context menu and separate from the
+double-click enlarged view. One tile has keyboard focus in a client, and one
+viewer has a control lease on each server. The client keeps the other desktop
+tiles visible. A foreground-only low-level keyboard hook forwards physical
+scan codes (including Windows shortcuts); Ctrl+Alt+F12 posts a local release
+message. The hook never renders or sends network traffic. Mouse input is mapped
+through the same aspect ratio and letterboxing as the displayed image, to
+absolute virtual-desktop coordinates. Button capture supports drags outside
+the tile; clicks in letterbox bars are local.
+
+Input travels inside the existing authenticated session, with its own ordered
+sequence and acknowledgement. Batches carry up to 32 events, with at most 256
+pending events. Unsent adjacent pointer moves coalesce; taps and wheel events
+are retried and injected once. Input batches are paced with the performance
+counter, up to every 8 ms, independently of the system timer's granularity.
+Per-peer input is limited to 2000 events/second
+with a 2000-event burst. A monotonically increasing control token prevents a
+delayed request, release, or input from reviving or ending a newer focus lease.
+The server tracks injected keys and buttons and releases them on relinquish,
+unsubscribe, capability loss, disconnect, shutdown, or a 1.5-second lease
+timeout. Missing acknowledgements or a full client queue also end control.
+Reconnect restores viewing only. Tests inject into a recording sink, never
+the machine's actual keyboard or mouse.
 
 ## Platform notes
 
@@ -360,3 +405,8 @@ so a running copy of the app doesn't get in the way.
 | `--presets` | Time and quality of each encoder preset at desktop size |
 | `--live` | Connect to this PC's running app and report what arrives |
 | `--crash-probe` | Crash on purpose, with no error dialog, to check the crash report |
+
+With remote control enabled, `build\rvmcontrol_test.exe` checks lost and
+duplicated datagrams, ordering, stale control tokens, exclusive admission,
+malformed input, pointer coalescing, bounded queues, focus expiry, disconnects,
+capability revocation, and injection failure without generating real input.

@@ -4,6 +4,9 @@
 #include "net/converter.h"
 #include "net/packetizer.h"
 #include "net/udp.h"
+#if RVM_REMOTE_CONTROL
+#include "net/control.h"
+#endif
 #include "stream_settings.h"
 
 #include <set>
@@ -16,6 +19,7 @@ struct MirrorInfo {
     std::wstring name;
     UINT         width = 0;
     UINT         height = 0;
+    bool         controllable = false;
 };
 
 // Serves mirrors to clients over one UDP port. Each subscribed mirror gets a
@@ -101,6 +105,10 @@ private:
     void SendTo(Client& client, const std::vector<uint8_t>& plain);
     void SendListTo(Client& client);
     bool MirrorListed(uint32_t mirrorId);
+#if RVM_REMOTE_CONTROL
+    bool ControlAllowed(uintptr_t peer, uint32_t mirrorId);
+    net::ControlHost control_;
+#endif
     void DropSubscription(const std::shared_ptr<Client>& client, uint32_t mirrorId);
     void DropUnlistedSubscriptions();
     void RemoveClient(const std::shared_ptr<Client>& client);

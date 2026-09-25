@@ -123,6 +123,19 @@ private:
     bool  ShownSize(TileKey key, UINT& w, UINT& h) const;
     static bool ShownSizeOf(const StreamView* view, const RemoteMirror* mirror, UINT& w, UINT& h);
     void  ShowTileMenu(TileKey key, POINT screenPt);
+#if RVM_REMOTE_CONTROL
+    void  BeginControl(TileKey key);
+    void  EndControl(const wchar_t* message = nullptr);
+    void  PollControl();
+    bool  ControlMessage(UINT msg, WPARAM wp, LPARAM lp);
+    bool  DrawControlTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1_RECT_F& cell);
+    TileKey controlKey_{};
+    net::ControlKeyboard controlKeyboard_;
+    bool controlKeyboardOn_ = false;
+    unsigned controlButtons_ = 0;
+    net::ControlState controlState_ = net::ControlState::Idle;
+#endif
+    D2D1_RECT_F PictureRect(const Tile& tile) const;
     const StreamView*   ViewFor(TileKey key) const;
     const RemoteMirror* MirrorFor(TileKey key) const;
     // A box's key travels in an LPARAM: both halves need a 64-bit build.

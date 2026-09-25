@@ -4,6 +4,9 @@
 #include "net/converter.h"
 #include "net/packetizer.h"
 #include "net/udp.h"
+#if RVM_REMOTE_CONTROL
+#include "net/control.h"
+#endif
 
 #include <condition_variable>
 #include <set>
@@ -28,6 +31,7 @@ struct RemoteMirror {
     std::wstring name;
     UINT         width = 0;
     UINT         height = 0;
+    bool         controllable = false;
 };
 
 // What the window draws for one subscribed stream: a BGRA texture that the
@@ -75,12 +79,18 @@ public:
     bool IsSubscribed(uint32_t id) const;
     void SetSubscribed(uint32_t id, bool on);
     std::vector<StreamView> Views() const;
+#if RVM_REMOTE_CONTROL
+    net::ControlClient& Control() { return control_; }
+#endif
 
     // The window calls this when it handles FrameReady, so the next decoded
     // frame posts a fresh one; bursts collapse into one repaint.
     void AckFrameReady() { framePosted_.store(false); }
 
 private:
+#if RVM_REMOTE_CONTROL
+    net::ControlClient control_;
+#endif
     struct Stream;
 
     void NetLoop();
