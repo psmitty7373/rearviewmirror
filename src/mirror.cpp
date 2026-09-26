@@ -138,8 +138,12 @@ void Mirror::PlaceInitially() {
 
 bool Mirror::StartCapture() {
     if (IsDesktop()) {
-        return desktop_.Start(
-            [this](ID3D11Texture2D* tex, UINT w, UINT h) { renderer_.SubmitFrame(tex, w, h); });
+        if (!desktop_.Start(
+                [this](ID3D11Texture2D* tex, UINT w, UINT h) { renderer_.SubmitFrame(tex, w, h); })) {
+            return false;
+        }
+        FollowDesktopSize();
+        return true;
     }
     HWND self = hwnd_;
     return capture_.Start(
@@ -151,6 +155,36 @@ bool Mirror::StartCapture() {
 void Mirror::StopCapture() {
     capture_.Stop();
     desktop_.Stop();
+}
+
+bool Mirror::WholeDesktop() const {
+    return state_.crop.left <= 0 && state_.crop.top <= 0 &&
+           state_.crop.right >= state_.baseSize.cx && state_.crop.bottom >= state_.baseSize.cy;
+}
+
+// Monitors or resolutions changed, now or while the app was closed. The
+// entire desktop stays the entire desktop, and the window keeps its zoom so
+// it covers the same share of the screen. A region keeps its tracking mode,
+// as a window mirror does.
+void Mirror::FollowDesktopSize() {
+    const SIZE now = desktop_.ContentSize();
+    const SIZE was = state_.baseSize;
+    if (now.cx <= 0 || now.cy <= 0 || (now.cx == was.cx && now.cy == was.cy) || !WholeDesktop()) return;
+
+    RECT r{};
+    GetWindowRect(hwnd_, &r);
+    const int w = was.cx > 0 ? static_cast<int>(std::lround(static_cast<double>(RectW(r)) * now.cx / was.cx)) : now.cx;
+    const int h = was.cy > 0 ? static_cast<int>(std::lround(static_cast<double>(RectH(r)) * now.cy / was.cy)) : now.cy;
+    r.right = r.left + ClampExtent(w, kMinWidth);
+    r.bottom = r.top + ClampExtent(h, kMinHeight);
+    const RECT p = ClampToVisibleMonitor(r);
+    SetWindowPos(hwnd_, nullptr, p.left, p.top, RectW(p), RectH(p),
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+
+    state_.crop = RECT{ 0, 0, now.cx, now.cy };
+    state_.baseSize = now;
+    renderer_.SetCrop(state_.crop, state_.baseSize);
+    NotifyStateChanged();
 }
 
 SIZE Mirror::ContentSize() const {
@@ -321,12 +355,7 @@ bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred) {
 }
 
 std::wstring Mirror::DisplayName() const {
-    if (IsDesktop()) {
-        const bool whole = state_.crop.left <= 0 && state_.crop.top <= 0 &&
-                           state_.crop.right >= state_.baseSize.cx &&
-                           state_.crop.bottom >= state_.baseSize.cy;
-        return whole ? L"Entire desktop" : L"Desktop region";
-    }
+    if (IsDesktop()) return WholeDesktop() ? L"Entire desktop" : L"Desktop region";
     std::wstring name = IsWindow(target_) ? WindowTitle(target_) : state_.title;
     if (name.empty()) name = state_.exeName;
     if (name.empty()) name = L"Untitled window";

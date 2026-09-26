@@ -79,6 +79,10 @@ public:
 private:
     bool StartCapture();
     void StopCapture();
+    // The crop is the whole desktop as it was when last sized.
+    bool WholeDesktop() const;
+    // An entire-desktop mirror follows the desktop to its current size.
+    void FollowDesktopSize();
     SIZE ContentSize() const;
     void ShowContextMenu(POINT screenPt);
     void ApplyClickThroughStyle();
