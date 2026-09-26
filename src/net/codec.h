@@ -88,6 +88,7 @@ public:
 
 private:
     bool TryInit(IMFActivate* activate);
+    void FinishInFlight();
     bool WaitForEvents(DWORD timeoutMs);
     bool CollectOutput(std::vector<EncodedFrame>& out);
     bool RenegotiateOutput();
@@ -106,6 +107,7 @@ private:
     EncoderEventRelay* relay_ = nullptr;   // COM-refcounted; see codec.cpp.
     HANDLE wake_ = nullptr;
     bool   failed_ = false;
+    bool   drained_ = false;   // METransformDrainComplete arrived.
     DWORD inputId_ = 0, outputId_ = 0;
     bool  providesSamples_ = false;
     int   inputsWanted_ = 0;

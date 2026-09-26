@@ -293,6 +293,7 @@ H264Encoder::~H264Encoder() {
 }
 
 void H264Encoder::Shutdown() {
+    FinishInFlight();
     if (relay_) relay_->Stop();   // Before the MFT goes: no event may reach us now.
     if (mft_) {
         mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -306,6 +307,7 @@ void H264Encoder::Shutdown() {
         relay_ = nullptr;
     }
     failed_ = false;
+    drained_ = false;
     codec_ = nullptr;
     events_ = nullptr;
     mft_ = nullptr;
@@ -317,6 +319,32 @@ void H264Encoder::Shutdown() {
     inputsTraced_ = 0;
     outputsTraced_ = 0;
     sequenceHeader_.clear();
+}
+
+// An asynchronous encoder finishes frames with work of its own on Media
+// Foundation threads. Freed with a frame still inside, NVIDIA's ran that work
+// on the freed encoder and crashed the process. Draining first leaves it
+// nothing in flight; the output is discarded.
+void H264Encoder::FinishInFlight() {
+    constexpr ULONGLONG kDrainTimeoutMs = 500;
+    if (!mft_ || !relay_ || failed_ || frameIndex_ == 0) return;
+    drained_ = false;
+    mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+    const HRESULT hr = mft_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    if (FAILED(hr)) {
+        LogError(L"COMMAND_DRAIN", hr);
+        return;
+    }
+    std::vector<EncodedFrame> discard;
+    const ULONGLONG deadline = GetTickCount64() + kDrainTimeoutMs;
+    while (Service(discard) && !drained_) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            Log(L"encoder: '%s' did not finish draining in %llu ms", name_.c_str(), kDrainTimeoutMs);
+            return;
+        }
+        WaitForEvents(static_cast<DWORD>(deadline - now));
+    }
 }
 
 // Tries each hardware encoder in turn, the one on our own GPU first, and
@@ -541,6 +569,8 @@ bool H264Encoder::Service(std::vector<EncodedFrame>& out) {
             ++inputsWanted_;
         } else if (type == METransformHaveOutput) {
             CollectOutput(out);
+        } else if (type == METransformDrainComplete) {
+            drained_ = true;
         } else if (type == MEError) {
             HRESULT status = S_OK;
             event->GetStatus(&status);

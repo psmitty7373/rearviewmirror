@@ -96,16 +96,21 @@ void StreamClient::Disconnect() {
 #if RVM_REMOTE_CONTROL
     control_.Reset();
 #endif
-    if (running_.exchange(false)) {
-        if (connected_) {
-            Writer w;
-            w.U8(static_cast<uint8_t>(Msg::Bye));
-            Send(w.Data());
-        }
-        queueCv_.notify_all();
-        if (netThread_.joinable()) netThread_.join();
-        if (decodeThread_.joinable()) decodeThread_.join();
+    // The net thread can stop by itself (no usable key), so the threads are
+    // joined whenever they exist, not only when this call stops them.
+    if (running_.exchange(false) && connected_) {
+        Writer w;
+        w.U8(static_cast<uint8_t>(Msg::Bye));
+        Send(w.Data());
     }
+    {
+        // Under the lock, so the decode thread cannot miss the wake-up between
+        // checking running_ and starting to wait.
+        std::lock_guard lock(queueMutex_);
+    }
+    queueCv_.notify_all();
+    if (netThread_.joinable()) netThread_.join();
+    if (decodeThread_.joinable()) decodeThread_.join();
     connected_ = false;
     socket_.Close();
     {

@@ -368,6 +368,39 @@ static void TestEncoderSizes() {
     Check(allInit, "every size at or above the 256 px floor can be encoded");
 }
 
+// A stream can close while its encoder still holds a frame: NVENC keeps one
+// back until more input arrives. The encoder's own Media Foundation work for
+// that frame must not outlive it; it once ran on the freed encoder and crashed
+// the process a second or two later.
+static void TestEncoderTeardown() {
+    printf("encoder teardown\n");
+    if (HardwareEncoderName().empty()) {
+        printf("  SKIP  no hardware encoder\n");
+        return;
+    }
+    auto& g = Gfx::Get();
+    D3D11_TEXTURE2D_DESC nd{};
+    nd.Width = 640; nd.Height = 360; nd.MipLevels = 1; nd.ArraySize = 1;
+    nd.Format = DXGI_FORMAT_NV12; nd.SampleDesc = { 1, 0 }; nd.Usage = D3D11_USAGE_DEFAULT;
+    nd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    winrt::com_ptr<ID3D11Texture2D> nv12;
+    if (FAILED(g.d3d->CreateTexture2D(&nd, nullptr, nv12.put()))) {
+        Check(false, "NV12 texture created");
+        return;
+    }
+    int held = 0;
+    for (int i = 0; i < 20; ++i) {
+        H264Encoder encoder;
+        if (!encoder.Init(640, 360, 60, 4'000'000)) continue;
+        std::vector<EncodedFrame> out;
+        std::lock_guard<std::mutex> device(g.deviceMutex);
+        if (encoder.Encode(nv12.get(), out) && out.empty()) ++held;
+    }   // Each encoder goes with its frame still inside.
+    Sleep(2000);   // Long enough for any stray work to have run.
+    Check(held > 0, "encoders were closed with a frame still inside");
+    Check(true, "and none of their work ran after they were freed");
+}
+
 // The size rule shared by server and client. A small crop is scaled up evenly
 // to the floor, and to each larger floor the server steps through when an
 // encoder refuses it; large crops are left alone by the floors.
@@ -1664,8 +1697,13 @@ int main(int argc, char** argv) {
     winrt::init_apartment(winrt::apartment_type::single_threaded);
 
     // Encoder and server diagnostics land in %APPDATA%\RearViewMirror\test.log,
-    // so a run on another machine records exactly what its GPU did.
+    // so a run on another machine records exactly what its GPU did. A crash
+    // adds its stack there and a dump beside it; unbuffered output keeps the
+    // progress printed before it, even when piped.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
     LogOpen(L"test");
+    InstallCrashHandler(L"test");
     printf("GPU encoders, own adapter first:\n");
     for (const auto& name : [] {
              std::vector<std::wstring> names;
@@ -1689,6 +1727,7 @@ int main(int argc, char** argv) {
         Gfx::Get().Init();
         TestCodec();
         TestEncoderSizes();
+        TestEncoderTeardown();
         TestEncodeSizeRule();
         TestRateControl();
         TestEncoderPresets();
