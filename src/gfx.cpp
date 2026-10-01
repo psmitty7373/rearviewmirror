@@ -19,7 +19,10 @@ constexpr uint64_t kMaxLogBytes = 16ull * 1024 * 1024;
 
 void LogOpen(const wchar_t* name) {
     std::lock_guard lock(g_logMutex);
-    if (g_logFile != INVALID_HANDLE_VALUE) CloseHandle(g_logFile);
+    if (g_logFile != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(g_logFile);
+        CloseHandle(g_logFile);
+    }
     const std::wstring path = ConfigDir() + L"\\" + name + L".log";
     g_logFile = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -63,7 +66,11 @@ void Log(const wchar_t* fmt, ...) {
         WriteFile(g_logFile, utf8, static_cast<DWORD>(n - 1), &written, nullptr);
         g_logBytes += written;
     }
-    FlushFileBuffers(g_logFile);
+}
+
+void LogFlush() {
+    std::lock_guard lock(g_logMutex);
+    if (g_logFile != INVALID_HANDLE_VALUE) FlushFileBuffers(g_logFile);
 }
 
 RECT ExtendedFrameBounds(HWND hwnd) {

@@ -46,8 +46,10 @@ public:
     size_t StreamCount() const;   // Encoders and buffers currently allocated.
 
     // The frame tee. Called on a capture thread under the renderer and device
-    // locks with the mirror's cache texture and effective crop; until a client
-    // subscribes to that mirror it costs one atomic load.
+    // locks with the mirror's cache texture and effective crop. While no
+    // client watches any mirror it costs an atomic load; while others are
+    // watched, an unwatched mirror's frame costs a map lookup under a short
+    // lock.
     void SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const RECT& crop);
 
     // UI thread. What clients see when they ask for the list, and the only
@@ -94,6 +96,7 @@ private:
     void NetLoop();
     void EncodeLoop();
     void EncodeStream(Stream& s);
+    DWORD NextCheckMs(Stream& s);
     void PruneStreams();
     void SendFrames(Stream& s, const std::vector<net::EncodedFrame>& frames);
     void RequestFrame(uint32_t mirrorId);
@@ -155,6 +158,7 @@ private:
 
     mutable std::mutex streamsMutex_;
     std::map<uint32_t, std::shared_ptr<Stream>> streams_;
+    std::atomic<int> watching_{ 0 };   // Subscriptions, over every stream.
 
     std::mutex listMutex_;
     std::vector<MirrorInfo> mirrorList_;

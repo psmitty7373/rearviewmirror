@@ -1460,6 +1460,69 @@ static void TestSoftwareLoopback() {
     server.Stop();
 }
 
+// The encode thread sleeps until something has a reason to wake it. On the
+// CPU path, so it runs on any machine: a picture the cap skipped is still
+// fetched again once the source goes still, a still source then costs no
+// further requests, and a stream nobody watches is freed at once.
+static void TestEncodeWakeups() {
+    printf("encode wakeups\n");
+    if (!SoftwareEncoder()) {
+        printf("  SKIP  no software H.264 encoder on this machine\n");
+        return;
+    }
+    auto& g = Gfx::Get();
+    const std::wstring key = L"wakeup-test-key";
+    const uint8_t a[3]{ 40, 170, 230 }, b[3]{ 200, 80, 50 };
+    const auto source = SplitSource(320, 240, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, a, b);
+    const RECT crop{ 0, 0, 320, 240 };
+
+    StreamSettings settings;
+    settings.enabled = true;
+    settings.port = 0;
+    settings.key = key;
+    settings.bitrateKbps = 1000;
+    settings.fps = 10;
+
+    StreamServer server;
+    server.ForceSoftwareEncoding(true);
+    std::atomic<int> requests{ 0 };
+    server.SetFrameRequester([&](uint32_t id) {
+        ++requests;
+        std::lock_guard<std::mutex> lock(g.deviceMutex);
+        server.SubmitFrame(id, source.get(), crop);
+    });
+    Check(server.Start(settings), "server starts, encoding on the CPU at 10 fps");
+    server.SetMirrorList({ { 1, L"Still", 320, 240 } });
+
+    RawPeer peer;
+    Check(peer.Open(server.Port(), key) && peer.Handshake() && peer.PingPong(), "raw peer admitted");
+    SendId(peer, Msg::Subscribe, 1);
+    const auto framed = [](const std::vector<std::vector<uint8_t>>& messages) {
+        return std::any_of(messages.begin(), messages.end(),
+                           [](const auto& m) { return m[0] == static_cast<uint8_t>(Msg::Frame); });
+    };
+    Check(framed(peer.Collect(1500)), "the subscriber's first frame arrives");
+    peer.Collect(300);
+
+    // After a pause the cadence takes two frames at once. A third, once the
+    // encode thread has gone back to sleep, falls inside the cap's gap.
+    const int before = requests.load();
+    for (int i = 0; i < 3; ++i) {
+        if (i == 2) Sleep(40);
+        std::lock_guard<std::mutex> lock(g.deviceMutex);
+        server.SubmitFrame(1, source.get(), crop);
+    }
+    peer.Collect(500);
+    const int after = requests.load();
+    Check(after > before, "a picture the cap skipped is fetched again once the source goes still");
+    peer.Collect(600);
+    Check(requests.load() == after, "a still source is not asked for anything more");
+
+    SendId(peer, Msg::Unsubscribe, 1);
+    Check(WaitFor([&] { return server.StreamCount() == 0; }, 300), "an unwatched stream is freed at once");
+    server.Stop();
+}
+
 // Everything the audit found a client could abuse, tried against a live
 // server: each must stay bounded.
 static void TestHostileClients() {
@@ -2192,6 +2255,7 @@ int main(int argc, char** argv) {
         TestLoopback();
         TestWelcomeBinding();
         TestSoftwareLoopback();
+        TestEncodeWakeups();
         TestHostileClients();
         TestEncoderSessionLimit();
         TestFrameRateCap();

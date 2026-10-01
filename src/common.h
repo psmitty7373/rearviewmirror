@@ -130,6 +130,9 @@ void ApplyTitleBarTheme(HWND hwnd);
 // Lines carry a millisecond tick and thread id. No-op until LogOpen is called.
 void LogOpen(const wchar_t* name);
 void Log(const wchar_t* fmt, ...);
+// Lines reach the file at once, but the system's cache only reaches the disk
+// in its own time; a crash report forces it there.
+void LogFlush();
 
 // Per-call-site sampling for per-frame events: the first few, then one in N.
 #define RVM_LOG_SAMPLED(n, ...)                                          \

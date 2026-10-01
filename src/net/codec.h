@@ -46,6 +46,9 @@ enum class EncoderKind {
 // returns with whatever the frame produced, having encoded it there and then.
 class H264Encoder {
 public:
+    H264Encoder() = default;
+    H264Encoder(const H264Encoder&) = delete;
+    H264Encoder& operator=(const H264Encoder&) = delete;
     ~H264Encoder();
 
     // Signalled whenever the encoder has something to say. Duplicated, so the
@@ -96,10 +99,12 @@ public:
     void RequestKeyframe() { forceKeyframe_.store(true, std::memory_order_relaxed); }
 
     // Some encoders (Intel Quick Sync among them) keep a frame back until the
-    // next one arrives, however low-latency they are asked to be. True when
-    // the last real frame has produced nothing for a while: the caller should
-    // feed the same picture again with Repeat() to push it out.
-    bool NeedsNudge(uint64_t nowMs) const;
+    // next one arrives, however low-latency they are asked to be. The tick
+    // (GetTickCount64) from which the last real frame has produced nothing
+    // for too long, or kNoNudge: from then the caller should feed the same
+    // picture again with Repeat() to push it out.
+    static constexpr uint64_t kNoNudge = ~0ull;
+    uint64_t NudgeDueMs() const;
     bool Repeat(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released = {});
 
     const std::wstring& Name() const { return name_; }
@@ -110,6 +115,7 @@ private:
     bool WaitForEvents(DWORD timeoutMs);
     HRESULT CollectOutput(std::vector<EncodedFrame>& out);
     bool RenegotiateOutput();
+    void ReadOutputStreamInfo();
     void ApplyKeyframeRequest();
     bool EncodeSoftware(ID3D11Texture2D* packed, std::vector<EncodedFrame>& out, Released released);
     void DrainSoftware(std::vector<EncodedFrame>& out);
@@ -126,6 +132,13 @@ private:
     winrt::com_ptr<IMFMediaEventGenerator> events_;
     winrt::com_ptr<ICodecAPI>              codec_;
     EncoderEventRelay* relay_ = nullptr;   // COM-refcounted; see codec.cpp. Hardware only.
+    std::vector<winrt::com_ptr<IMFMediaEvent>> taken_;   // Service()'s batch, kept for its capacity.
+
+    // Reused every frame while the encoder has let go of them.
+    winrt::com_ptr<IMFSample>      inSample_, outSample_;
+    winrt::com_ptr<IMFMediaBuffer> inBuffer_, outBuffer_;
+    DWORD  outputSize_ = 0;      // The output stream's buffer size.
+    HANDLE gpuDone_ = nullptr;   // Software: the frame's readback may begin.
     EncoderKind kind_ = EncoderKind::Hardware;
     HANDLE wake_ = nullptr;
     bool   failed_ = false;
@@ -170,6 +183,8 @@ private:
     bool Drain(std::vector<DecodedFrame>& out);
 
     winrt::com_ptr<IMFTransform> mft_;
+    winrt::com_ptr<IMFSample>      inSample_;   // Reused while the decoder has let go of it.
+    winrt::com_ptr<IMFMediaBuffer> inBuffer_;
     DWORD inputId_ = 0, outputId_ = 0;
     bool  providesSamples_ = false;
     UINT  width_ = 0, height_ = 0;   // Display size, after cropping.

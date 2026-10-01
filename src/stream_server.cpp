@@ -151,6 +151,9 @@ struct StreamServer::Stream : std::enable_shared_from_this<StreamServer::Stream>
     bool SlotFree(int i) const {
         return i != ready && i != busy && i != held && !inEncoder[i];
     }
+    // Encode thread, under `swap`: whether the textures still suit the encoder.
+    bool SizeDiffers() const { return encoder.Width() != texW || encoder.Height() != texH; }
+    bool KindDiffers() const { return (encoder.Kind() == EncoderKind::Software) != texSoftware; }
 
     // Set once an encoder refused the exact size: frames are then scaled to
     // multiples of 16, which every encoder accepts.
@@ -253,6 +256,7 @@ void StreamServer::Stop() {
         std::lock_guard lock(streamsMutex_);
         streams_.clear();
     }
+    watching_ = 0;
     recentHellos_.clear();
     recentHelloOrder_.clear();
     socket_.Close();
@@ -274,7 +278,7 @@ size_t StreamServer::StreamCount() const {
 }
 
 bool StreamServer::Watched(uint32_t mirrorId) const {
-    if (!running_) return false;
+    if (watching_.load(std::memory_order_relaxed) == 0 || !running_) return false;
     std::lock_guard lock(streamsMutex_);
     const auto it = streams_.find(mirrorId);
     return it != streams_.end() && it->second->subscribers.load(std::memory_order_relaxed) > 0;
@@ -291,8 +295,6 @@ void StreamServer::RequestFrame(uint32_t mirrorId) {
         std::lock_guard lock(requesterMutex_);
         requester = requester_;
     }
-    RVM_LOG_SAMPLED(100, L"server: requesting a frame for mirror %u (requester %s)", mirrorId,
-                    requester ? L"set" : L"NOT SET");
     if (requester) requester(mirrorId);
 }
 
@@ -367,6 +369,7 @@ std::shared_ptr<StreamServer::Stream> StreamServer::AcquireStream(uint32_t mirro
         slot->software = software_;
     }
     slot->subscribers.fetch_add(1);
+    watching_.fetch_add(1);
     return slot;
 }
 
@@ -382,11 +385,8 @@ void StreamServer::SendTo(Client& client, const std::vector<uint8_t>& plain) {
 // Capture side
 
 void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const RECT& crop) {
-    if (!running_) return;
+    if (watching_.load(std::memory_order_relaxed) == 0 || !running_) return;
     auto s = FindStream(mirrorId);
-    RVM_LOG_SAMPLED(300, L"server: tee frame for mirror %u crop %dx%d, stream=%s subs=%d",
-                    mirrorId, RectW(crop), RectH(crop), s ? L"yes" : L"NO",
-                    s ? s->subscribers.load() : 0);
     if (!s || s->subscribers.load(std::memory_order_relaxed) == 0) return;
 
     const UINT cropW = static_cast<UINT>(RectW(crop));
@@ -396,6 +396,12 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
     UINT w = 0, h = 0;
     EncodeSize(cropW, cropH, s->align16.load(), w, h, s->minDim.load());
 
+    // Under `swap`. The first frame dropped since one went through wakes the
+    // encode thread, which fetches it again if the source then goes still.
+    const auto skip = [&] {
+        if (!std::exchange(s->skipped, true)) SetEvent(frameEvent_);
+    };
+
     // Hold each stream to the configured rate, on an even cadence. A frame
     // someone is waiting for (a keyframe, a new viewer) always goes through.
     {
@@ -403,7 +409,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
         const int64_t now = NowUs();
         std::lock_guard lock(s->swap);
         if (!s->wantKeyframe.load() && now + interval / 4 < s->nextAcceptUs) {
-            s->skipped = true;
+            skip();
             return;
         }
         s->nextAcceptUs = (std::max)(s->nextAcceptUs, now - interval) + interval;
@@ -420,7 +426,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
     } else {
         if (!s->converterReady) s->converterReady = s->converter.Init();
         if (!s->converterReady) {
-            Log(L"server: video processor unavailable for mirror %u", mirrorId);
+            RVM_LOG_SAMPLED(300, L"server: video processor unavailable for mirror %u", mirrorId);
             return;
         }
     }
@@ -432,7 +438,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
         std::lock_guard lock(s->swap);
         if (w != s->texW || h != s->texH || software != s->texSoftware) {
             if (s->busy >= 0) {   // Encoder mid-frame; resize on the next one.
-                s->skipped = true;
+                skip();
                 return;
             }
             // All or nothing: a half-replaced set would leave slots that are
@@ -459,7 +465,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
                                     software ? L"packed NV12" : L"NV12", w, h, mirrorId,
                                     static_cast<unsigned>(hr));
                     Gfx::Get().CheckDevice(hr);
-                    s->skipped = true;
+                    skip();
                     return;
                 }
             }
@@ -481,7 +487,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
             if (s->SlotFree(i)) { write = i; break; }
         }
         if (write < 0) {
-            s->skipped = true;   // Every slot is still with the encoder.
+            skip();   // Every slot is still with the encoder.
             return;
         }
     }
@@ -495,7 +501,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
     if (!converted) {
         RVM_LOG_SAMPLED(300, L"server: convert failed for mirror %u", mirrorId);
         std::lock_guard lock(s->swap);
-        s->skipped = true;
+        skip();
         return;
     }
 
@@ -514,13 +520,14 @@ void StreamServer::EncodeLoop() {
     // thread joins it rather than relying on one existing by accident.
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
+    // Frames, encoder events and viewers leaving all signal the event; only
+    // what falls due at a time of its own sets a timeout. Idle, this sleeps.
+    std::vector<std::shared_ptr<Stream>> streams;
+    DWORD wait = INFINITE;
     while (running_) {
-        // The wait also serves the frame-rate cap's owed frames and nudging a
-        // still encoder, which no event announces.
-        WaitForSingleObject(frameEvent_, 20);
+        WaitForSingleObject(frameEvent_, wait);
         if (!running_) break;
 
-        std::vector<std::shared_ptr<Stream>> streams;
         {
             std::lock_guard lock(streamsMutex_);
             for (auto& [id, s] : streams_) streams.push_back(s);
@@ -539,7 +546,15 @@ void StreamServer::EncodeLoop() {
                 RequestFrame(s->mirrorId);
             }
         }
-        PruneStreams();
+
+        wait = INFINITE;
+        bool unwatched = false;
+        for (auto& s : streams) {
+            wait = (std::min)(wait, NextCheckMs(*s));
+            unwatched |= s->subscribers.load() == 0;
+        }
+        streams.clear();   // Not held while waiting, so a pruned stream is freed.
+        if (unwatched) PruneStreams();
     }
 
     // Encoders are shut down on the thread and in the apartment that made them.
@@ -622,8 +637,8 @@ void StreamServer::EncodeStream(Stream& s) {
     UINT w = 0, h = 0;
     {
         std::lock_guard lock(s.swap);
-        const bool sizeDiffers = s.encoder.Width() != s.texW || s.encoder.Height() != s.texH;
-        const bool kindDiffers = (s.encoder.Kind() == EncoderKind::Software) != s.texSoftware;
+        const bool sizeDiffers = s.SizeDiffers();
+        const bool kindDiffers = s.KindDiffers();
         const bool settling = s.encoder.Ready() && sizeDiffers && !kindDiffers &&
                               NowMs() - s.sizeChangedMs < kResizeSettleMs;
         const bool mustInit = !s.encoder.Ready() || s.reinit || sizeDiffers || kindDiffers;
@@ -665,7 +680,7 @@ void StreamServer::EncodeStream(Stream& s) {
         // Nothing came out, and the encoder is sitting on the last frame: the
         // source is still, so no next frame will come to push it out.
         if (produced.empty() && s.encoder.Ready() && s.encoder.WantsInput() &&
-            s.encoder.NeedsNudge(GetTickCount64())) {
+            GetTickCount64() >= s.encoder.NudgeDueMs()) {
             int again = -1;
             {
                 std::lock_guard lock(s.swap);
@@ -789,9 +804,34 @@ void StreamServer::EncodeStream(Stream& s) {
     } else {
         giveBack();
     }
-    RVM_LOG_SAMPLED(300, L"server: encode mirror %u -> fed=%d frames=%zu%s", s.mirrorId, fed ? 1 : 0,
-                    produced.size(), (!produced.empty() && produced[0].keyframe) ? L" (keyframe)" : L"");
     if (!produced.empty()) SendFrames(s, produced);
+}
+
+// How long until the stream needs a look that no event will prompt: a frame
+// the cap skipped, an encoder sitting on its last frame, a retry or a resize
+// falling due. Mirrors the conditions EncodeStream acts on, so whatever is
+// already due is acted on at the next pass and no pass repeats for nothing.
+DWORD StreamServer::NextCheckMs(Stream& s) {
+    if (s.subscribers.load() == 0) return INFINITE;
+    const uint64_t nowMs = NowMs();
+    int64_t due = INT64_MAX;   // Milliseconds from now.
+    const auto at = [&](uint64_t tickMs) { due = (std::min)(due, static_cast<int64_t>(tickMs - nowMs)); };
+    {
+        std::lock_guard lock(s.swap);
+        if (s.ready >= 0 && s.encoder.Ready() && s.SizeDiffers() && !s.KindDiffers()) {
+            at(s.sizeChangedMs + kResizeSettleMs);
+        }
+        if (s.skipped && s.ready < 0) {
+            const int64_t interval = 1'000'000 / static_cast<int64_t>((std::max)(fps_.load(), 1u));
+            due = (std::min)(due, (s.nextAcceptUs + interval / 2 - NowUs() + 999) / 1000);
+        }
+        if (s.held >= 0 && s.encoder.Ready() && s.encoder.WantsInput() &&
+            s.encoder.NudgeDueMs() != H264Encoder::kNoNudge) {
+            at(s.encoder.NudgeDueMs());
+        }
+    }
+    if (!s.encoder.Ready() && s.failedW != 0 && !s.retryRequested) at(s.nextInitMs);
+    return due == INT64_MAX ? INFINITE : static_cast<DWORD>(std::clamp<int64_t>(due, 1, 60000));
 }
 
 void StreamServer::SendFrames(Stream& s, const std::vector<EncodedFrame>& frames) {
@@ -807,9 +847,6 @@ void StreamServer::SendFrames(Stream& s, const std::vector<EncodedFrame>& frames
         const uint32_t seq = ++s.seq;
         std::lock_guard sender(s.senderMutex);
         const auto& packets = s.sender.Packetize(seq, f.keyframe, f.data.data(), f.data.size());
-        RVM_LOG_SAMPLED(300, L"server: send mirror %u seq %u: %zu bytes in %zu packets to %zu clients%s",
-                        s.mirrorId, seq, f.data.size(), packets.size(), targets.size(),
-                        f.keyframe ? L" (keyframe)" : L"");
         for (auto& c : targets) {
             std::lock_guard send(c->sendMutex);
             std::vector<uint8_t> datagram;
@@ -1057,6 +1094,7 @@ void StreamServer::Subscribe(const std::shared_ptr<Client>& client, uint32_t id,
         std::lock_guard lock(s->subsMutex);
         s->subs.push_back(client);
     }
+    SetEvent(frameEvent_);
     RVM_LOG_SAMPLED(50, L"server: %s subscribes to mirror %u (subscribers now %d)",
                     client->endpoint.ToString().c_str(), id, s->subscribers.load());
     ForceKeyframe(*s, nowMs);   // A newcomer can only start on an IDR.
@@ -1231,7 +1269,8 @@ void StreamServer::DropSubscription(const std::shared_ptr<Client>& client, uint3
                 it = (!c || c == client) ? s->subs.erase(it) : it + 1;
             }
         }
-        s->subscribers.fetch_sub(1);
+        watching_.fetch_sub(1);
+        if (s->subscribers.fetch_sub(1) == 1) SetEvent(frameEvent_);   // Its encoder can go.
     }
 }
 
