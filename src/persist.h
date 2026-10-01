@@ -58,6 +58,10 @@ void SetConfigDir(const std::wstring& dir);
 // a BOM: a crash mid-write leaves the previous file intact.
 bool WriteTextAtomically(const std::wstring& path, const std::wstring& text);
 
+// The most mirrors the file holds, waiting ones included, and so the most the
+// app makes.
+constexpr int kMaxMirrors = 32;
+
 std::vector<MirrorState> LoadMirrorStates();
 
 // Writes the whole file atomically, as UTF-16 with a BOM so titles in any

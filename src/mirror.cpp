@@ -49,6 +49,14 @@ int ClampExtent(int v, int minimum) {
     return ClampI(v, minimum, kMaxExtent);
 }
 
+// Sets a flag for a scope, restoring what it was.
+struct Busy {
+    explicit Busy(bool& flag) : flag_(flag), was_(std::exchange(flag, true)) {}
+    ~Busy() { flag_ = was_; }
+    bool& flag_;
+    const bool was_;
+};
+
 }  // namespace
 
 Mirror::~Mirror() {
@@ -137,22 +145,25 @@ void Mirror::PlaceInitially() {
 }
 
 bool Mirror::StartCapture() {
-    if (IsDesktop()) {
-        if (!desktop_.Start(
-                [this](ID3D11Texture2D* tex, UINT w, UINT h) { renderer_.SubmitFrame(tex, w, h); })) {
-            return false;
-        }
-        FollowDesktopSize();
-        return true;
-    }
+    const Busy busy(transitioning_);
+    const auto onFrame = [this](ID3D11Texture2D* tex, UINT w, UINT h) {
+        renderer_.SubmitFrame(tex, w, h);
+    };
     HWND self = hwnd_;
-    return capture_.Start(
-        target_,
-        [this](ID3D11Texture2D* tex, UINT w, UINT h) { renderer_.SubmitFrame(tex, w, h); },
-        [self] { PostMessageW(self, WM_RVM_TARGET_LOST, 0, 0); });
+    const bool started = IsDesktop()
+        ? desktop_.Start(onFrame)
+        : capture_.Start(target_, onFrame, [self] { PostMessageW(self, WM_RVM_TARGET_LOST, 0, 0); });
+    if (!started) return false;
+    if (!hwnd_) {   // Destroyed while starting.
+        StopCapture();
+        return false;
+    }
+    if (IsDesktop()) FollowDesktopSize();
+    return true;
 }
 
 void Mirror::StopCapture() {
+    const Busy busy(transitioning_);
     capture_.Stop();
     desktop_.Stop();
 }
@@ -266,7 +277,7 @@ void Mirror::UpdateVisibility() {
 }
 
 bool Mirror::SetEnabled(bool enabled, const std::vector<HWND>& exclude, HWND preferred) {
-    if (!hwnd_) return false;
+    if (!hwnd_ || transitioning_) return false;
     if (state_.enabled == enabled) return true;
 
     if (!enabled) {
@@ -305,6 +316,7 @@ void Mirror::SetHidden(bool hidden) {
 }
 
 void Mirror::Orphan() {
+    if (!hwnd_ || transitioning_) return;
     StopCapture();
     target_ = nullptr;
     orphaned_ = true;
@@ -312,10 +324,9 @@ void Mirror::Orphan() {
 }
 
 bool Mirror::RestartDesktop() {
-    if (!hwnd_ || !IsDesktop() || !state_.enabled) return true;
+    if (!hwnd_ || transitioning_ || !IsDesktop() || !state_.enabled) return true;
     StopCapture();
-    // Stopping pumps messages (a COM call waits inside it), and one of them
-    // can retire this mirror; a retired one must not start capturing again.
+    // Stopping pumps messages, and one of them can retire this mirror.
     if (!hwnd_) return true;
     if (StartCapture()) {
         orphaned_ = false;
@@ -331,7 +342,7 @@ bool Mirror::RestartDesktop() {
 }
 
 bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred) {
-    if (!hwnd_ || !orphaned_) return false;
+    if (!hwnd_ || transitioning_ || !orphaned_) return false;
 
     if (IsDesktop()) {
         if (!StartCapture()) return false;
@@ -379,15 +390,14 @@ bool Mirror::IsFullDesktop() const {
 }
 #endif
 
+// Detached before stopping, which pumps messages: nothing arriving meanwhile
+// may reach this mirror or start it again.
 void Mirror::Destroy() {
+    HWND h = std::exchange(hwnd_, nullptr);
+    if (h) SetWindowLongPtrW(h, GWLP_USERDATA, 0);
     StopCapture();
     renderer_.Shutdown();
-    if (hwnd_) {
-        HWND h = hwnd_;
-        hwnd_ = nullptr;
-        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
-        DestroyWindow(h);
-    }
+    if (h) DestroyWindow(h);
 }
 
 MirrorState Mirror::SaveState() const {
@@ -594,8 +604,8 @@ LRESULT Mirror::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_RVM_TARGET_LOST:
-        // The source closed. Wait for it rather than forgetting the mirror.
-        Orphan();
+        // The source closed. The app orphans the mirror, when no other
+        // capture is starting or stopping.
         if (notify_) PostMessageW(notify_, WM_RVM_MIRROR_ORPHANED, id_, 0);
         return 0;
 

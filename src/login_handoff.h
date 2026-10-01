@@ -31,10 +31,12 @@ inline bool SessionLocked(DWORD session) {
 // WM_WTSSESSION_CHANGE for this session: locks, unlocks, connects, disconnects.
 void WatchSessionChanges(HWND window, bool on);
 
-// True when this session is not what the console shows, and the service is
-// running to stream the console instead. Without the service, never: the app
+// True when this session is not what the console shows, unlocked.
+bool AwayFromConsole();
+
+// The app hands off only while this is true as well. Without the service it
 // carries on as it always has.
-bool LoginServiceTakesOver();
+bool LoginServiceRunning();
 
 }  // namespace rvm
 #endif  // RVM_LOGIN_SERVICE

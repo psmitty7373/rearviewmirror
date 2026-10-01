@@ -14,8 +14,8 @@ namespace {
 constexpr UINT_PTR kTimerRestore = 1;
 constexpr UINT_PTR kTimerSave    = 2;
 constexpr UINT_PTR kTimerHandoff = 3;
-// While handed off, look again now and then: the console can be between
-// sessions at the moment of a notification, and the service can stop.
+// Away from the console, look again now and then: the console can be between
+// sessions at the moment of a notification, and the service can start or stop.
 constexpr UINT kHandoffRecheckMs = 5000;
 // Taking the port back: the service's helper lets go of it a moment after the
 // session returns, so try each second for half a minute before saying so.
@@ -43,6 +43,25 @@ enum TrayMenuId : UINT {
     kTrayExit,
     kTrayManager,
 };
+
+// Messages whose handling can start or stop a capture (see App::Transition).
+bool StartsOrStopsCapture(UINT msg, WPARAM wp) {
+    switch (msg) {
+    case WM_DISPLAYCHANGE:
+    case WM_RVM_NEW_MIRROR:
+    case WM_RVM_MIRROR_CLOSED:
+    case WM_RVM_MIRROR_ORPHANED:
+    case WM_RVM_FOREGROUND_CHANGED:
+    case WM_RVM_TRAY:
+    case WM_HOTKEY:
+    case WM_CLOSE:
+        return true;
+    case WM_TIMER:
+        return wp == kTimerRestore;
+    default:
+        return false;
+    }
+}
 
 }  // namespace
 
@@ -145,6 +164,15 @@ void App::NewMirror() {
     selecting_ = true;
     struct Reset { bool& flag; ~Reset() { flag = false; } } reset{ selecting_ };
 
+    // Beyond what the file holds, a mirror would be lost on the next save.
+    if (mirrors_.size() + pending_.size() >= static_cast<size_t>(kMaxMirrors)) {
+        const std::wstring text = L"There are already " + std::to_wstring(kMaxMirrors) +
+                                  L" mirrors, counting those waiting for their apps, which is "
+                                  L"as many as Rear View Mirror keeps. Close one to make another.";
+        MessageBoxW(nullptr, text.c_str(), kAppName, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
     const PickResult pick = PickSource();
     if (pick.desktop) {
         NewDesktopMirror();
@@ -169,7 +197,7 @@ void App::NewMirror() {
     state.group = GroupForWindow(target);
 
     auto mirror = std::make_unique<Mirror>(nextId_++);
-    if (!mirror->Create(state, target, hwnd_)) {
+    if (!CreateMirror(*mirror, state, target)) {
         MessageBoxW(nullptr, L"Could not start capturing that window.", kAppName,
                     MB_OK | MB_ICONWARNING);
         return;
@@ -199,7 +227,7 @@ void App::NewDesktopMirror() {
     state.group    = NewGroup();
 
     auto mirror = std::make_unique<Mirror>(nextId_++);
-    if (!mirror->Create(state, nullptr, hwnd_)) {
+    if (!CreateMirror(*mirror, state, nullptr)) {
         MessageBoxW(nullptr, L"Could not start capturing the desktop.", kAppName,
                     MB_OK | MB_ICONWARNING);
         return;
@@ -230,16 +258,43 @@ void App::RequestNewMirror() {
     PostMessageW(hwnd_, WM_RVM_NEW_MIRROR, 0, 0);
 }
 
+App::Transition::~Transition() {
+    if (--app.transitions_ > 0) return;
+    for (const Deferred& d : std::exchange(app.deferred_, {})) {
+        PostMessageW(app.hwnd_, d.msg, d.wp, d.lp);
+    }
+}
+
+void App::Defer(UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_DISPLAYCHANGE) wp = lp = 0;   // One restart covers any number of changes.
+    const bool queued = std::any_of(deferred_.begin(), deferred_.end(), [&](const Deferred& d) {
+        return d.msg == msg && d.wp == wp && d.lp == lp;
+    });
+    if (!queued) deferred_.push_back(Deferred{ msg, wp, lp });
+}
+
+bool App::CreateMirror(Mirror& mirror, const MirrorState& state, HWND target) {
+    Transition transition(*this);
+    return mirror.Create(state, target, hwnd_);
+}
+
 // Tears the mirror down immediately so it disappears at once, but defers
-// deleting the object until the outer message loop turns.
+// deleting the object until the outer message loop turns. It leaves the list
+// first, so nothing handled while it stops can find it.
 void App::RetireMirror(size_t index) {
     if (index >= mirrors_.size()) return;
-    mirrors_[index]->Destroy();
+    Mirror* mirror = mirrors_[index].get();
     retired_.push_back(std::move(mirrors_[index]));
     mirrors_.erase(mirrors_.begin() + static_cast<ptrdiff_t>(index));
+    Transition transition(*this);
+    mirror->Destroy();
 }
 
 void App::CloseMirror(uint32_t id) {
+    if (transitions_ > 0) {
+        Defer(WM_RVM_MIRROR_CLOSED, id, 0);
+        return;
+    }
     for (size_t i = 0; i < mirrors_.size(); ++i) {
         if (mirrors_[i]->Id() == id) {
             RetireMirror(i);
@@ -305,7 +360,7 @@ void App::SaveNow() {
     states.reserve(mirrors_.size() + pending_.size());
     for (const auto& m : mirrors_) states.push_back(m->SaveState());
     // Unmatched entries stay on disk until their app comes back.
-    for (const auto& p : pending_) states.push_back(p);
+    for (const auto& p : pending_) states.push_back(p.state);
     SaveMirrorStates(states);
 }
 
@@ -348,15 +403,23 @@ uint32_t App::NewGroup() const {
 }
 
 bool App::SetMirrorEnabled(Mirror& mirror, bool on) {
+    if (transitions_ > 0) return true;
+    Transition transition(*this);
     return mirror.SetEnabled(on, TargetsOfOtherGroups(mirror.Group()),
                              TargetOfGroup(mirror.Group(), &mirror));
 }
 
 int App::TryRebindOrphans() {
+    Transition transition(*this);
+    // By id: a nested message can retire a mirror meanwhile.
+    std::vector<uint32_t> ids;
+    for (const auto& m : mirrors_) {
+        if (m->Orphaned()) ids.push_back(m->Id());
+    }
     int rebound = 0;
-    for (auto& m : mirrors_) {
-        if (!m->Orphaned()) continue;
-        if (m->TryRebind(TargetsOfOtherGroups(m->Group()), TargetOfGroup(m->Group(), m.get()))) {
+    for (const uint32_t id : ids) {
+        Mirror* m = FindMirror(id);
+        if (m && m->TryRebind(TargetsOfOtherGroups(m->Group()), TargetOfGroup(m->Group(), m))) {
             ++rebound;
         }
     }
@@ -378,20 +441,13 @@ void App::EnsureRestoreTimer() {
     SetTimer(hwnd_, kTimerRestore, restorePeriodMs_, nullptr);
 }
 
-// One attempt to bind everything that is waiting. The mirror reappearing is
-// its own feedback, so no balloon here; only the launch-time restore announces.
 // Monitors came, went or changed resolution: desktop mirrors start over on the
-// new layout. Stopping a capture waits on a COM call, and this thread pumps
-// messages meanwhile, so the next WM_DISPLAYCHANGE (moving a session between
-// Remote Desktop and the console sends them in a burst) arrives in the middle
-// of it. Restarting again from there deadlocked inside Windows Graphics
-// Capture, on a lock the unfinished stop still held. Such a change is now
-// only noted, and caught up once the restart in progress is done.
+// new layout. Moving a session between Remote Desktop and the console sends
+// these in a burst; one arriving mid-restart waits for it (see Transition).
 void App::RestartDesktops() {
-    restartingDesktops_ = true;
     bool any = false;
-    while (displayChanged_) {
-        displayChanged_ = false;
+    {
+        Transition transition(*this);
         // By id: a nested message can retire a mirror meanwhile.
         std::vector<uint32_t> ids;
         for (const auto& m : mirrors_) {
@@ -404,7 +460,6 @@ void App::RestartDesktops() {
             }
         }
     }
-    restartingDesktops_ = false;
     if (any) {
         streaming_.MirrorsChanged();
         manager_.Refresh();
@@ -413,17 +468,18 @@ void App::RestartDesktops() {
 
 #if RVM_LOGIN_SERVICE
 void App::UpdateHandoff() {
-    const bool handOff = LoginServiceTakesOver();
+    const bool away = AwayFromConsole();
+    const bool handOff = away && LoginServiceRunning();
     if (handOff != handedOff_) {
         Log(handOff ? L"app: this session is not on the console; the sign-in service streams it"
-                    : L"app: this session is on the console again; streaming resumes");
+                    : L"app: no longer handed off to the sign-in service; streaming resumes");
         handedOff_ = handOff;
         resumeTries_ = 0;
     }
     KillTimer(hwnd_, kTimerHandoff);
     if (streaming_.SetPaused(handOff)) {
         resumeTries_ = 0;
-        if (handOff) SetTimer(hwnd_, kTimerHandoff, kHandoffRecheckMs, nullptr);
+        if (away) SetTimer(hwnd_, kTimerHandoff, kHandoffRecheckMs, nullptr);
         return;
     }
     if (++resumeTries_ < kResumeTries) {
@@ -435,6 +491,8 @@ void App::UpdateHandoff() {
 }
 #endif
 
+// One attempt to bind everything that is waiting. The mirror reappearing is
+// its own feedback, so no balloon here; only the launch-time restore announces.
 int App::RunRestorePass() {
     const ULONGLONG now = GetTickCount64();
     if (now - lastRestorePassTick_ < kRestorePassMinGapMs) return 0;
@@ -449,36 +507,48 @@ int App::RunRestorePass() {
 }
 
 int App::TryRestorePending() {
+    Transition transition(*this);
+    // By id, found again after each Create, which can pump messages.
+    std::vector<uint32_t> ids;
+    for (const auto& p : pending_) ids.push_back(p.id);
+    const auto find = [this](uint32_t id) {
+        return std::find_if(pending_.begin(), pending_.end(),
+                            [id](const Pending& p) { return p.id == id; });
+    };
     int restored = 0;
-    for (auto it = pending_.begin(); it != pending_.end();) {
+    for (const uint32_t id : ids) {
+        auto it = find(id);
+        if (it == pending_.end()) continue;
         HWND target = nullptr;
-        if (it->enabled && it->source == SourceKind::Window) {
+        if (it->state.enabled && it->state.source == SourceKind::Window) {
             // A group member already showing the window takes it straight
             // away; otherwise search, never among other groups' windows.
-            target = TargetOfGroup(it->group, nullptr);
-            if (!target) target = FindMatchingWindow(*it, TargetsOfOtherGroups(it->group));
-            if (!target) {
-                ++it;
-                continue;
-            }
+            target = TargetOfGroup(it->state.group, nullptr);
+            if (!target) target = FindMatchingWindow(it->state, TargetsOfOtherGroups(it->state.group));
+            if (!target) continue;   // Kept for the next attempt.
         }
         // A mirror saved disabled needs no source yet: it takes its place in
         // the listing and binds when it is switched on.
-        auto mirror = std::make_unique<Mirror>(nextId_++);
-        if (!mirror->Create(*it, target, hwnd_)) {
-            ++it;   // Keep it for the next attempt rather than forgetting it.
+        auto mirror = std::make_unique<Mirror>(id);
+        const MirrorState state = it->state;
+        if (!mirror->Create(state, target, hwnd_)) continue;
+        it = find(id);
+        if (it == pending_.end()) {   // Forgotten meanwhile.
+            mirror->Destroy();
             continue;
         }
+        pending_.erase(it);
         streaming_.Attach(*mirror);
         mirrors_.push_back(std::move(mirror));
         ++restored;
-        it = pending_.erase(it);
     }
     return restored;
 }
 
 void App::RestoreSaved() {
-    pending_ = LoadMirrorStates();
+    for (MirrorState& state : LoadMirrorStates()) {
+        pending_.push_back(Pending{ nextId_++, std::move(state) });
+    }
     if (pending_.empty()) {
         // Nothing to bring back: show the manager, where a mirror is a click
         // away, but never start one unasked. Not after a device-loss restart,
@@ -504,6 +574,11 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    if (transitions_ > 0 && StartsOrStopsCapture(msg, wp)) {
+        Defer(msg, wp, lp);
+        return 0;
+    }
+
     switch (msg) {
     case WM_RVM_NEW_MIRROR:
         NewMirror();
@@ -514,8 +589,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DISPLAYCHANGE:
-        displayChanged_ = true;
-        if (!restartingDesktops_) RestartDesktops();
+        RestartDesktops();
         break;
 
     case WM_RVM_MIRROR_CLOSED:
@@ -528,6 +602,11 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_RVM_MIRROR_ORPHANED:
+        // Its source closed, or a desktop restart failed and it already waits.
+        if (Mirror* m = FindMirror(static_cast<uint32_t>(wp)); m && m->Enabled() && !m->Orphaned()) {
+            Transition transition(*this);
+            m->Orphan();
+        }
         MarkDirty();
         manager_.Refresh();
         EnsureRestoreTimer();

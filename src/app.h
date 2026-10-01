@@ -26,6 +26,7 @@ public:
     void   ShowStreamSettings() { streaming_.ShowSettings(); }
 
     // Switching a mirror on binds it under the same rules as a restore.
+    // Ignored, as no failure, while a capture is starting or stopping.
     bool   SetMirrorEnabled(Mirror& mirror, bool on);
 
     LRESULT WndProc(UINT msg, WPARAM wp, LPARAM lp);
@@ -39,6 +40,7 @@ private:
 
     void NewMirror();
     void NewDesktopMirror();
+    bool CreateMirror(Mirror& mirror, const MirrorState& state, HWND target);
     void CloseAll();
     void ConfirmCloseAll();
     void OnDeviceLost();
@@ -49,10 +51,23 @@ private:
     void MarkDirty();
     void SaveNow();
 
-    // Desktop mirrors start over after a display change, one change at a time.
+    // Starting or stopping a capture waits on a cross-process COM call, and
+    // this thread pumps messages meanwhile. Starting or stopping another from
+    // one of them deadlocked inside Windows Graphics Capture, so every start
+    // and stop runs inside a Transition, and messages that would start or
+    // stop one wait until the outermost ends, then are posted again.
+    struct Transition {
+        explicit Transition(App& owner) : app(owner) { ++app.transitions_; }
+        ~Transition();
+        App& app;
+    };
+    struct Deferred { UINT msg; WPARAM wp; LPARAM lp; };
+    void Defer(UINT msg, WPARAM wp, LPARAM lp);
+    int  transitions_ = 0;
+    std::vector<Deferred> deferred_;
+
+    // Desktop mirrors start over after a display change.
     void RestartDesktops();
-    bool restartingDesktops_ = false;
-    bool displayChanged_ = false;   // A change still to catch up.
 
 #if RVM_LOGIN_SERVICE
     // Lets go of the streaming port while the sign-in service streams the
@@ -89,8 +104,10 @@ private:
 
     // Saved mirrors whose source has not turned up yet. They stay on disk, so a
     // mirror survives the app it watches not running. Live mirrors whose source
-    // has since closed wait the same way, as orphans, on the same timer.
-    std::vector<MirrorState> pending_;
+    // has since closed wait the same way, as orphans, on the same timer. Each
+    // has the id its mirror will get.
+    struct Pending { uint32_t id; MirrorState state; };
+    std::vector<Pending> pending_;
     UINT restorePeriodMs_ = 2000;
     bool restoreTimerActive_ = false;
     ULONGLONG lastRestorePassTick_ = 0;
