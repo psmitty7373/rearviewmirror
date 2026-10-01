@@ -98,6 +98,7 @@ DWORD WINAPI WriteReport(void* param) {
         }
         if (thread) CloseHandle(thread);
     }
+    LogFlush();   // On disk before the dump, which can take a while.
 
     // Every thread's stack, for what the log cannot show.
     SYSTEMTIME t{};
@@ -116,6 +117,7 @@ DWORD WINAPI WriteReport(void* param) {
                                                nullptr, nullptr);
         CloseHandle(file);
         Log(L"CRASH: %s %s", written ? L"dump written to" : L"dump failed:", path.c_str());
+        LogFlush();
     }
     if (symbols) SymCleanup(process);
     return 0;
