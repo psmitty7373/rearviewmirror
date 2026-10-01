@@ -80,7 +80,20 @@ public:
     void SetSubscribed(uint32_t id, bool on);
     std::vector<StreamView> Views() const;
 #if RVM_REMOTE_CONTROL
-    net::ControlClient& Control() { return control_; }
+    // The UI's hold on desktop control. Each call wakes the network thread,
+    // which otherwise sleeps while control is idle.
+    class ControlLink {
+    public:
+        explicit ControlLink(StreamClient& client) : c_(client) {}
+        void Begin(uint32_t mirror, uint64_t now) { c_.control_.Begin(mirror, now); c_.PokeControl(); }
+        void End(uint64_t now) { c_.control_.End(now); c_.PokeControl(); }
+        void Push(const net::RemoteInput& input) { c_.control_.Push(input); c_.PokeControl(); }
+        net::ControlState State() const { return c_.control_.State(); }
+
+    private:
+        StreamClient& c_;
+    };
+    ControlLink Control() { return ControlLink(*this); }
     bool Controllable(uint32_t id) const;
 #endif
 
@@ -91,6 +104,14 @@ public:
 private:
 #if RVM_REMOTE_CONTROL
     net::ControlClient control_;
+    void PokeControl();
+    // Sends what the control link has due; the milliseconds until it next
+    // has something, or UINT64_MAX while idle.
+    uint64_t ServiceControl();
+    std::atomic<bool> controlPoked_{ false };
+    // Net thread, in net::ControlNowMs() time.
+    uint64_t controlSentMs_ = 0;
+    uint64_t controlDueMs_ = 0;
 #endif
     struct Stream;
 
@@ -105,7 +126,10 @@ private:
     bool HandleDatagram(const uint8_t* data, size_t len, uint64_t nowMs);
     void RequestList(uint64_t nowMs);
     void HandleMessage(net::Reader& r, uint64_t nowMs);
-    void PollStreams(uint64_t nowMs);
+    // Sends the Subscribes and Unsubscribes the wish list calls for.
+    void SyncSubscriptions(uint64_t nowMs);
+    // NACKs and keyframe requests; returns when the streams next need it.
+    uint64_t PollStreams(uint64_t nowMs);
     void SetStatus(std::wstring status);
     void Notify(ClientEvent event, LPARAM lp = 0);
     std::shared_ptr<Stream> FindStream(uint32_t id) const;
@@ -125,22 +149,30 @@ private:
 
     std::mutex sendMutex_;
     net::SecureChannel channel_;
+    std::vector<uint8_t> sealed_;   // Under sendMutex_.
     net::SecureChannel master_;   // Net thread: seals HELLOs, opens WELCOMEs.
     net::Key masterKey_{};
-    std::atomic<uint64_t> session_{ 0 };   // Bumped by every new handshake.
 
     // Net thread only.
+    uint64_t session_ = 0;   // Bumped by every new handshake.
     bool     listPending_ = false;
     uint64_t lastListReqMs_ = 0;
+    uint64_t streamsDueMs_ = UINT64_MAX;
     std::map<uint32_t, uint64_t> unwantedMs_;
     uint32_t clientSession_ = 0;
     uint8_t  clientRandom_[net::kRandomBytes]{};
+    std::vector<uint8_t> plain_;
+    std::vector<std::shared_ptr<Stream>> polled_;
+    std::vector<net::FrameAssembler::Missing> nacks_;
+    std::vector<net::FrameAssembler::Frame> assembled_;
 
     mutable std::mutex stateMutex_;
     std::wstring status_;
     std::vector<RemoteMirror> mirrors_;
     std::set<uint32_t> wanted_;   // Mirrors the user chose; survives reconnects.
     std::map<uint32_t, std::shared_ptr<Stream>> streams_;
+    std::vector<uint32_t> unsubscribe_;   // For the network thread to send.
+    std::atomic<bool> subscriptionsChanged_{ false };
     std::atomic<int64_t> rttUs_{ -1 };
 
     std::mutex queueMutex_;

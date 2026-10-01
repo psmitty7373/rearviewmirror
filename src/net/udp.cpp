@@ -18,6 +18,11 @@ void EnsureWinsock() {
     static WinsockInit init;
 }
 
+// A single oversized or reset datagram is not fatal to the socket.
+bool Discardable(int err) {
+    return err == WSAEMSGSIZE || err == WSAECONNRESET || err == WSAENETRESET;
+}
+
 }  // namespace
 
 bool Endpoint::operator==(const Endpoint& o) const {
@@ -44,11 +49,23 @@ std::wstring Endpoint::ToString() const {
 
 UdpSocket::~UdpSocket() {
     Close();
+    if (wake_) CloseHandle(wake_);
+    if (timer_) CloseHandle(timer_);
+    if (recv_.hEvent) WSACloseEvent(recv_.hEvent);
 }
 
 bool UdpSocket::Open(uint16_t bindPort) {
     EnsureWinsock();
     Close();
+
+    if (!wake_) wake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!timer_) {
+        timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                        TIMER_ALL_ACCESS);
+    }
+    if (!recv_.hEvent) recv_.hEvent = WSACreateEvent();
+    if (!wake_ || recv_.hEvent == WSA_INVALID_EVENT) return false;
+    heldBuf_.resize(2048);   // Anything longer is no datagram of ours.
 
     sock_ = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
     if (sock_ == INVALID_SOCKET) return false;
@@ -89,10 +106,17 @@ uint16_t UdpSocket::LocalPort() const {
 }
 
 void UdpSocket::Close() {
-    if (sock_ != INVALID_SOCKET) {
-        closesocket(sock_);
-        sock_ = INVALID_SOCKET;
+    if (sock_ == INVALID_SOCKET) return;
+    if (posted_) {
+        // The receive must be over before its buffer and OVERLAPPED are reused.
+        CancelIoEx(reinterpret_cast<HANDLE>(sock_), &recv_);
+        DWORD n = 0, flags = 0;
+        WSAGetOverlappedResult(sock_, &recv_, &n, TRUE, &flags);
+        posted_ = false;
     }
+    held_ = false;
+    closesocket(sock_);
+    sock_ = INVALID_SOCKET;
 }
 
 bool UdpSocket::SendTo(const Endpoint& to, const void* data, size_t len) {
@@ -103,6 +127,21 @@ bool UdpSocket::SendTo(const Endpoint& to, const void* data, size_t len) {
 
 int UdpSocket::Receive(void* buf, size_t cap, Endpoint& from, int timeoutMs) {
     if (sock_ == INVALID_SOCKET) return -1;
+
+    // A receive that Wait posted gets the next datagram.
+    if (posted_) {
+        const DWORD wait = static_cast<DWORD>((std::max)(timeoutMs, 0));
+        if (WaitForSingleObject(recv_.hEvent, wait) != WAIT_OBJECT_0) return 0;
+        if (CompleteReceive() < 0) return -1;
+    }
+    if (held_) {
+        held_ = false;
+        if (heldLen_ > cap) return 0;
+        memcpy(buf, heldBuf_.data(), heldLen_);
+        from = heldFrom_;
+        return static_cast<int>(heldLen_);
+    }
+    if (posted_) return 0;
 
     fd_set readable;
     FD_ZERO(&readable);
@@ -116,11 +155,74 @@ int UdpSocket::Receive(void* buf, size_t cap, Endpoint& from, int timeoutMs) {
     const int n = recvfrom(sock_, static_cast<char*>(buf), static_cast<int>(cap), 0,
                            reinterpret_cast<sockaddr*>(&from.addr), &from.len);
     if (n < 0) {
-        // A single oversized or reset datagram is not fatal to the socket.
-        const int err = WSAGetLastError();
-        return (err == WSAEMSGSIZE || err == WSAECONNRESET) ? 0 : -1;
+        return Discardable(WSAGetLastError()) ? 0 : -1;
     }
     return n;
+}
+
+int UdpSocket::PostReceive() {
+    WSAResetEvent(recv_.hEvent);
+    WSABUF b{ static_cast<ULONG>(heldBuf_.size()), reinterpret_cast<char*>(heldBuf_.data()) };
+    heldFrom_.len = sizeof(heldFrom_.addr);
+    recvFlags_ = 0;
+    // Finishing at once signals the event too, so it is collected the same way.
+    if (WSARecvFrom(sock_, &b, 1, nullptr, &recvFlags_, reinterpret_cast<sockaddr*>(&heldFrom_.addr),
+                    &heldFrom_.len, &recv_, nullptr) != 0) {
+        const int err = WSAGetLastError();
+        if (Discardable(err)) return 0;
+        if (err != WSA_IO_PENDING) return -1;
+    }
+    posted_ = true;
+    return 1;
+}
+
+int UdpSocket::CompleteReceive() {
+    posted_ = false;
+    DWORD flags = 0;
+    if (!WSAGetOverlappedResult(sock_, &recv_, &heldLen_, FALSE, &flags)) {
+        return Discardable(WSAGetLastError()) ? 0 : -1;
+    }
+    held_ = true;
+    return 1;
+}
+
+UdpSocket::WaitResult UdpSocket::Wait(DWORD timeoutMs) {
+    if (sock_ == INVALID_SOCKET) return WaitResult::Error;
+    if (held_) return WaitResult::Readable;
+    // A discarded datagram ends the wait at once, so a flood of them cannot
+    // hold the caller's deadlines off.
+    if (!posted_) {
+        const int posted = PostReceive();
+        if (posted <= 0) return posted == 0 ? WaitResult::Timeout : WaitResult::Error;
+    }
+
+    // The plain timeout rounds up to the system tick, 15.6 ms by default;
+    // a high-resolution timer keeps short waits short without raising the
+    // tick rate for the whole machine.
+    HANDLE handles[3] = { recv_.hEvent, wake_, timer_ };
+    DWORD count = 2, wait = timeoutMs;
+    if (timer_ && timeoutMs != INFINITE && timeoutMs > 0) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(timeoutMs) * 10'000;
+        if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) {
+            count = 3;
+            wait = INFINITE;
+        }
+    }
+    switch (WaitForMultipleObjects(count, handles, FALSE, wait)) {
+    case WAIT_OBJECT_0: {
+        const int got = CompleteReceive();
+        return got > 0 ? WaitResult::Readable : got == 0 ? WaitResult::Timeout : WaitResult::Error;
+    }
+    case WAIT_OBJECT_0 + 1: return WaitResult::Woken;
+    case WAIT_OBJECT_0 + 2:
+    case WAIT_TIMEOUT:      return WaitResult::Timeout;
+    default:                return WaitResult::Error;
+    }
+}
+
+void UdpSocket::Wake() {
+    if (wake_) SetEvent(wake_);
 }
 
 bool UdpSocket::Resolve(const std::wstring& host, uint16_t port, Endpoint& out) {

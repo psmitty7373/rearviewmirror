@@ -11,6 +11,7 @@
 #include "stream_client.h"
 #include "stream_server.h"
 
+#include <chrono>
 #include <codecapi.h>
 #include <cstdio>
 #include <cstring>
@@ -179,9 +180,9 @@ static void TestPacketizer() {
     Check(got.empty(), "frame 2 is held back behind the incomplete frame 1");
 
     // Retransmit from the sender's history.
-    const auto* resend = sender.Lookup(1, 3);
-    Check(resend != nullptr, "sender still has the packet");
-    feed(*resend, 40);
+    const auto resend = sender.Lookup(1, 3);
+    Check(static_cast<bool>(resend), "sender still has the packet");
+    feed(resend, 40);
     for (size_t i = 1; i < p2.size(); ++i) feed(p2[i], 41);
     Check(got.size() == 2 && got[0].data == f1 && got[1].data == f2,
           "both frames delivered, in order, after the resend");
@@ -211,8 +212,116 @@ static void TestPacketizer() {
           "the next keyframe restarts the chain, older frames discarded");
     Check(!assembler.NeedKeyframe(), "keyframe requirement cleared");
 
-    const auto* gone = sender.Lookup(0, 0);
-    Check(gone != nullptr, "history retains recent frames");
+    Check(static_cast<bool>(sender.Lookup(0, 0)), "history retains recent frames");
+}
+
+// What a hostile or broken server could make the client set aside, and when
+// the client asks for keyframes.
+static void TestAssemblerLimits() {
+    printf("assembler limits\n");
+    std::vector<FrameAssembler::Frame> got;
+    std::vector<FrameAssembler::Missing> nacks;
+    const std::vector<uint8_t> full(kMaxChunk, 0x5A);
+    const auto header = [](uint32_t seq, uint16_t idx, uint16_t count, bool key) {
+        FrameHeader h;
+        h.mirrorId = 1;
+        h.frameSeq = seq;
+        h.pktIdx = idx;
+        h.pktCount = count;
+        h.flags = key ? kFlagKeyframe : 0;
+        return h;
+    };
+    const auto feedAll = [&](FrameAssembler& a, const PacketizedFrame& frame, uint64_t t) {
+        for (const auto& p : frame) {
+            Reader r(p.data() + 1, p.size() - 1);
+            FrameHeader h;
+            ReadFrameHeader(r, h);
+            a.Accept(h, r.Ptr(), r.Left(), t, got);
+        }
+    };
+    FrameSender sender(1);
+    const std::vector<uint8_t> payload(3000, 7);
+
+    {
+        FrameAssembler a;
+        a.Accept(header(1, 0, kMaxFramePackets + 1, true), full.data(), full.size(), 0, got);
+        a.Accept(header(2, 0, 3, false), full.data(), full.size() - 1, 0, got);
+        feedAll(a, sender.Packetize(3, true, payload.data(), payload.size()), 1);
+        a.Poll(10, nacks);
+        Check(got.size() == 1 && got[0].frameSeq == 3 && nacks.empty(),
+              "an oversized frame count and a short middle chunk are refused outright");
+    }
+    {
+        // Each claims the most packets a frame may have; together they would
+        // pin about 600 MB.
+        FrameAssembler a;
+        for (uint32_t seq = 10; seq < 74; ++seq) {
+            a.Accept(header(seq, 0, kMaxFramePackets, false), full.data(), full.size(), 0, got);
+        }
+        nacks.clear();
+        a.Poll(10, nacks);
+        size_t claimed = 0;
+        for (const auto& m : nacks) claimed += m.indices.size() + 1;
+        Check(nacks.size() <= 2 && claimed <= 2u * kMaxFramePackets && a.NeedKeyframe(),
+              "frames waiting on the word of their first packet stay within budget");
+    }
+    {
+        FrameAssembler a;
+        a.MarkKeyframeRequested(1000);   // The Subscribe.
+        Check(!a.KeyframeRequestDue(1100) && a.KeyframeRequestDue(1200),
+              "a subscribe counts as the first keyframe request");
+        const auto big = std::vector<uint8_t>(kMaxChunk * 3, 9);
+        const PacketizedFrame key(1, 5, true, big.data(), big.size());
+        const auto feedOne = [&](size_t i, uint64_t t) {
+            const auto p = key[i];
+            Reader r(p.data() + 1, p.size() - 1);
+            FrameHeader h;
+            ReadFrameHeader(r, h);
+            a.Accept(h, r.Ptr(), r.Left(), t, got);
+        };
+        got.clear();
+        feedOne(0, 1150);
+        feedOne(1, 1300);
+        Check(!a.KeyframeRequestDue(1350), "no request while a keyframe is still arriving");
+        Check(a.NextDueMs() == 1300 + 81, "the next deadline is that keyframe's drop time");
+        nacks.clear();
+        a.Poll(1400, nacks);
+        Check(a.KeyframeRequestDue(1400), "a keyframe that stalls is given up and asked for again");
+        a.MarkKeyframeRequested(2000);
+        a.MarkKeyframeRequested(2200);
+        Check(!a.KeyframeRequestDue(2500) && a.KeyframeRequestDue(2600),
+              "unanswered keyframe requests are spaced further apart");
+        feedOne(2, 2700);
+        Check(a.NextDueMs() != UINT64_MAX && got.empty(), "a stray packet is held, not delivered");
+    }
+    {
+        // Frame 21, a single packet, is lost whole: only frame 22 shows it.
+        FrameAssembler a;
+        got.clear();
+        feedAll(a, sender.Packetize(20, true, payload.data(), payload.size()), 0);
+        const auto lost = sender.Packetize(21, false, payload.data(), 100);
+        const auto after = sender.Packetize(22, false, payload.data(), 200);
+        feedAll(a, after, 10);
+        nacks.clear();
+        a.Poll(15, nacks);
+        Check(got.size() == 1 && nacks.size() == 1 && nacks[0].frameSeq == 21 &&
+              nacks[0].indices == std::vector<uint16_t>{ 0 },
+              "a frame lost whole is asked for by its first packet");
+        feedAll(a, lost, 13);
+        Check(got.size() == 3 && got[1].frameSeq == 21 && got[2].frameSeq == 22 &&
+              got[2].data.size() == 200, "and the frames behind it follow once it arrives");
+        feedAll(a, sender.Packetize(24, false, payload.data(), 200), 20);
+        nacks.clear();
+        a.Poll(120, nacks);
+        Check(a.NeedKeyframe() && got.size() == 3, "a gap that never fills is given up on");
+    }
+    {
+        const std::vector<uint8_t> huge(static_cast<size_t>(kMaxFramePackets) * kMaxChunk + 1);
+        FrameSender s(2);
+        Check(s.Packetize(1, true, huge.data(), huge.size()).empty() && !s.Find(1) &&
+              s.Packetize(2, true, huge.data(), huge.size() - 1).size() == kMaxFramePackets,
+              "the sender drops a frame larger than any receiver accepts");
+    }
 }
 
 static bool ReadPixel(ID3D11Texture2D* tex, UINT x, UINT y, uint8_t bgra[4]) {
@@ -1366,6 +1475,149 @@ static void TestWelcomeBinding() {
     client.Disconnect();
 }
 
+// The real client against a scripted server that never sends a frame: its
+// network thread sleeps between deadlines, so what the UI asks for must wake
+// it, and a subscribe must not be followed by a second keyframe request.
+static void TestClientWakes() {
+    printf("client wakes\n");
+    const std::wstring key = L"wakes-test-key";
+    const Key master = DeriveMasterKey(key);
+    const auto clock = [] {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+
+    UdpSocket fake;
+    Check(fake.Open(0), "scripted server socket");
+    StreamClient client;
+    client.Connect(L"127.0.0.1", fake.LocalPort(), key, nullptr);
+
+    std::vector<uint8_t> buf(kMaxDatagram + 64), plain;
+    Endpoint from;
+    SecureChannel channel;
+    // Answers the client's next HELLO and keys `channel` for the session.
+    const auto handshake = [&](uint32_t serverSession) {
+        SecureChannel hello;
+        hello.SetKey(master);
+        uint32_t clientSession = 0;
+        uint8_t clientRandom[kRandomBytes]{};
+        bool got = false;
+        for (const ULONGLONG end = GetTickCount64() + 5000; !got && GetTickCount64() < end;) {
+            const int n = fake.Receive(buf.data(), buf.size(), from, 50);
+            got = n > 0 && hello.Open(buf.data(), static_cast<size_t>(n), plain, clientSession) &&
+                  plain.size() >= 3 + kRandomBytes && plain[0] == static_cast<uint8_t>(Msg::Hello);
+            if (got) memcpy(clientRandom, plain.data() + 3, kRandomBytes);
+        }
+        uint8_t serverRandom[kRandomBytes];
+        RandomBytes(serverRandom, kRandomBytes);
+        SecureChannel w;
+        w.SetKey(master);
+        w.BeginSend(serverSession, 12345);
+        Writer m;
+        m.U8(static_cast<uint8_t>(Msg::Welcome));
+        m.Bytes(serverRandom, kRandomBytes);
+        m.Bytes(clientRandom, kRandomBytes);
+        std::vector<uint8_t> gram;
+        w.Seal(m.Data().data(), m.Data().size(), gram);
+        fake.SendTo(from, gram.data(), gram.size());
+        channel.SetKeys(DeriveSessionKey(master, clientRandom, serverRandom, Direction::kServerToClient),
+                        DeriveSessionKey(master, clientRandom, serverRandom, Direction::kClientToServer));
+        channel.BeginSend(serverSession);
+        channel.BeginRecv(clientSession);
+        return got && WaitFor([&] { return client.Connected(); }, 2000);
+    };
+    Check(handshake(0x7171), "client connects to the scripted server");
+
+    const auto send = [&](const Writer& w) {
+        std::vector<uint8_t> gram;
+        if (channel.Seal(w.Data().data(), w.Data().size(), gram)) fake.SendTo(from, gram.data(), gram.size());
+    };
+    // The client's messages over `ms`, each with when it arrived. Pings are
+    // answered, as a server would.
+    struct Got { Msg msg; uint64_t at; };
+    const auto collect = [&](int ms) {
+        std::vector<Got> got;
+        for (const uint64_t end = clock() + ms; clock() < end;) {
+            const int n = fake.Receive(buf.data(), buf.size(), from, 5);
+            uint32_t sender = 0;
+            if (n <= 0 || !channel.Open(buf.data(), static_cast<size_t>(n), plain, sender) || plain.empty()) {
+                continue;
+            }
+            got.push_back({ static_cast<Msg>(plain[0]), clock() });
+            if (got.back().msg == Msg::Ping && plain.size() == 9) {
+                Writer w;
+                w.U8(static_cast<uint8_t>(Msg::Pong));
+                w.Bytes(plain.data() + 1, 8);
+                send(w);
+            }
+        }
+        return got;
+    };
+    const auto first = [](const std::vector<Got>& got, Msg msg) {
+        for (const auto& g : got) {
+            if (g.msg == msg) return g.at;
+        }
+        return UINT64_MAX;
+    };
+    const auto count = [](const std::vector<Got>& got, Msg msg) {
+        return std::count_if(got.begin(), got.end(), [&](const Got& g) { return g.msg == msg; });
+    };
+
+    Writer list;
+    list.U8(static_cast<uint8_t>(Msg::ListResp));
+    list.U8(1);
+    list.U32(1);
+    list.U16(640);
+    list.U16(360);
+    list.U8(kMirrorControllable);
+    list.Str("scripted");
+    send(list);
+    Check(WaitFor([&] { return client.Mirrors().size() == 1; }, 2000), "client takes the list");
+
+    collect(100);   // The list request.
+    const auto idle = collect(2500);
+    Check(count(idle, Msg::Ping) == 1 && idle.size() == 1, "an idle connection sends only its ping");
+    Check(WaitFor([&] { return client.RttUs() >= 0; }, 500) && client.RttUs() < 100'000,
+          "the round trip is still measured");
+
+    const uint64_t subscribed = clock();
+    client.SetSubscribed(1, true);
+    const auto after = collect(700);
+    const uint64_t sub = first(after, Msg::Subscribe), req = first(after, Msg::KeyframeReq);
+    Check(sub != UINT64_MAX && sub - subscribed < 100, "a subscribe goes out at once, not at the next deadline");
+    Check(req != UINT64_MAX && req - sub >= 180,
+          "no keyframe is asked for on top of the subscribe until it has had its time");
+    Check(count(after, Msg::KeyframeReq) <= 2, "and unanswered requests are spaced out");
+
+#if RVM_REMOTE_CONTROL
+    const uint64_t began = clock();
+    client.Control().Begin(1, ControlNowMs());
+    const auto control = collect(250);
+    const uint64_t asked = first(control, Msg::Control);
+    Check(asked != UINT64_MAX && asked - began < 100, "a control request wakes the network thread");
+    Check(count(control, Msg::Control) >= 2, "and is repeated while unanswered");
+    client.Control().End(ControlNowMs());
+#endif
+
+    // The server restarts: the client comes back and restores what it watched.
+    Writer bye;
+    bye.U8(static_cast<uint8_t>(Msg::Bye));
+    send(bye);
+    Check(WaitFor([&] { return !client.Connected(); }, 1000), "the server's goodbye drops the session");
+    Check(handshake(0x7272), "and the client reconnects by itself");
+    send(list);
+    Check(first(collect(500), Msg::Subscribe) != UINT64_MAX, "restoring its subscription");
+
+    const uint64_t dropped = clock();
+    client.SetSubscribed(1, false);
+    const uint64_t unsub = first(collect(300), Msg::Unsubscribe);
+    Check(unsub != UINT64_MAX && unsub - dropped < 100, "an unsubscribe goes out at once");
+
+    const uint64_t closing = clock();
+    client.Disconnect();
+    Check(clock() - closing < 500, "disconnecting does not wait out the network thread's sleep");
+}
+
 static void SendId(RawPeer& peer, Msg msg, uint32_t id) {
     Writer w;
     w.U8(static_cast<uint8_t>(msg));
@@ -2240,6 +2492,7 @@ int main(int argc, char** argv) {
     TestCrypto();
     TestChannel();
     TestPacketizer();
+    TestAssemblerLimits();
     try {
         Gfx::Get().Init();
         TestCodec();
@@ -2254,6 +2507,7 @@ int main(int argc, char** argv) {
         TestDesktopCapture();
         TestLoopback();
         TestWelcomeBinding();
+        TestClientWakes();
         TestSoftwareLoopback();
         TestEncodeWakeups();
         TestHostileClients();

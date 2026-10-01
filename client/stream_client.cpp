@@ -11,12 +11,17 @@ constexpr int      kHelloAttempts     = 8;
 constexpr uint64_t kHelloRetryMs      = 3000;   // After the quick attempts, indefinitely.
 constexpr uint64_t kPingIntervalMs    = 2000;
 constexpr uint64_t kServerTimeoutMs   = 10000;
-constexpr uint64_t kKeyframeThrottleMs = 200;
 constexpr size_t   kMaxQueuedPerStream = 6;
 constexpr uint64_t kListRetryMs       = 1000;    // Until the first list arrives.
 constexpr uint64_t kListRefreshMs     = 15000;   // In case a change notice was lost.
 constexpr uint64_t kUnwantedMs        = 1000;    // Unsubscribe again at most this often.
+constexpr size_t   kMaxUnwanted       = 64;      // The server's own limit on subscriptions.
 constexpr size_t   kMaxNackIndices    = 500;     // Per message, to fit one datagram.
+constexpr int      kMaxDrain          = 64;      // Datagrams per wake, between deadline checks.
+#if RVM_REMOTE_CONTROL
+constexpr uint64_t kControlInputMs    = 8;       // ControlClient::Poll's pacing while input waits,
+constexpr uint64_t kControlIdleMs     = 100;     // and while it does not.
+#endif
 
 uint64_t NowMs() {
     return GetTickCount64();
@@ -45,10 +50,7 @@ struct StreamClient::Stream {
     H264Decoder    decoder;     // Decode thread.
     VideoConverter converter;   // Decode thread, under the device lock.
     bool converterReady = false;
-    // The session this stream was last subscribed in; 0 is never. A session
-    // number rather than a flag, so a subscribe racing a session drop can
-    // never leave a stale "already subscribed" behind.
-    std::atomic<uint64_t> subscribedIn{ 0 };
+    uint64_t subscribedIn = 0;  // Net thread: the session it was last subscribed in; 0 is never.
 
     // Guarded by StreamClient::stateMutex_.
     winrt::com_ptr<ID3D11Texture2D> texture;
@@ -103,6 +105,7 @@ void StreamClient::Disconnect() {
         w.U8(static_cast<uint8_t>(Msg::Bye));
         Send(w.Data());
     }
+    socket_.Wake();
     {
         // Under the lock, so the decode thread cannot miss the wake-up between
         // checking running_ and starting to wait.
@@ -122,7 +125,9 @@ void StreamClient::Disconnect() {
         streams_.clear();
         mirrors_.clear();
         wanted_.clear();
+        unsubscribe_.clear();
     }
+    streamsDueMs_ = UINT64_MAX;
     rttUs_ = -1;
     SecureZeroMemory(masterKey_.data(), masterKey_.size());
 }
@@ -211,34 +216,30 @@ bool StreamClient::IsSubscribed(uint32_t id) const {
     return wanted_.count(id) != 0;
 }
 
+// The network thread sends the change; off-line, the wish is kept and acted
+// on when the list next arrives.
 void StreamClient::SetSubscribed(uint32_t id, bool on) {
-    std::shared_ptr<Stream> stream;
     {
         std::lock_guard lock(stateMutex_);
         if (on) {
             if (!wanted_.insert(id).second) return;
             auto& slot = streams_[id];
             if (!slot) slot = std::make_shared<Stream>(id);
-            stream = slot;
         } else {
             if (!wanted_.erase(id)) return;
             streams_.erase(id);
+            unsubscribe_.push_back(id);
         }
     }
-    // Off-line, the wish is kept and acted on when the list next arrives. The
-    // session number is read before sending: if the session drops meanwhile,
-    // the stream is marked with the old one and the next list re-subscribes.
-    const uint64_t session = session_.load();
-    if (connected_) {
-        Writer w;
-        w.U8(static_cast<uint8_t>(on ? Msg::Subscribe : Msg::Unsubscribe));
-        w.U32(id);
-        Send(w.Data());
-        if (stream) stream->subscribedIn = session;
-        Log(L"client: %s mirror %u", on ? L"subscribed to" : L"unsubscribed from", id);
-    }
-    Notify(ClientEvent::FrameReady);
+    subscriptionsChanged_ = true;
+    socket_.Wake();
 }
+
+#if RVM_REMOTE_CONTROL
+void StreamClient::PokeControl() {
+    if (!controlPoked_.exchange(true)) socket_.Wake();
+}
+#endif
 
 std::vector<StreamView> StreamClient::Views() const {
     std::lock_guard lock(stateMutex_);
@@ -251,9 +252,8 @@ std::vector<StreamView> StreamClient::Views() const {
 
 void StreamClient::Send(const std::vector<uint8_t>& plain) {
     std::lock_guard lock(sendMutex_);
-    std::vector<uint8_t> datagram;
-    if (channel_.Seal(plain.data(), plain.size(), datagram)) {
-        socket_.SendTo(server_, datagram.data(), datagram.size());
+    if (channel_.Seal(plain.data(), plain.size(), sealed_)) {
+        socket_.SendTo(server_, sealed_.data(), sealed_.size());
     }
 }
 
@@ -299,10 +299,18 @@ void StreamClient::NetLoop() {
     uint64_t lastHello = 0, lastPing = 0, lastFromServer = 0;
     int helloAttempts = 0;
 
+    // Sleeps until a datagram, a wake from the UI, or the earliest deadline:
+    // an idle connection costs a ping every couple of seconds.
     while (running_) {
         const uint64_t now = NowMs();
+        uint64_t due = UINT64_MAX;
+        uint64_t controlWait = UINT64_MAX;
 
         if (!connected_) {
+            {
+                std::lock_guard lock(stateMutex_);
+                unsubscribe_.clear();   // The next session starts with none.
+            }
             // Quick attempts first, then a slower retry that never gives up:
             // the server may simply not be running yet. Each slow retry is a
             // fresh handshake, so the server's replay filter never mistakes a
@@ -319,6 +327,7 @@ void StreamClient::NetLoop() {
                 SendHello();
                 lastHello = now;
             }
+            due = lastHello + (helloAttempts >= kHelloAttempts ? kHelloRetryMs : kHelloIntervalMs);
         } else {
             if (now - lastPing >= kPingIntervalMs) {
                 Writer w;
@@ -337,29 +346,45 @@ void StreamClient::NetLoop() {
             // refresh the list now and then in case a change notice was lost.
             const uint64_t listEvery = listPending_ ? kListRetryMs : kListRefreshMs;
             if (now - lastListReqMs_ >= listEvery) RequestList(now);
-            PollStreams(now);
+            if (subscriptionsChanged_.exchange(false)) SyncSubscriptions(now);
+            if (now >= streamsDueMs_) streamsDueMs_ = PollStreams(now);
 #if RVM_REMOTE_CONTROL
-            const auto input = control_.Poll(net::ControlNowMs());
-            if (!input.empty()) Send(input);
+            controlWait = ServiceControl();
 #endif
+            due = (std::min)({ lastPing + kPingIntervalMs, lastFromServer + kServerTimeoutMs + 1,
+                               lastListReqMs_ + listEvery, streamsDueMs_ });
         }
 
-        Endpoint from;
-        const int n = socket_.Receive(buffer.data(), buffer.size(), from, 2);
-        if (n > 0 && from == server_) {
+        const uint64_t after = NowMs();
+        const uint64_t wait = (std::min)(due > after ? due - after : 0, controlWait);
+        const auto ready = socket_.Wait(static_cast<DWORD>((std::min)(wait, uint64_t{ 60'000 })));
+        if (ready == UdpSocket::WaitResult::Error) {
+            // A broken socket must not make this a busy loop.
+            Sleep(static_cast<DWORD>((std::min)(wait, uint64_t{ 50 })));
+            continue;
+        }
+        if (ready != UdpSocket::WaitResult::Readable) continue;
+
+        for (int i = 0; i < kMaxDrain && running_; ++i) {
+            Endpoint from;
+            const int n = socket_.Receive(buffer.data(), buffer.size(), from, 0);
+            if (n <= 0) break;
+            if (!(from == server_)) continue;
+            const uint64_t at = NowMs();
             const bool wasConnected = connected_;
             // Only a datagram that authenticated counts as a sign of life:
             // anyone can send from a forged address.
-            if (HandleDatagram(buffer.data(), static_cast<size_t>(n), now) && connected_) {
-                lastFromServer = now;
+            if (HandleDatagram(buffer.data(), static_cast<size_t>(n), at) && connected_) {
+                lastFromServer = at;
             }
             if (!wasConnected && connected_) {
-                lastPing = now;
+                lastPing = at;
                 helloAttempts = 0;
             }
             if (wasConnected && !connected_) {   // The server said goodbye.
                 helloAttempts = 0;
-                lastHello = now;
+                lastHello = at;
+                break;
             }
         }
     }
@@ -374,7 +399,7 @@ bool StreamClient::HandleDatagram(const uint8_t* data, size_t len, uint64_t nowM
     if (!connected_) {
         // Expecting the WELCOME that answers this session's own HELLO: it must
         // echo our random, so a WELCOME recorded earlier is worthless.
-        std::vector<uint8_t> plain;
+        std::vector<uint8_t>& plain = plain_;
         uint32_t serverSession = 0;
         if (!master_.Open(data, len, plain, serverSession) || plain.size() < 1 + 2 * kRandomBytes) {
             return false;
@@ -401,10 +426,9 @@ bool StreamClient::HandleDatagram(const uint8_t* data, size_t len, uint64_t nowM
         return true;
     }
 
-    std::vector<uint8_t> plain;
     uint32_t sender = 0;
-    if (!channel_.Open(data, len, plain, sender) || plain.empty()) return false;
-    Reader r(plain.data(), plain.size());
+    if (!channel_.Open(data, len, plain_, sender) || plain_.empty()) return false;
+    Reader r(plain_.data(), plain_.size());
     HandleMessage(r, nowMs);
     return true;
 }
@@ -427,9 +451,13 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
                         h.mirrorId, h.frameSeq, h.pktIdx, h.pktCount, h.flags, s ? L"yes" : L"NO");
         if (!s) {
             // Frames for a mirror we no longer want: our Unsubscribe was lost.
-            uint64_t& last = unwantedMs_[h.mirrorId];
-            if (nowMs - last >= kUnwantedMs) {
-                last = nowMs;
+            auto it = unwantedMs_.find(h.mirrorId);
+            if (it == unwantedMs_.end()) {
+                if (unwantedMs_.size() >= kMaxUnwanted) return;
+                it = unwantedMs_.emplace(h.mirrorId, 0).first;
+            }
+            if (nowMs - it->second >= kUnwantedMs) {
+                it->second = nowMs;
                 Writer w;
                 w.U8(static_cast<uint8_t>(Msg::Unsubscribe));
                 w.U32(h.mirrorId);
@@ -438,8 +466,10 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
             return;
         }
 
-        std::vector<FrameAssembler::Frame> done;
+        std::vector<FrameAssembler::Frame>& done = assembled_;
+        done.clear();
         s->assembler.Accept(h, r.Ptr(), r.Left(), nowMs, done);
+        streamsDueMs_ = (std::min)(streamsDueMs_, s->assembler.NextDueMs());
         if (done.empty()) return;
         RVM_LOG_SAMPLED(300, L"client: assembled frame seq %u, %zu bytes%s", done[0].frameSeq,
                         done[0].data.size(), done[0].keyframe ? L" (keyframe)" : L"");
@@ -454,6 +484,7 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
                 }
                 s->queued = 0;
                 s->assembler.Reset();
+                streamsDueMs_ = (std::min)(streamsDueMs_, s->assembler.NextDueMs());
                 break;
             }
             queue_.emplace_back(s, std::move(f));
@@ -485,8 +516,6 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
         for (const auto& m : list) Log(L"client:   id=%u %ux%u '%s'", m.id, m.width, m.height, m.name.c_str());
         listPending_ = false;
         unwantedMs_.clear();
-        const uint64_t session = session_.load();
-        std::vector<uint32_t> subscribe;
         {
             std::lock_guard lock(stateMutex_);
             mirrors_ = std::move(list);
@@ -501,21 +530,8 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
             for (auto it = wanted_.begin(); it != wanted_.end();) {
                 it = present(*it) ? std::next(it) : wanted_.erase(it);
             }
-            // Wanted but not yet subscribed in this session: chosen while the
-            // link was down, or carried over a reconnect.
-            for (uint32_t id : wanted_) {
-                auto& slot = streams_[id];
-                if (!slot) slot = std::make_shared<Stream>(id);
-                if (slot->subscribedIn.exchange(session) != session) subscribe.push_back(id);
-            }
         }
-        for (uint32_t id : subscribe) {
-            Writer w;
-            w.U8(static_cast<uint8_t>(Msg::Subscribe));
-            w.U32(id);
-            Send(w.Data());
-            Log(L"client: subscribed to mirror %u (restored)", id);
-        }
+        SyncSubscriptions(nowMs);
         Notify(ClientEvent::ListUpdated);
         break;
     }
@@ -563,15 +579,51 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
     }
 }
 
-void StreamClient::PollStreams(uint64_t nowMs) {
-    std::vector<std::shared_ptr<Stream>> streams;
+// Wanted but not yet subscribed in this session: just chosen, chosen while
+// the link was down, or carried over a reconnect.
+void StreamClient::SyncSubscriptions(uint64_t nowMs) {
+    std::vector<uint32_t> drop;
     {
         std::lock_guard lock(stateMutex_);
-        for (auto& [id, s] : streams_) streams.push_back(s);
+        drop.swap(unsubscribe_);
+        for (const uint32_t id : wanted_) {
+            auto& slot = streams_[id];
+            if (!slot) slot = std::make_shared<Stream>(id);
+            if (slot->subscribedIn != session_) polled_.push_back(slot);
+        }
+    }
+    for (const uint32_t id : drop) {
+        Writer w;
+        w.U8(static_cast<uint8_t>(Msg::Unsubscribe));
+        w.U32(id);
+        Send(w.Data());
+        Log(L"client: unsubscribed from mirror %u", id);
+    }
+    for (const auto& s : polled_) {
+        Writer w;
+        w.U8(static_cast<uint8_t>(Msg::Subscribe));
+        w.U32(s->id);
+        Send(w.Data());
+        s->subscribedIn = session_;
+        // The server answers a Subscribe with a keyframe: asking again would
+        // cost it a second one.
+        s->assembler.MarkKeyframeRequested(nowMs);
+        streamsDueMs_ = (std::min)(streamsDueMs_, s->assembler.NextDueMs());
+        Log(L"client: subscribed to mirror %u", s->id);
+    }
+    polled_.clear();
+}
+
+uint64_t StreamClient::PollStreams(uint64_t nowMs) {
+    {
+        std::lock_guard lock(stateMutex_);
+        for (auto& [id, s] : streams_) polled_.push_back(s);
     }
 
-    for (auto& s : streams) {
-        std::vector<FrameAssembler::Missing> nacks;
+    uint64_t due = UINT64_MAX;
+    for (auto& s : polled_) {
+        auto& nacks = nacks_;
+        nacks.clear();
         s->assembler.Poll(nowMs, nacks);
         for (const auto& m : nacks) {
             // A frame with very many losses is asked for in several messages,
@@ -587,8 +639,7 @@ void StreamClient::PollStreams(uint64_t nowMs) {
                 Send(w.Data());
             }
         }
-        if (s->assembler.NeedKeyframe() &&
-            nowMs - s->assembler.LastKeyframeRequestMs() >= kKeyframeThrottleMs) {
+        if (s->assembler.KeyframeRequestDue(nowMs)) {
             Writer w;
             w.U8(static_cast<uint8_t>(Msg::KeyframeReq));
             w.U32(s->id);
@@ -596,8 +647,34 @@ void StreamClient::PollStreams(uint64_t nowMs) {
             s->assembler.MarkKeyframeRequested(nowMs);
             RVM_LOG_SAMPLED(25, L"client: keyframe requested for mirror %u", s->id);
         }
+        due = (std::min)(due, s->assembler.NextDueMs());
     }
+    polled_.clear();
+    return due;
 }
+
+#if RVM_REMOTE_CONTROL
+uint64_t StreamClient::ServiceControl() {
+    const uint64_t now = net::ControlNowMs();
+    // The UI began, ended or gave input: go as soon as pacing allows.
+    if (controlPoked_.exchange(false)) {
+        controlDueMs_ = (std::min)(controlDueMs_, controlSentMs_ + kControlInputMs);
+    }
+    if (now < controlDueMs_) return controlDueMs_ == UINT64_MAX ? UINT64_MAX : controlDueMs_ - now;
+
+    const auto batch = control_.Poll(now);
+    if (!batch.empty()) {
+        Send(batch);
+        controlSentMs_ = now;
+        controlDueMs_ = now + kControlInputMs;   // Unacknowledged input is resent.
+        return kControlInputMs;
+    }
+    // Nothing waiting: a held or ending lease still goes out at the slower
+    // pace, and once that stops too the link is idle until the UI acts.
+    controlDueMs_ = now - controlSentMs_ < kControlIdleMs ? controlSentMs_ + kControlIdleMs : UINT64_MAX;
+    return controlDueMs_ == UINT64_MAX ? UINT64_MAX : controlDueMs_ - now;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Decode thread
