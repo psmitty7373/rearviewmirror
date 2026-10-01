@@ -30,6 +30,7 @@ public:
 
     // The source window went away. Capture stops and the window hides, but the
     // mirror keeps its place and settings and waits for a matching window.
+    // The mirror reports the loss to `notify` and the app calls this.
     void Orphan();
     bool Orphaned() const { return orphaned_; }
 
@@ -104,6 +105,9 @@ private:
     bool hovered_  = false;
     bool snapped_  = false;   // Held at 100% by the resize detent.
     bool orphaned_ = false;
+    // Capture is starting or stopping, which pumps messages; nothing nested
+    // may start or stop it meanwhile.
+    bool transitioning_ = false;
 };
 
 }  // namespace rvm

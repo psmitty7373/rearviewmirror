@@ -3,10 +3,22 @@
 #if RVM_LOGIN_SERVICE
 namespace rvm {
 
-namespace {
+void WatchSessionChanges(HWND window, bool on) {
+    if (on) {
+        WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION);
+    } else {
+        WTSUnRegisterSessionNotification(window);
+    }
+}
+
+bool AwayFromConsole() {
+    DWORD self = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &self);
+    return WTSGetActiveConsoleSessionId() != self || SessionLocked(self);
+}
 
 // Anyone signed in may ask a service whether it is running.
-bool ServiceRunning() {
+bool LoginServiceRunning() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
     bool running = false;
@@ -17,23 +29,6 @@ bool ServiceRunning() {
     }
     CloseServiceHandle(scm);
     return running;
-}
-
-}  // namespace
-
-void WatchSessionChanges(HWND window, bool on) {
-    if (on) {
-        WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION);
-    } else {
-        WTSUnRegisterSessionNotification(window);
-    }
-}
-
-bool LoginServiceTakesOver() {
-    DWORD self = 0;
-    ProcessIdToSessionId(GetCurrentProcessId(), &self);
-    if (WTSGetActiveConsoleSessionId() == self && !SessionLocked(self)) return false;
-    return ServiceRunning();
 }
 
 }  // namespace rvm

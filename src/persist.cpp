@@ -6,7 +6,6 @@ namespace rvm {
 
 namespace {
 
-constexpr int kMaxMirrors = 32;
 constexpr int kMaxValueChars = 256;
 constexpr int kMaxCoord = 1 << 20;   // Screen positions; extents use kMaxExtent.
 constexpr int kScreenMargin = 24;
@@ -347,6 +346,9 @@ std::vector<MirrorState> LoadMirrorStates() {
 
 bool SaveMirrorStates(const std::vector<MirrorState>& states) {
     const int count = (std::min)(static_cast<int>(states.size()), kMaxMirrors);
+    if (static_cast<int>(states.size()) > count) {
+        Log(L"persist: %zu mirrors, only the first %d saved", states.size(), count);
+    }
 
     std::wstring text;
     text += L"[General]\r\n";

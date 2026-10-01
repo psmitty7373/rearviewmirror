@@ -97,28 +97,30 @@ bool WindowCapture::StartMonitor(HMONITOR monitor, FrameCallback onFrame) {
     }
 }
 
+// Built in locals and kept only once running: these calls can pump messages,
+// and a nested Stop must not find a half-built capture.
 bool WindowCapture::StartItem(wgc::GraphicsCaptureItem item, bool cursor, FrameCallback onFrame,
                               std::function<void()> onClosed) {
     auto& g = Gfx::Get();
 
+    wgc::Direct3D11CaptureFramePool pool{ nullptr };
+    wgc::GraphicsCaptureSession session{ nullptr };
     try {
-        item_ = std::move(item);
+        auto shared = std::make_shared<Shared>();
+        shared->onFrame  = std::move(onFrame);
+        shared->onClosed = std::move(onClosed);
+        shared->poolSize = item.Size();
 
-        shared_ = std::make_shared<Shared>();
-        shared_->onFrame  = std::move(onFrame);
-        shared_->onClosed = std::move(onClosed);
-        shared_->poolSize = item_.Size();
-
-        pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            g.winrtDevice, kFormat, kBufferCount, shared_->poolSize);
-        session_ = pool_.CreateCaptureSession(item_);
+        pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+            g.winrtDevice, kFormat, kBufferCount, shared->poolSize);
+        session = pool.CreateCaptureSession(item);
 
         // No yellow capture frame; the pointer only where asked for.
         if (SessionHasProperty(L"IsCursorCaptureEnabled")) {
-            try { session_.IsCursorCaptureEnabled(cursor); } catch (...) {}
+            try { session.IsCursorCaptureEnabled(cursor); } catch (...) {}
         }
         if (SessionHasProperty(L"IsBorderRequired")) {
-            try { session_.IsBorderRequired(false); } catch (...) {}
+            try { session.IsBorderRequired(false); } catch (...) {}
         }
         // Windows throttles capture to one frame per 16 ms unless told
         // otherwise, which holds every mirror and stream to about 60 fps
@@ -126,21 +128,21 @@ bool WindowCapture::StartItem(wgc::GraphicsCaptureItem item, bool cursor, FrameC
         // arrive when the window changes, so a still source costs nothing.
         if (SessionHasProperty(L"MinUpdateInterval")) {
             try {
-                const auto before = session_.MinUpdateInterval();
-                session_.MinUpdateInterval(std::chrono::milliseconds(1));
+                const auto before = session.MinUpdateInterval();
+                session.MinUpdateInterval(std::chrono::milliseconds(1));
                 RVM_LOG_SAMPLED(20, L"capture: minimum update interval %.2f ms -> %.2f ms",
-                                before.count() / 10000.0, session_.MinUpdateInterval().count() / 10000.0);
+                                before.count() / 10000.0, session.MinUpdateInterval().count() / 10000.0);
             } catch (...) {}
         }
 
-        std::weak_ptr<Shared> weak = shared_;
+        std::weak_ptr<Shared> weak = shared;
 
-        frameArrived_ = pool_.FrameArrived(winrt::auto_revoke,
-            [weak](wgc::Direct3D11CaptureFramePool const& pool, auto&&) {
-                if (auto state = weak.lock()) OnFrame(*state, pool);
+        auto frameArrived = pool.FrameArrived(winrt::auto_revoke,
+            [weak](wgc::Direct3D11CaptureFramePool const& framePool, auto&&) {
+                if (auto state = weak.lock()) OnFrame(*state, framePool);
             });
 
-        closed_ = item_.Closed(winrt::auto_revoke,
+        auto closed = item.Closed(winrt::auto_revoke,
             [weak](auto&&, auto&&) {
                 auto state = weak.lock();
                 if (!state) return;
@@ -148,35 +150,48 @@ bool WindowCapture::StartItem(wgc::GraphicsCaptureItem item, bool cursor, FrameC
                 if (state->onClosed) state->onClosed();
             });
 
-        session_.StartCapture();
+        session.StartCapture();
+
+        item_         = std::move(item);
+        pool_         = std::move(pool);
+        session_      = std::move(session);
+        frameArrived_ = std::move(frameArrived);
+        closed_       = std::move(closed);
+        shared_       = std::move(shared);
         return true;
     } catch (...) {
-        Stop();
+        if (session) { try { session.Close(); } catch (...) {} }
+        if (pool) { try { pool.Close(); } catch (...) {} }
         return false;
     }
 }
 
 void WindowCapture::Stop() {
-    frameArrived_.revoke();
-    closed_.revoke();
+    // Taken out first: closing makes cross-process calls during which this
+    // thread pumps messages, and a nested Stop or Start must find nothing.
+    auto frameArrived = std::move(frameArrived_);
+    auto closed       = std::move(closed_);
+    auto shared       = std::exchange(shared_, nullptr);
+    auto session      = std::exchange(session_, nullptr);
+    auto pool         = std::exchange(pool_, nullptr);
+    auto item         = std::exchange(item_, nullptr);
 
-    if (shared_) {
+    frameArrived.revoke();
+    closed.revoke();
+
+    if (shared) {
         // Blocks until any frame already inside the callback has finished.
-        std::lock_guard lock(shared_->mutex);
-        shared_->onFrame = nullptr;
-        shared_->onClosed = nullptr;
+        std::lock_guard lock(shared->mutex);
+        shared->onFrame = nullptr;
+        shared->onClosed = nullptr;
     }
-    shared_.reset();
 
-    if (session_) {
-        try { session_.Close(); } catch (...) {}
-        session_ = nullptr;
+    if (session) {
+        try { session.Close(); } catch (...) {}
     }
-    if (pool_) {
-        try { pool_.Close(); } catch (...) {}
-        pool_ = nullptr;
+    if (pool) {
+        try { pool.Close(); } catch (...) {}
     }
-    item_ = nullptr;
 }
 
 void WindowCapture::OnFrame(Shared& state, wgc::Direct3D11CaptureFramePool const& pool) {
@@ -301,7 +316,8 @@ bool DesktopCapture::Start(FrameCallback onFrame) {
         },
         reinterpret_cast<LPARAM>(&monitors));
 
-    shared_ = shared;
+    // Kept only once complete, as in WindowCapture::StartItem.
+    std::vector<std::unique_ptr<WindowCapture>> captures;
     std::weak_ptr<Shared> weak = shared;
     for (const auto& [monitor, rect] : monitors) {
         const LONG atX = rect.left - bounds.left;
@@ -334,31 +350,31 @@ bool DesktopCapture::Start(FrameCallback onFrame) {
                            static_cast<UINT>(s->size.cy));
             });
         if (started) {
-            monitors_.push_back(std::move(capture));
+            captures.push_back(std::move(capture));
         } else {
             Log(L"capture: monitor at %ld,%ld could not be captured", rect.left, rect.top);
         }
     }
 
-    if (monitors_.empty()) {
-        Stop();
-        return false;
-    }
-    Log(L"capture: desktop %dx%d from %zu monitor(s)", width, height, monitors_.size());
+    if (captures.empty()) return false;
+    Log(L"capture: desktop %dx%d from %zu monitor(s)", width, height, captures.size());
+    shared_ = std::move(shared);
+    monitors_ = std::move(captures);
     return true;
 }
 
 void DesktopCapture::Stop() {
+    // Taken out first, as in WindowCapture::Stop.
+    auto monitors = std::exchange(monitors_, {});
+    auto shared   = std::exchange(shared_, nullptr);
     // Each monitor's Stop waits out a frame already in its callback, which
     // may be waiting for the shared lock; so that lock is not held here.
-    for (auto& m : monitors_) m->Stop();
-    monitors_.clear();
-    if (shared_) {
-        std::lock_guard lock(shared_->mutex);
-        shared_->onFrame = nullptr;
-        shared_->composite = nullptr;
+    for (auto& m : monitors) m->Stop();
+    if (shared) {
+        std::lock_guard lock(shared->mutex);
+        shared->onFrame = nullptr;
+        shared->composite = nullptr;
     }
-    shared_.reset();
 }
 
 }  // namespace rvm
