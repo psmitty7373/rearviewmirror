@@ -60,6 +60,9 @@ public:
     using FrameRequester = std::function<void(uint32_t mirrorId)>;
     void SetFrameRequester(FrameRequester requester);
 
+    // Whether any client watches the mirror; any thread.
+    bool Watched(uint32_t mirrorId) const;
+
     // For tests: encode on the CPU even where a hardware encoder exists.
     // Takes effect at the next Start().
     void ForceSoftwareEncoding(bool on) { forceSoftware_ = on; }

@@ -273,6 +273,13 @@ size_t StreamServer::StreamCount() const {
     return streams_.size();
 }
 
+bool StreamServer::Watched(uint32_t mirrorId) const {
+    if (!running_) return false;
+    std::lock_guard lock(streamsMutex_);
+    const auto it = streams_.find(mirrorId);
+    return it != streams_.end() && it->second->subscribers.load(std::memory_order_relaxed) > 0;
+}
+
 void StreamServer::SetFrameRequester(FrameRequester requester) {
     std::lock_guard lock(requesterMutex_);
     requester_ = std::move(requester);
