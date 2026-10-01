@@ -1,6 +1,8 @@
 @echo off
 setlocal
 
+rem Before any shift: shift moves %0 too, after which %~dp0 is no longer here.
+set "ROOT=%~dp0"
 set "CFG="
 set "TGT="
 set "FEATURES="
@@ -82,7 +84,7 @@ if errorlevel 1 (
     goto fail
 )
 
-cd /d "%~dp0" || goto fail
+cd /d "%ROOT%" || goto fail
 cmake -G Ninja -S . -B build "-DCMAKE_BUILD_TYPE=%CFG%" %FEATURES% %SIGNING% || goto fail
 if defined TGT (
     cmake --build build --target "%TGT%" || goto fail

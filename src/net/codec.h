@@ -23,14 +23,27 @@ struct DecodedFrame {
 
 class EncoderEventRelay;
 
-// H.264 through the GPU's Media Foundation encoder. Input is an NV12 texture
-// on the shared device; nothing is read back to the CPU except the bitstream.
+// Where an H264Encoder does its work, and so what it takes as input.
+enum class EncoderKind {
+    // The GPU's encoder. Input is an NV12 texture on the shared device;
+    // nothing is read back to the CPU except the bitstream.
+    Hardware,
+    // Windows' own encoder, on the CPU. Input is an R8 staging texture holding
+    // the frame packed as NV12 lays it out in memory (see Nv12Packer): the
+    // luma rows, then the interleaved chroma rows, `height * 3 / 2` in all.
+    Software,
+};
+
+// H.264 through Media Foundation, on the GPU's encoder or the CPU.
 //
 // Hardware encoders are asynchronous: they announce "want input" and "have
 // output" as events. Those arrive on a Media Foundation thread, are queued,
 // and wake whoever waits on the event given to SetWakeEvent(). All work on the
 // encoder itself happens in Service() and Encode(), on one thread, and
 // nothing blocks: a frame costs only the encoder's own time.
+//
+// The software encoder is synchronous: it always wants input, and Encode()
+// returns with whatever the frame produced, having encoded it there and then.
 class H264Encoder {
 public:
     ~H264Encoder();
@@ -43,9 +56,10 @@ public:
     // it; kEncoderDefault leaves the encoder's own choice.
     static constexpr UINT kEncoderDefault = 0xFFFFFFFFu;
     bool Init(UINT width, UINT height, UINT fps, UINT bitrateBps,
-              UINT qualityVsSpeed = kEncoderDefault);
+              UINT qualityVsSpeed = kEncoderDefault, EncoderKind kind = EncoderKind::Hardware);
     void Shutdown();
     bool Ready() const { return mft_ != nullptr; }
+    EncoderKind Kind() const { return kind_; }
 
     UINT Width()  const { return width_; }
     UINT Height() const { return height_; }
@@ -67,6 +81,10 @@ public:
     // taken: at once if it was not, otherwise when the encoder lets go of the
     // texture, which can be after this returns and on another thread. Until
     // then the texture must not be written.
+    //
+    // A software encoder copies the texture out before encoding, so
+    // `released` runs before this returns. It maps the texture under
+    // Gfx::deviceMutex, so never call it with that lock held.
     using Released = std::function<void()>;
     bool Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released = {});
 
@@ -90,8 +108,11 @@ private:
     bool TryInit(IMFActivate* activate);
     void FinishInFlight();
     bool WaitForEvents(DWORD timeoutMs);
-    bool CollectOutput(std::vector<EncodedFrame>& out);
+    HRESULT CollectOutput(std::vector<EncodedFrame>& out);
     bool RenegotiateOutput();
+    void ApplyKeyframeRequest();
+    bool EncodeSoftware(ID3D11Texture2D* packed, std::vector<EncodedFrame>& out, Released released);
+    void DrainSoftware(std::vector<EncodedFrame>& out);
     void LogError(const wchar_t* step, HRESULT hr);
 
     static constexpr int kMaxErrorLogs = 50;
@@ -104,7 +125,8 @@ private:
     winrt::com_ptr<IMFTransform>           mft_;
     winrt::com_ptr<IMFMediaEventGenerator> events_;
     winrt::com_ptr<ICodecAPI>              codec_;
-    EncoderEventRelay* relay_ = nullptr;   // COM-refcounted; see codec.cpp.
+    EncoderEventRelay* relay_ = nullptr;   // COM-refcounted; see codec.cpp. Hardware only.
+    EncoderKind kind_ = EncoderKind::Hardware;
     HANDLE wake_ = nullptr;
     bool   failed_ = false;
     bool   drained_ = false;   // METransformDrainComplete arrived.
@@ -157,5 +179,18 @@ private:
 
 // Human-readable name of the hardware encoder in use, or empty if none.
 std::wstring HardwareEncoderName();
+
+// The H.264 encoder Windows provides on the CPU, or null if there is none
+// (N editions without the Media Feature Pack).
+winrt::com_ptr<IMFActivate> SoftwareEncoder();
+
+// What streaming encodes with on this machine. A hardware encoder needs the
+// device's video processor to turn frames into NV12 for it; without either,
+// frames go to the CPU. `name` is empty if there is no encoder at all.
+struct EncoderChoice {
+    std::wstring name;
+    EncoderKind  kind = EncoderKind::Hardware;
+};
+EncoderChoice ChooseEncoder();
 
 }  // namespace rvm::net

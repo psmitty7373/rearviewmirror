@@ -285,6 +285,24 @@ std::wstring HardwareEncoderName() {
     return encoders.empty() ? std::wstring() : FriendlyName(encoders.front().get());
 }
 
+// Any synchronous H.264 encoder that takes NV12 would do; Windows' own is the
+// one every desktop install has.
+winrt::com_ptr<IMFActivate> SoftwareEncoder() {
+    EnsureMf();
+    return FindTransform(MFT_CATEGORY_VIDEO_ENCODER,
+                         MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                         MFVideoFormat_NV12, MFVideoFormat_H264);
+}
+
+EncoderChoice ChooseEncoder() {
+    const auto& d3d = Gfx::Get().d3d;
+    if (d3d && d3d.try_as<ID3D11VideoDevice>()) {
+        const auto hardware = HardwareEncoders();
+        if (!hardware.empty()) return { FriendlyName(hardware.front().get()), EncoderKind::Hardware };
+    }
+    return { FriendlyName(SoftwareEncoder().get()), EncoderKind::Software };
+}
+
 // ---------------------------------------------------------------------------
 // Encoder
 
@@ -347,11 +365,13 @@ void H264Encoder::FinishInFlight() {
     }
 }
 
-// Tries each hardware encoder in turn, the one on our own GPU first, and
-// logs exactly where any of them refused.
-bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps, UINT qualityVsSpeed) {
+// Tries each hardware encoder in turn, the one on our own GPU first, or the
+// software one, and logs exactly where any of them refused.
+bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps, UINT qualityVsSpeed,
+                       EncoderKind kind) {
     EnsureMf();
     Shutdown();
+    kind_ = kind;
     qualityVsSpeed_ = qualityVsSpeed;
     width_ = width & ~1u;
     height_ = height & ~1u;
@@ -359,8 +379,14 @@ bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps, UINT 
     bitrate_ = bitrateBps;
     if (width_ == 0 || height_ == 0) return false;
 
-    const auto encoders = HardwareEncoders();
-    if (encoders.empty()) Log(L"encoder: no hardware H.264 encoder found");
+    std::vector<winrt::com_ptr<IMFActivate>> encoders;
+    if (kind_ == EncoderKind::Software) {
+        if (auto software = SoftwareEncoder()) encoders.push_back(std::move(software));
+        if (encoders.empty()) Log(L"encoder: no software H.264 encoder found");
+    } else {
+        encoders = HardwareEncoders();
+        if (encoders.empty()) Log(L"encoder: no hardware H.264 encoder found");
+    }
     for (const auto& activate : encoders) {
         name_ = FriendlyName(activate.get());
         if (TryInit(activate.get())) {
@@ -397,19 +423,22 @@ bool H264Encoder::TryInit(IMFActivate* activate) {
     HRESULT hr = activate->ActivateObject(IID_PPV_ARGS(mft_.put()));
     if (FAILED(hr)) return fail(L"activation", hr);
 
-    // Hardware encoders are asynchronous MFTs and must be unlocked explicitly.
+    const bool hardware = kind_ == EncoderKind::Hardware;
     winrt::com_ptr<IMFAttributes> attrs;
     if (SUCCEEDED(mft_->GetAttributes(attrs.put()))) {
-        attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        // Hardware encoders are asynchronous MFTs and must be unlocked explicitly.
+        if (hardware) attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
     }
-    events_ = mft_.try_as<IMFMediaEventGenerator>();
-    if (!events_) return fail(L"event generator", E_NOINTERFACE);
+    if (hardware) {
+        events_ = mft_.try_as<IMFMediaEventGenerator>();
+        if (!events_) return fail(L"event generator", E_NOINTERFACE);
 
-    IMFDXGIDeviceManager* manager = DeviceManager();
-    if (!manager) return fail(L"device manager", E_FAIL);
-    hr = mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(manager));
-    if (FAILED(hr)) return fail(L"SET_D3D_MANAGER (encoder on another GPU?)", hr);
+        IMFDXGIDeviceManager* manager = DeviceManager();
+        if (!manager) return fail(L"device manager", E_FAIL);
+        hr = mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(manager));
+        if (FAILED(hr)) return fail(L"SET_D3D_MANAGER (encoder on another GPU?)", hr);
+    }
 
     DWORD inCount = 0, outCount = 0;
     mft_->GetStreamCount(&inCount, &outCount);
@@ -496,6 +525,10 @@ bool H264Encoder::TryInit(IMFActivate* activate) {
     hr = mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     if (FAILED(hr)) return fail(L"START_OF_STREAM", hr);
 
+    if (!hardware) {
+        inputsWanted_ = 1;   // A synchronous encoder takes a frame whenever it is given one.
+        return true;
+    }
     // Events queue inside the encoder until asked for, so starting to listen
     // after START_OF_STREAM loses nothing.
     relay_ = new EncoderEventRelay(events_.get(), wake_);
@@ -561,6 +594,7 @@ bool H264Encoder::WaitForEvents(DWORD timeoutMs) {
 }
 
 bool H264Encoder::Service(std::vector<EncodedFrame>& out) {
+    if (mft_ && kind_ == EncoderKind::Software) return !failed_;   // No events: Encode() does it all.
     if (!mft_ || !relay_) return false;
     for (auto& event : relay_->Take()) {
         MediaEventType type = MEUnknown;
@@ -599,6 +633,7 @@ bool H264Encoder::EncodeSync(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& o
     }
     const size_t before = out.size();
     if (!Encode(nv12, out)) return false;
+    if (kind_ == EncoderKind::Software) return true;   // Whatever it made is already out.
     while (out.size() == before && remaining() > 0) {
         WaitForEvents(remaining());
         if (!Service(out)) return false;
@@ -606,7 +641,9 @@ bool H264Encoder::EncodeSync(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& o
     return true;
 }
 
-bool H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
+// MF_E_TRANSFORM_NEED_MORE_INPUT when there was nothing to collect, and
+// MF_E_TRANSFORM_STREAM_CHANGE when the output format changed instead.
+HRESULT H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
     MFT_OUTPUT_DATA_BUFFER db{};
     db.dwStreamID = outputId_;
     winrt::com_ptr<IMFSample> sample;
@@ -617,7 +654,7 @@ bool H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
         if (FAILED(MFCreateSample(sample.put())) ||
             FAILED(MFCreateMemoryBuffer((std::max)(static_cast<UINT>(info.cbSize), 1u << 20),
                                         buffer.put()))) {
-            return false;
+            return E_OUTOFMEMORY;
         }
         sample->AddBuffer(buffer.get());
         db.pSample = sample.get();
@@ -632,31 +669,30 @@ bool H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
     // METransformHaveOutput once the new type is set; asking again before
     // that event is refused with E_UNEXPECTED.
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-        RenegotiateOutput();
-        return false;
+        return RenegotiateOutput() ? hr : E_FAIL;
     }
     if (FAILED(hr)) {
         if (hr != MF_E_TRANSFORM_NEED_MORE_INPUT) LogError(L"ProcessOutput", hr);
-        return false;
+        return hr;
     }
 
     winrt::com_ptr<IMFSample> produced;
     if (providesSamples_) produced.attach(db.pSample);
     else                  produced = sample;
-    if (!produced) return false;
+    if (!produced) return E_UNEXPECTED;
 
     winrt::com_ptr<IMFMediaBuffer> contiguous;
-    if (FAILED(produced->ConvertToContiguousBuffer(contiguous.put()))) return false;
+    if (const HRESULT c = produced->ConvertToContiguousBuffer(contiguous.put()); FAILED(c)) return c;
 
     BYTE* bytes = nullptr;
     DWORD length = 0;
-    if (FAILED(contiguous->Lock(&bytes, nullptr, &length))) return false;
+    if (const HRESULT l = contiguous->Lock(&bytes, nullptr, &length); FAILED(l)) return l;
 
     EncodedFrame frame;
     frame.data.assign(bytes, bytes + length);
     frame.keyframe = MFGetAttributeUINT32(produced.get(), MFSampleExtension_CleanPoint, 0) != 0;
     contiguous->Unlock();
-    if (frame.data.empty()) return false;
+    if (frame.data.empty()) return S_FALSE;
 
     // A decoder cannot start without the sequence headers. An encoder that
     // moved them into its output format is made to carry them in-band again.
@@ -681,10 +717,21 @@ bool H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
     out.push_back(std::move(frame));
     awaitingOutput_ = false;
     repeats_ = 0;
-    return true;
+    return S_OK;
+}
+
+void H264Encoder::ApplyKeyframeRequest() {
+    if (!forceKeyframe_.exchange(false, std::memory_order_relaxed) || !codec_) return;
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_UI4;
+    v.ulVal = 1;
+    codec_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
 }
 
 bool H264Encoder::Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released) {
+    if (kind_ == EncoderKind::Software) return EncodeSoftware(nv12, out, std::move(released));
+
     // Until the tracked sample exists, `released` is ours to call.
     const auto notTaken = [&] {
         if (released) released();
@@ -693,13 +740,7 @@ bool H264Encoder::Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, 
     if (!mft_ || !nv12 || failed_) return notTaken();
     if (!Service(out) || inputsWanted_ <= 0) return notTaken();
 
-    if (forceKeyframe_.exchange(false, std::memory_order_relaxed) && codec_) {
-        VARIANT v;
-        VariantInit(&v);
-        v.vt = VT_UI4;
-        v.ulVal = 1;
-        codec_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
-    }
+    ApplyKeyframeRequest();
 
     // A tracked sample reports when the encoder has let go of it, which is
     // the only reliable sign that it has finished reading the texture.
@@ -737,6 +778,121 @@ bool H264Encoder::Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, 
     }
     Service(out);   // Anything the encoder had already finished.
     return true;
+}
+
+namespace {
+
+// Copies a packed NV12 staging texture into `dst`, rows back to back. Map on
+// the shared immediate context needs the device lock, but the wait for the GPU
+// to finish writing the texture happens outside it, so this thread never
+// holds up every other draw while it waits.
+bool ReadPacked(ID3D11Texture2D* staging, UINT width, UINT rows, BYTE* dst) {
+    auto& g = Gfx::Get();
+    const ULONGLONG deadline = GetTickCount64() + 500;
+    for (bool flushed = false;;) {
+        {
+            std::lock_guard lock(g.deviceMutex);
+            D3D11_MAPPED_SUBRESOURCE m{};
+            const HRESULT hr = g.ctx->Map(staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+            if (SUCCEEDED(hr)) {
+                const auto* src = static_cast<const BYTE*>(m.pData);
+                for (UINT r = 0; r < rows; ++r) {
+                    memcpy(dst + static_cast<size_t>(r) * width, src + static_cast<size_t>(r) * m.RowPitch,
+                           width);
+                }
+                g.ctx->Unmap(staging, 0);
+                return true;
+            }
+            if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+                g.CheckDevice(hr);
+                return false;
+            }
+            // The copy may still be queued, not running: send it on its way.
+            if (!flushed) {
+                g.ctx->Flush();
+                flushed = true;
+            }
+        }
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(1);
+    }
+}
+
+}  // namespace
+
+// The CPU encoder reads frames from memory. The packed texture is copied out
+// first, and its slot handed back, before the frame is encoded.
+bool H264Encoder::EncodeSoftware(ID3D11Texture2D* packed, std::vector<EncodedFrame>& out,
+                                 Released released) {
+    struct Release {
+        Released fn;
+        void Now() { if (fn) std::exchange(fn, nullptr)(); }
+        ~Release() { Now(); }
+    } release{ std::move(released) };
+    if (!mft_ || !packed || failed_) return false;
+
+    D3D11_TEXTURE2D_DESC d{};
+    packed->GetDesc(&d);
+    const UINT rows = height_ * 3 / 2;
+    if (d.Width != width_ || d.Height != rows || d.Format != DXGI_FORMAT_R8_UNORM) {
+        LogError(L"input size or format", E_INVALIDARG);
+        return false;
+    }
+
+    const DWORD bytes = width_ * rows;
+    winrt::com_ptr<IMFMediaBuffer> buffer;
+    BYTE* dst = nullptr;
+    if (FAILED(MFCreateMemoryBuffer(bytes, buffer.put())) || FAILED(buffer->Lock(&dst, nullptr, nullptr))) {
+        return false;
+    }
+    const bool copied = ReadPacked(packed, width_, rows, dst);
+    buffer->Unlock();
+    release.Now();
+    if (!copied) {
+        LogError(L"reading back the frame", E_FAIL);
+        return false;
+    }
+    buffer->SetCurrentLength(bytes);
+
+    winrt::com_ptr<IMFSample> sample;
+    if (FAILED(MFCreateSample(sample.put()))) return false;
+    sample->AddBuffer(buffer.get());
+    const LONGLONG duration = FrameDuration(fps_);
+    sample->SetSampleTime(frameIndex_ * duration);
+    sample->SetSampleDuration(duration);
+    ++frameIndex_;
+
+    ApplyKeyframeRequest();
+    HRESULT hr = mft_->ProcessInput(inputId_, sample.get(), 0);
+    if (hr == MF_E_NOTACCEPTING) {   // Still holding output it has not handed over.
+        DrainSoftware(out);
+        hr = mft_->ProcessInput(inputId_, sample.get(), 0);
+    }
+    if (FAILED(hr)) {
+        LogError(L"ProcessInput", hr);
+        return false;
+    }
+    awaitingOutput_ = true;
+    lastFedMs_ = GetTickCount64();
+    if (inputsTraced_ < kTraceFrames) {
+        ++inputsTraced_;
+        Log(L"encoder: '%s' input %lld accepted", name_.c_str(), frameIndex_ - 1);
+    }
+    DrainSoftware(out);
+    return true;
+}
+
+// Everything a synchronous encoder has finished, until it asks for more input.
+// A failure here marks the encoder failed, so Service() reports it.
+void H264Encoder::DrainSoftware(std::vector<EncodedFrame>& out) {
+    for (int i = 0; i < 16; ++i) {
+        const HRESULT hr = CollectOutput(out);
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return;
+        if (FAILED(hr) && hr != MF_E_TRANSFORM_STREAM_CHANGE) {
+            failed_ = true;
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

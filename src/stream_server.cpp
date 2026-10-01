@@ -130,11 +130,18 @@ struct StreamServer::Stream : std::enable_shared_from_this<StreamServer::Stream>
     // textures are replaced, so a late report about an old one is ignored.
     static constexpr int kSlots = 5;
 
+    // Which encoder the frames are for. A hardware encoder reads NV12
+    // textures the video processor fills; the CPU encoder reads packed NV12
+    // staging textures the packer fills. Starts as the server chose, and
+    // moves to the CPU for good if no hardware encoder will take the stream.
+    std::atomic<bool> software{ false };
+
     std::mutex swap;
     winrt::com_ptr<ID3D11Texture2D> textures[kSlots];
     bool     inEncoder[kSlots]{};
     uint64_t generation = 0;
     UINT texW = 0, texH = 0;
+    bool texSoftware = false;   // The encoder the textures were made for.
     int  ready = -1;           // Latest complete frame, or -1.
     int  busy  = -1;           // Being handed to the encoder, or -1.
     int  held  = -1;           // Last frame encoded, kept intact for Repeat(), or -1.
@@ -172,6 +179,8 @@ struct StreamServer::Stream : std::enable_shared_from_this<StreamServer::Stream>
     std::atomic<bool> wantKeyframe{ false };
     VideoConverter converter;   // Capture thread, under the device lock.
     bool converterReady = false;
+    Nv12Packer packer;          // The same, for the CPU encoder.
+    bool packerReady = false;
 
     H264Encoder encoder;        // Encode thread only.
     uint32_t seq = 0;
@@ -204,15 +213,17 @@ bool StreamServer::Start(const StreamSettings& settings) {
     settings_ = settings;
     fps_ = static_cast<UINT>(ClampI(static_cast<int>(settings.fps), static_cast<int>(kMinStreamFps),
                                     static_cast<int>(kMaxStreamFps)));
+    const EncoderChoice encoder = ChooseEncoder();
+    software_ = forceSoftware_ || encoder.kind == EncoderKind::Software;
     admitTokens_ = kAdmitBurst;
     admitRefillMs_ = NowMs();
     ResetEvent(frameEvent_);
     running_ = true;
     netThread_ = std::thread([this] { NetLoop(); });
     encodeThread_ = std::thread([this] { EncodeLoop(); });
-    Log(L"server: started on udp %u, %u kbps, %u fps, preset %d, encoder '%s'", Port(),
+    Log(L"server: started on udp %u, %u kbps, %u fps, preset %d, encoder '%s'%s", Port(),
         settings.bitrateKbps, settings.fps, static_cast<int>(settings.preset),
-        HardwareEncoderName().c_str());
+        software_ ? L"CPU" : encoder.name.c_str(), forceSoftware_ ? L" (forced)" : L"");
     return true;
 }
 
@@ -344,7 +355,10 @@ std::shared_ptr<StreamServer::Stream> StreamServer::FindStream(uint32_t mirrorId
 std::shared_ptr<StreamServer::Stream> StreamServer::AcquireStream(uint32_t mirrorId) {
     std::lock_guard lock(streamsMutex_);
     auto& slot = streams_[mirrorId];
-    if (!slot) slot = std::make_shared<Stream>(mirrorId);
+    if (!slot) {
+        slot = std::make_shared<Stream>(mirrorId);
+        slot->software = software_;
+    }
     slot->subscribers.fetch_add(1);
     return slot;
 }
@@ -389,10 +403,19 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
         s->skipped = false;
     }
 
-    if (!s->converterReady) s->converterReady = s->converter.Init();
-    if (!s->converterReady) {
-        Log(L"server: video processor unavailable for mirror %u", mirrorId);
-        return;
+    const bool software = s->software.load();
+    if (software) {
+        if (!s->packerReady) s->packerReady = s->packer.Init();
+        if (!s->packerReady) {
+            RVM_LOG_SAMPLED(300, L"server: frame packer unavailable for mirror %u", mirrorId);
+            return;
+        }
+    } else {
+        if (!s->converterReady) s->converterReady = s->converter.Init();
+        if (!s->converterReady) {
+            Log(L"server: video processor unavailable for mirror %u", mirrorId);
+            return;
+        }
     }
 
     // Every way a frame can be dropped below marks it owed, so that if the
@@ -400,7 +423,7 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
     int write = -1;
     {
         std::lock_guard lock(s->swap);
-        if (w != s->texW || h != s->texH) {
+        if (w != s->texW || h != s->texH || software != s->texSoftware) {
             if (s->busy >= 0) {   // Encoder mid-frame; resize on the next one.
                 s->skipped = true;
                 return;
@@ -408,16 +431,26 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
             // All or nothing: a half-replaced set would leave slots that are
             // null or the wrong size behind indices still in use.
             D3D11_TEXTURE2D_DESC d{};
-            d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
-            d.Format = DXGI_FORMAT_NV12; d.SampleDesc = { 1, 0 };
-            d.Usage = D3D11_USAGE_DEFAULT;
-            d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            d.Width = w; d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc = { 1, 0 };
+            if (software) {
+                // NV12 as it lies in memory, luma rows then chroma rows, for the CPU to read.
+                d.Height = h * 3 / 2;
+                d.Format = DXGI_FORMAT_R8_UNORM;
+                d.Usage = D3D11_USAGE_STAGING;
+                d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            } else {
+                d.Height = h;
+                d.Format = DXGI_FORMAT_NV12;
+                d.Usage = D3D11_USAGE_DEFAULT;
+                d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            }
             winrt::com_ptr<ID3D11Texture2D> fresh[Stream::kSlots];
             for (auto& t : fresh) {
                 const HRESULT hr = Gfx::Get().d3d->CreateTexture2D(&d, nullptr, t.put());
                 if (FAILED(hr)) {
-                    RVM_LOG_SAMPLED(100, L"server: NV12 texture %ux%u failed for mirror %u (0x%08X)",
-                                    w, h, mirrorId, static_cast<unsigned>(hr));
+                    RVM_LOG_SAMPLED(100, L"server: %s texture %ux%u failed for mirror %u (0x%08X)",
+                                    software ? L"packed NV12" : L"NV12", w, h, mirrorId,
+                                    static_cast<unsigned>(hr));
                     Gfx::Get().CheckDevice(hr);
                     s->skipped = true;
                     return;
@@ -428,9 +461,10 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
                 s->inEncoder[i] = false;   // Old textures live on in their samples.
             }
             ++s->generation;
-            Log(L"server: stream %u textures %ux%u", mirrorId, w, h);
+            Log(L"server: stream %u textures %ux%u%s", mirrorId, w, h, software ? L" for the CPU encoder" : L"");
             s->texW = w;
             s->texH = h;
+            s->texSoftware = software;
             s->ready = -1;
             s->held = -1;
             s->reinit = true;
@@ -445,10 +479,12 @@ void StreamServer::SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const 
         }
     }
 
-    // The whole crop, scaled by the video processor into the encode texture.
+    // The whole crop, scaled into the encode texture by the video processor,
+    // or for the CPU by the packer's shaders.
     const RECT src{ crop.left, crop.top, crop.left + static_cast<LONG>(cropW),
                     crop.top + static_cast<LONG>(cropH) };
-    const bool converted = s->converter.Convert(cache, 0, &src, s->textures[write].get());
+    const bool converted = software ? s->packer.Pack(cache, src, s->textures[write].get())
+                                    : s->converter.Convert(cache, 0, &src, s->textures[write].get());
     if (!converted) {
         RVM_LOG_SAMPLED(300, L"server: convert failed for mirror %u", mirrorId);
         std::lock_guard lock(s->swap);
@@ -575,19 +611,22 @@ void StreamServer::EncodeStream(Stream& s) {
     // than rebuild the encoder for every intermediate size.
     int idx = -1;
     bool reinit = false;
+    bool software = false;   // What the frame's texture is for, and so which encoder.
     UINT w = 0, h = 0;
     {
         std::lock_guard lock(s.swap);
         const bool sizeDiffers = s.encoder.Width() != s.texW || s.encoder.Height() != s.texH;
-        const bool settling = s.encoder.Ready() && sizeDiffers &&
+        const bool kindDiffers = (s.encoder.Kind() == EncoderKind::Software) != s.texSoftware;
+        const bool settling = s.encoder.Ready() && sizeDiffers && !kindDiffers &&
                               NowMs() - s.sizeChangedMs < kResizeSettleMs;
-        const bool mustInit = !s.encoder.Ready() || s.reinit || sizeDiffers;
+        const bool mustInit = !s.encoder.Ready() || s.reinit || sizeDiffers || kindDiffers;
         if (s.ready >= 0 && !settling && (mustInit || s.encoder.WantsInput())) {
             idx = s.ready;
             s.ready = -1;
             s.busy = idx;
-            reinit = s.reinit;
+            reinit = s.reinit || kindDiffers;
             s.reinit = false;
+            software = s.texSoftware;
             w = s.texW;
             h = s.texH;
         }
@@ -646,9 +685,11 @@ void StreamServer::EncodeStream(Stream& s) {
 
     const uint64_t now = GetTickCount64();
     if (reinit || !s.encoder.Ready() || s.encoder.Width() != w || s.encoder.Height() != h) {
-        if ((s.align16.load() && ((w | h) & 15u)) || (std::min)(w, h) < s.minDim.load()) {
-            // A frame converted before the switch to aligned or larger sizes;
-            // the next one will fit, so do not spend an Init on this one.
+        if ((s.align16.load() && ((w | h) & 15u)) || (std::min)(w, h) < s.minDim.load() ||
+            software != s.software.load()) {
+            // A frame converted before the switch to aligned or larger sizes,
+            // or to the CPU encoder; the next one will fit, so do not spend an
+            // Init on this one.
             std::lock_guard lock(s.swap);
             s.busy = -1;
             return;
@@ -659,9 +700,10 @@ void StreamServer::EncodeStream(Stream& s) {
             s.retryRequested = false;
             s.encoder.SetWakeEvent(frameEvent_);
             ok = s.encoder.Init(w, h, settings_.fps, settings_.bitrateKbps * 1000,
-                                QualityVsSpeed(settings_.preset));
-            Log(L"server: encoder init %ux%u for mirror %u -> %s", w, h, s.mirrorId,
-                ok ? L"ok" : L"FAILED");
+                                QualityVsSpeed(settings_.preset),
+                                software ? EncoderKind::Software : EncoderKind::Hardware);
+            Log(L"server: %s encoder init %ux%u for mirror %u -> %s", software ? L"CPU" : L"hardware",
+                w, h, s.mirrorId, ok ? L"ok" : L"FAILED");
             {
                 std::lock_guard lock(s.swap);
                 s.held = -1;
@@ -669,7 +711,7 @@ void StreamServer::EncodeStream(Stream& s) {
             if (!ok) {
                 s.failedW = w;
                 s.failedH = h;
-                if (const int others = OtherOpenEncoders(s); others > 0) {
+                if (const int others = OtherOpenEncoders(s); !software && others > 0) {
                     // GeForce cards run only a few encoder sessions at once
                     // (three on a GT 730's drivers, twelve on an RTX 4080's),
                     // and a refused session looks like any other failure. With
@@ -691,6 +733,16 @@ void StreamServer::EncodeStream(Stream& s) {
                     // scale this one up further, keeping its shape.
                     Log(L"server: retrying mirror %u with frames at least %u pixels a side",
                         s.mirrorId, s.minDim.load());
+                    RequestFrame(s.mirrorId);
+                } else if (!software) {
+                    // No hardware encoder takes this mirror at any size: one on
+                    // another GPU, say, or one its driver refuses. The CPU can,
+                    // starting again from the usual sizes.
+                    Log(L"server: no hardware encoder takes mirror %u; encoding it on the CPU",
+                        s.mirrorId);
+                    s.software = true;
+                    s.align16 = false;
+                    s.minDim = kMinEncodeDim;
                     RequestFrame(s.mirrorId);
                 } else {
                     // Nothing left to adjust: wait longer each time.
@@ -763,12 +815,13 @@ void StreamServer::SendFrames(Stream& s, const std::vector<EncodedFrame>& frames
     }
 }
 
-// Encode thread, which alone opens and closes encoders.
+// Encode thread, which alone opens and closes encoders. Hardware sessions
+// only: the CPU encoder has no session limit.
 int StreamServer::OtherOpenEncoders(const Stream& self) {
     int open = 0;
     std::lock_guard lock(streamsMutex_);
     for (const auto& [id, s] : streams_) {
-        if (s.get() != &self && s->encoder.Ready()) ++open;
+        if (s.get() != &self && s->encoder.Ready() && s->encoder.Kind() == EncoderKind::Hardware) ++open;
     }
     return open;
 }

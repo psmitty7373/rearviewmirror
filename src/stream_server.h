@@ -24,7 +24,8 @@ struct MirrorInfo {
 
 // Serves mirrors to clients over one UDP port. Each subscribed mirror gets a
 // hardware encoder fed by a GPU crop of the frames the mirror already has; the
-// only CPU work per frame is packetising and sealing the bitstream.
+// only CPU work per frame is packetising and sealing the bitstream. Where no
+// hardware encoder will do, the crop is read back and encoded on the CPU.
 //
 // Everything a peer can make the server do is bounded: sessions, pending
 // handshakes, subscriptions, streams, keyframes, frame requests and
@@ -58,6 +59,10 @@ public:
     // handler should get the mirror to RepushFrame(). Rate-limited per mirror.
     using FrameRequester = std::function<void(uint32_t mirrorId)>;
     void SetFrameRequester(FrameRequester requester);
+
+    // For tests: encode on the CPU even where a hardware encoder exists.
+    // Takes effect at the next Start().
+    void ForceSoftwareEncoding(bool on) { forceSoftware_ = on; }
 
 private:
     struct Client;
@@ -120,6 +125,11 @@ private:
 
     StreamSettings settings_;
     std::atomic<UINT> fps_{ 60 };   // Read on capture threads; set at Start.
+    // Set at Start: no hardware encoder can be fed here, so every stream
+    // starts on the CPU. Otherwise a stream moves there only if no hardware
+    // encoder will take it.
+    bool software_ = false;
+    bool forceSoftware_ = false;
     net::Key masterKey_{};
     net::SecureChannel master_;   // Net thread: opens HELLOs, seals WELCOMEs.
     net::UdpSocket socket_;

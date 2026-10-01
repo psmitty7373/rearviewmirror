@@ -20,7 +20,7 @@ How Rear View Mirror works inside, and why. For using and building it, see
 | `src/app.rc` | Icon, version and dialog resources |
 | `src/net/crypto.*`, `channel.*` | PBKDF2/HMAC key derivation, AES-GCM, replay-protected datagrams |
 | `src/net/udp.*`, `packetizer.*` | Dual-stack UDP socket; frame splitting, reassembly, NACK |
-| `src/net/codec.*`, `converter.*` | Media Foundation H.264 encode/decode; D3D11 colour conversion |
+| `src/net/codec.*`, `converter.*` | Media Foundation H.264 encode (GPU or CPU) and decode; D3D11 colour conversion |
 | `src/net/control.*` | Optional focused input, reliable delivery, exclusive server lease, keyboard hook |
 | `client/control_ui.cpp` | Desktop control mode, focus lifetime and letterboxed pointer mapping |
 | `src/streaming.*` | The app's one seam to streaming; `streaming_off.cpp` is the empty stand-in |
@@ -175,7 +175,9 @@ at its call sites.
 - **Zero-copy into the encoder.** The renderer's cache texture is teed to the
   server, which crops it into NV12 with one video-processor blit and hands it to
   the GPU's H.264 encoder through Media Foundation (NVENC, Quick Sync or AMF).
-  Only the compressed bitstream reaches the CPU.
+  Only the compressed bitstream reaches the CPU. (Without a usable hardware
+  encoder, frames are read back and encoded on the CPU instead; see
+  [Encoding on the CPU](#encoding-on-the-cpu).)
 - **One encoder per mirror**, shared by every client watching it; nothing is
   encoded while nobody watches, and unwatched streams are freed.
 - **Event-driven encoding.** The hardware encoder is asynchronous. Its "want
@@ -261,8 +263,9 @@ spend their effort on motion search, which text does not reward.
   encoder rejects is retried at 16-pixel alignment, then with larger floors
   (384, 512, 768, 1024 px on the smallest side), keeping the crop's shape. The
   client recognises every floor, so it still draws the true shape. Once nothing
-  is left to adjust, retries back off from 2 s to a minute, and the viewer is
-  told the mirror cannot be encoded; a new size is tried at once.
+  is left to adjust, a hardware stream moves to the CPU encoder (below);
+  after that, retries back off from 2 s to a minute, and the viewer is told
+  the mirror cannot be encoded; a new size is tried at once.
 - **Encoder sessions are limited.** GeForce cards run only so many encoder
   sessions at once: three on the drivers that still support a GT 730, twelve on
   an RTX 4080's current driver. A refused session looks like any other failure
@@ -279,6 +282,40 @@ spend their effort on motion search, which text does not reward.
 - The encoder on the device's own adapter is preferred (`MFTEnum2` with the
   adapter LUID), then every other hardware encoder in turn. Each failure is
   logged with its HRESULT.
+
+### Encoding on the CPU
+
+Where no hardware encoder can be fed, the server encodes with Windows' own
+H.264 encoder ("H264 Encoder MFT") on the CPU. That means no hardware encoder,
+or no D3D11 video processor to convert frames for one: basic display adapters,
+WARP, many virtual machines and Remote Desktop sessions. `ChooseEncoder`
+decides at server start, and the settings dialog shows the same choice. A
+hardware stream that every encoder refuses at every size, such as one whose
+only encoder sits on another GPU, also moves to the CPU, for good. The wire
+protocol is the same, so clients cannot tell.
+
+- **Conversion without a video processor.** `Nv12Packer` converts on the
+  capture thread with two pixel-shader passes into one R8 texture laid out
+  exactly as NV12 is in memory: the luma rows, then the interleaved chroma
+  rows. One `CopyResource` puts it in a staging slot, so the CPU reads 1.5
+  bytes a pixel, already converted. BT.709 studio range, like the video
+  processor; the tests check the values exactly.
+- **Readback off the capture thread.** The encode thread maps the staging slot
+  with `D3D11_MAP_FLAG_DO_NOT_WAIT`, taking the device lock only for each
+  attempt, so waiting for the GPU's copy never holds up other draws. The slot is
+  handed back as soon as the frame is copied out, before it is encoded.
+- **Synchronous.** The CPU encoder always takes input, and `Encode` returns
+  with whatever the frame produced: no events, no relay, no nudging. It gets
+  the same constant bitrate, no B-frames, longest keyframe interval and
+  low-latency mode, and it honours forced keyframes.
+- **Cost.** Measured on a development VM with no GPU: 15 ms a frame at
+  640x360, and 47 ms at 1080p on detailed content that changes every frame,
+  about 21 fps at most. The presets made no measurable difference there. One
+  encode thread serves every stream, so a busy CPU stream also delays the
+  others; latest-frame-wins drops what the CPU cannot keep up with.
+- The viewing client still decodes on the GPU. Windows' decoder buffers
+  pictures for reordering unless low-latency mode is set, which the client and
+  the tests' CPU decoder both do.
 
 ## Security
 
@@ -394,7 +431,11 @@ packetisation with loss, GPU encode/decode round trips, encoder size limits
 (including whole-desktop sizes), desktop capture (frames counted, never read
 back), a full server-to-client loopback, reconnects, hostile-client limits, the
 frame-rate cap, rate control and keyframe policy, and a 120 fps end-to-end
-stream. It logs to `test.log` beside the
+stream. The CPU path is checked on any machine: the shader packer's exact
+BT.709 values, a CPU encode/decode round trip with forced keyframes and 1080p
+timings, and a server forced onto the CPU streaming to a raw peer. Tests that
+need a hardware encoder, a video processor or screen capture skip without
+one. It logs to `test.log` beside the
 app's logs. Timing checks leave room for a busy machine; servers bind port 0
 so a running copy of the app doesn't get in the way.
 

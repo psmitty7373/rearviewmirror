@@ -121,11 +121,13 @@ INT_PTR CALLBACK StreamDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        const std::wstring encoder = net::HardwareEncoderName();
-        state->encoderAvailable = !encoder.empty();
+        const net::EncoderChoice encoder = net::ChooseEncoder();
+        state->encoderAvailable = !encoder.name.empty();
         SetDlgItemTextW(dlg, IDC_STREAM_ENCODER,
-                        encoder.empty() ? L"No hardware H.264 encoder found: streaming is unavailable."
-                                        : (L"Encoder: " + encoder).c_str());
+                        encoder.name.empty() ? L"No H.264 encoder found: streaming is unavailable."
+                        : encoder.kind == net::EncoderKind::Software
+                            ? L"Encoder: the CPU (no hardware encoder found)"
+                            : (L"Encoder: " + encoder.name).c_str());
         SetDlgItemTextW(dlg, IDC_STREAM_HELP,
                         s.key.empty() && !s.lockedKey.empty()
                             ? L"The saved key could not be decrypted by this Windows account. "

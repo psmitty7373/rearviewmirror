@@ -79,9 +79,12 @@ pick up where they left off.
    app through Windows Firewall when asked.
 
 The dialog shows whether the server is running and how many clients are
-connected. A running server starts again at the next launch. Streaming needs a
-hardware H.264 encoder (NVIDIA, Intel or AMD); the dialog names the one it
-found.
+connected. A running server starts again at the next launch. Streaming uses the
+graphics card's H.264 encoder (NVIDIA, Intel or AMD), and the dialog names the
+one it found. Without one, for example in a virtual machine or over Remote
+Desktop, it encodes on the CPU instead and says so. That works, but costs far
+more: keep CPU-encoded mirrors small and their frame rate low. The viewing PC
+still needs a graphics card that can decode H.264.
 
 The app and the client must be the same version. This release changed the
 protocol, so update both PCs together.

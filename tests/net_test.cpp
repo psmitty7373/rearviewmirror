@@ -11,8 +11,10 @@
 #include "stream_client.h"
 #include "stream_server.h"
 
+#include <codecapi.h>
 #include <cstdio>
 #include <cstring>
+#include <mferror.h>
 
 using namespace rvm;
 using namespace rvm::net;
@@ -629,7 +631,10 @@ static void TestConverterSources() {
     printf("converter sources\n");
     auto& g = Gfx::Get();
     VideoConverter conv;
-    Check(conv.Init(), "video processor initialises");
+    if (!conv.Init()) {
+        printf("  SKIP  no video processor on this device\n");
+        return;
+    }
 
     const UINT srcW = 1522, srcH = 1360, cropW = 354, cropH = 418;
     D3D11_TEXTURE2D_DESC nd{};
@@ -658,6 +663,368 @@ static void TestConverterSources() {
         char what[160];
         snprintf(what, sizeof what, "%ux%u %s source converts cropped into NV12", srcW, srcH, v.name);
         Check(ok, what);
+    }
+}
+
+// What the packer and the video processor should make of a colour: BT.709,
+// studio range.
+struct Yuv { int y, cb, cr; };
+static Yuv Bt709(int r, int g, int b) {
+    const double R = r / 255.0, G = g / 255.0, B = b / 255.0;
+    const double l = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+    return { static_cast<int>(std::lround(16 + 219 * l)),
+             static_cast<int>(std::lround(128 + 224 * (B - l) / 1.8556)),
+             static_cast<int>(std::lround(128 + 224 * (R - l) / 1.5748)) };
+}
+
+// One NV12 picture in memory: `stride` bytes a row, the chroma plane after
+// `rows` luma rows.
+struct Nv12Picture {
+    std::vector<uint8_t> data;
+    UINT stride = 0, rows = 0;
+    Yuv At(UINT x, UINT y) const {
+        const size_t chroma = static_cast<size_t>(stride) * rows + (y / 2) * stride + (x / 2) * 2;
+        return { data[static_cast<size_t>(y) * stride + x], data[chroma], data[chroma + 1] };
+    }
+};
+
+static bool WithinYuv(const Yuv& a, const Yuv& b, int tolerance) {
+    return std::abs(a.y - b.y) <= tolerance && std::abs(a.cb - b.cb) <= tolerance &&
+           std::abs(a.cr - b.cr) <= tolerance;
+}
+
+// Windows' H.264 decoder on the CPU, into memory. It checks what the CPU
+// encoder made on machines whose GPU cannot decode at all.
+struct SoftwareDecoder {
+    winrt::com_ptr<IMFTransform> mft;
+    UINT stride = 0, rows = 0;
+
+    SoftwareDecoder() { MFStartup(MF_VERSION, MFSTARTUP_LITE); }
+    ~SoftwareDecoder() {
+        mft = nullptr;
+        MFShutdown();
+    }
+
+    bool Init() {
+        MFT_REGISTER_TYPE_INFO in{ MFMediaType_Video, MFVideoFormat_H264 };
+        MFT_REGISTER_TYPE_INFO out{ MFMediaType_Video, MFVideoFormat_NV12 };
+        IMFActivate** list = nullptr;
+        UINT32 count = 0;
+        if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                             &in, &out, &list, &count)) || count == 0) {
+            return false;
+        }
+        const HRESULT hr = list[0]->ActivateObject(IID_PPV_ARGS(mft.put()));
+        for (UINT32 i = 0; i < count; ++i) list[i]->Release();
+        CoTaskMemFree(list);
+        if (FAILED(hr)) return false;
+
+        // Otherwise it holds pictures back for reordering, as the client's does
+        // not. Set up exactly as H264Decoder sets it up.
+        winrt::com_ptr<IMFAttributes> attrs;
+        if (SUCCEEDED(mft->GetAttributes(attrs.put()))) {
+            attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+            attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
+        }
+        if (auto codec = mft.try_as<ICodecAPI>()) {
+            VARIANT v;
+            VariantInit(&v);
+            v.vt = VT_BOOL;
+            v.boolVal = VARIANT_TRUE;
+            codec->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+        }
+
+        winrt::com_ptr<IMFMediaType> type;
+        MFCreateMediaType(type.put());
+        type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        return SUCCEEDED(mft->SetInputType(0, type.get(), 0)) && Negotiate() &&
+               SUCCEEDED(mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)) &&
+               SUCCEEDED(mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0));
+    }
+
+    bool Negotiate() {
+        for (DWORD i = 0;; ++i) {
+            winrt::com_ptr<IMFMediaType> type;
+            if (FAILED(mft->GetOutputAvailableType(0, i, type.put()))) return false;
+            GUID subtype{};
+            type->GetGUID(MF_MT_SUBTYPE, &subtype);
+            if (subtype != MFVideoFormat_NV12) continue;
+            if (FAILED(mft->SetOutputType(0, type.get(), 0))) return false;
+            UINT32 w = 0, h = 0;
+            MFGetAttributeSize(type.get(), MF_MT_FRAME_SIZE, &w, &h);
+            stride = MFGetAttributeUINT32(type.get(), MF_MT_DEFAULT_STRIDE, w);
+            rows = h;
+            return true;
+        }
+    }
+
+    // Feeds one access unit. Each picture it completes replaces `last`.
+    bool Decode(const std::vector<uint8_t>& unit, Nv12Picture& last, int& pictures) {
+        winrt::com_ptr<IMFSample> sample;
+        winrt::com_ptr<IMFMediaBuffer> buffer;
+        BYTE* p = nullptr;
+        if (FAILED(MFCreateSample(sample.put())) ||
+            FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(unit.size()), buffer.put())) ||
+            FAILED(buffer->Lock(&p, nullptr, nullptr))) {
+            return false;
+        }
+        memcpy(p, unit.data(), unit.size());
+        buffer->Unlock();
+        buffer->SetCurrentLength(static_cast<DWORD>(unit.size()));
+        sample->AddBuffer(buffer.get());
+        if (FAILED(mft->ProcessInput(0, sample.get(), 0))) return false;
+
+        for (;;) {
+            MFT_OUTPUT_STREAM_INFO info{};
+            mft->GetOutputStreamInfo(0, &info);
+            winrt::com_ptr<IMFSample> outSample;
+            winrt::com_ptr<IMFMediaBuffer> outBuffer;
+            MFCreateSample(outSample.put());
+            MFCreateMemoryBuffer((std::max)(info.cbSize, 1ul), outBuffer.put());
+            outSample->AddBuffer(outBuffer.get());
+            MFT_OUTPUT_DATA_BUFFER db{};
+            db.pSample = outSample.get();
+            DWORD status = 0;
+            const HRESULT hr = mft->ProcessOutput(0, 1, &db, &status);
+            if (db.pEvents) db.pEvents->Release();
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return true;
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                if (!Negotiate()) return false;
+                continue;
+            }
+            if (FAILED(hr)) return false;
+            winrt::com_ptr<IMFMediaBuffer> contiguous;
+            DWORD length = 0;
+            if (FAILED(outSample->ConvertToContiguousBuffer(contiguous.put())) ||
+                FAILED(contiguous->Lock(&p, nullptr, &length))) {
+                return false;
+            }
+            last.data.assign(p, p + length);
+            last.stride = stride;
+            last.rows = rows;
+            contiguous->Unlock();
+            ++pictures;
+        }
+    }
+};
+
+// Reads a packed NV12 staging texture, as the CPU encoder will.
+static bool ReadPacked(ID3D11Texture2D* staging, Nv12Picture& picture) {
+    auto& g = Gfx::Get();
+    D3D11_TEXTURE2D_DESC d{};
+    staging->GetDesc(&d);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(g.ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) return false;
+    picture.stride = d.Width;
+    picture.rows = d.Height / 3 * 2;
+    picture.data.resize(static_cast<size_t>(d.Width) * d.Height);
+    for (UINT r = 0; r < d.Height; ++r) {
+        memcpy(&picture.data[static_cast<size_t>(r) * d.Width],
+               static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(r) * m.RowPitch, d.Width);
+    }
+    g.ctx->Unmap(staging, 0);
+    return true;
+}
+
+static winrt::com_ptr<ID3D11Texture2D> PackedStaging(UINT w, UINT h) {
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = w; d.Height = h * 3 / 2; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R8_UNORM; d.SampleDesc = { 1, 0 };
+    d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    winrt::com_ptr<ID3D11Texture2D> t;
+    Gfx::Get().d3d->CreateTexture2D(&d, nullptr, t.put());
+    return t;
+}
+
+// A BGRA texture split down the middle: `left` | `right`, each {B, G, R}.
+static winrt::com_ptr<ID3D11Texture2D> SplitSource(UINT w, UINT h, UINT bind, const uint8_t left[3],
+                                                   const uint8_t right[3]) {
+    std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
+    for (UINT y = 0; y < h; ++y) {
+        for (UINT x = 0; x < w; ++x) {
+            const uint8_t* c = x < w / 2 ? left : right;
+            uint8_t* p = &pixels[(static_cast<size_t>(y) * w + x) * 4];
+            p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = 255;
+        }
+    }
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc = { 1, 0 };
+    d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = bind;
+    const D3D11_SUBRESOURCE_DATA init{ pixels.data(), w * 4, 0 };
+    winrt::com_ptr<ID3D11Texture2D> t;
+    Gfx::Get().d3d->CreateTexture2D(&d, &init, t.put());
+    return t;
+}
+
+// The shader conversion for the CPU encoder: exact colours at 1:1, and flat
+// areas still flat when a small crop is scaled up to the encoder's floor.
+static void TestPacker() {
+    printf("frame packer\n");
+    auto& g = Gfx::Get();
+    Nv12Packer packer;
+    Check(packer.Init(), "packing shaders compile");
+
+    const uint8_t a[3]{ 30, 60, 200 }, b[3]{ 220, 150, 40 };   // B, G, R
+    const Yuv ya = Bt709(a[2], a[1], a[0]), yb = Bt709(b[2], b[1], b[0]);
+    // Shader-resource only, as a capture cache could be; the crop straddles the split.
+    const auto source = SplitSource(400, 300, D3D11_BIND_SHADER_RESOURCE, a, b);
+    const RECT crop{ 100, 50, 300, 250 };
+
+    const struct { UINT w, h; int tolerance; const char* what; } sizes[] = {
+        { 200, 200, 1, "a 1:1 crop packs to exact BT.709 values, luma and chroma" },
+        { 256, 256, 2, "a crop scaled up keeps its flat colours" },
+    };
+    for (const auto& s : sizes) {
+        const auto staging = PackedStaging(s.w, s.h);
+        Nv12Picture picture;
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lock(g.deviceMutex);
+            ok = source && staging && packer.Pack(source.get(), crop, staging.get()) &&
+                 ReadPacked(staging.get(), picture);
+        }
+        if (!ok) {
+            Check(false, "pack and read back");
+            continue;
+        }
+        const Yuv left = picture.At(s.w / 4, s.h / 2), right = picture.At(3 * s.w / 4, s.h / 2);
+        printf("  %ux%u  left Y%3d Cb%3d Cr%3d (want %d %d %d)  right Y%3d Cb%3d Cr%3d (want %d %d %d)\n",
+               s.w, s.h, left.y, left.cb, left.cr, ya.y, ya.cb, ya.cr, right.y, right.cb, right.cr,
+               yb.y, yb.cb, yb.cr);
+        Check(WithinYuv(left, ya, s.tolerance) && WithinYuv(right, yb, s.tolerance), s.what);
+    }
+
+    const auto wrong = PackedStaging(200, 100);
+    std::lock_guard<std::mutex> lock(g.deviceMutex);
+    Check(!packer.Pack(source.get(), RECT{ 350, 0, 450, 100 }, wrong.get()),
+          "a crop reaching outside the source is refused");
+}
+
+// The CPU encoder end to end: packed frames in, H.264 out, decoded on the CPU
+// to the colours that went in, with keyframes exactly when asked for.
+static void TestSoftwareCodec() {
+    printf("CPU codec\n");
+    if (!SoftwareEncoder()) {
+        printf("  SKIP  no software H.264 encoder on this machine\n");
+        return;
+    }
+    auto& g = Gfx::Get();
+    const UINT W = 640, H = 360;
+    Nv12Packer packer;
+    const auto staging = PackedStaging(W, H);
+    Check(packer.Init() && staging, "packer and staging texture");
+
+    H264Encoder encoder;
+    Check(encoder.Init(W, H, 60, 4'000'000, H264Encoder::kEncoderDefault, EncoderKind::Software),
+          "CPU encoder initialises");
+    printf("  encoder: %ls\n", encoder.Name().c_str());
+    Check(encoder.Kind() == EncoderKind::Software && encoder.WantsInput(),
+          "a synchronous encoder always takes input");
+    SoftwareDecoder decoder;
+    Check(decoder.Init(), "CPU decoder initialises");
+
+    constexpr int kFrames = 16, kAskAt = 10;
+    int released = 0, pictures = 0, keyframes = 0, askedKeyframeAt = -1;
+    size_t bytes = 0;
+    bool ok = true;
+    Nv12Picture last;
+    uint8_t left[3]{}, right[3]{};
+    LARGE_INTEGER freq{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    double encodeMs = 0;
+    for (int f = 0; f < kFrames && ok; ++f) {
+        const uint8_t shade = static_cast<uint8_t>(40 + (std::min)(f, 8) * 15);
+        const uint8_t l[3]{ shade, 60, 200 }, r[3]{ 30, shade, 90 };
+        memcpy(left, l, 3);
+        memcpy(right, r, 3);
+        const auto source = SplitSource(W, H, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, l, r);
+        {
+            std::lock_guard<std::mutex> lock(g.deviceMutex);
+            ok = source && packer.Pack(source.get(), RECT{ 0, 0, LONG(W), LONG(H) }, staging.get());
+        }
+        if (!ok) break;
+        if (f == kAskAt) encoder.RequestKeyframe();
+
+        std::vector<EncodedFrame> encoded;
+        QueryPerformanceCounter(&t0);
+        ok = encoder.Encode(staging.get(), encoded, [&] { ++released; });   // Device lock not held.
+        QueryPerformanceCounter(&t1);
+        encodeMs += 1000.0 * (t1.QuadPart - t0.QuadPart) / freq.QuadPart;
+        for (const auto& e : encoded) {
+            bytes += e.data.size();
+            if (e.keyframe) {
+                ++keyframes;
+                if (f >= kAskAt && askedKeyframeAt < 0) askedKeyframeAt = f;
+            }
+            if (!decoder.Decode(e.data, last, pictures)) ok = false;
+        }
+    }
+    Check(ok, "every frame packs, encodes and decodes");
+    Check(released == kFrames, "each frame's texture is handed back before Encode returns");
+    Check(keyframes == 2 && askedKeyframeAt == kAskAt,
+          "a keyframe to start, and one exactly when asked: none on a timer");
+    Check(pictures >= kFrames - 2, "nearly every frame decodes (low latency)");
+    printf("  %d frames -> %d pictures, %zu bytes, %d keyframes, %.1f ms a frame to encode\n", kFrames,
+           pictures, bytes, keyframes, encodeMs / kFrames);
+
+    if (!last.data.empty()) {
+        const Yuv gotL = last.At(W / 4, H / 2), gotR = last.At(3 * W / 4, H / 2);
+        const Yuv wantL = Bt709(left[2], left[1], left[0]), wantR = Bt709(right[2], right[1], right[0]);
+        printf("  left Y%3d Cb%3d Cr%3d (want %d %d %d)  right Y%3d Cb%3d Cr%3d (want %d %d %d)\n",
+               gotL.y, gotL.cb, gotL.cr, wantL.y, wantL.cb, wantL.cr, gotR.y, gotR.cb, gotR.cr,
+               wantR.y, wantR.cb, wantR.cr);
+        Check(WithinYuv(gotL, wantL, 6) && WithinYuv(gotR, wantR, 6),
+              "decoded colours match the source within codec tolerance");
+    } else {
+        Check(false, "a decoded picture to compare");
+    }
+
+    // What a 1080p mirror costs this CPU, on detailed content that moves
+    // every frame (the worst case; a still window costs nothing). Reported,
+    // not checked: it depends entirely on the machine.
+    const UINT BW = 1920, BH = 1080;
+    const auto big = PackedStaging(BW, BH);
+    D3D11_TEXTURE2D_DESC bd{};
+    bd.Width = BW; bd.Height = BH; bd.MipLevels = 1; bd.ArraySize = 1;
+    bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; bd.SampleDesc = { 1, 0 };
+    bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    winrt::com_ptr<ID3D11Texture2D> busy;
+    g.d3d->CreateTexture2D(&bd, nullptr, busy.put());
+    std::vector<uint8_t> pixels(static_cast<size_t>(BW) * BH * 4);
+    for (const auto& [preset, name] : { std::pair{ H264Encoder::kEncoderDefault, "balanced" },
+                                        std::pair{ 0u, "fastest" } }) {
+        H264Encoder bench;
+        if (!big || !busy || !bench.Init(BW, BH, 30, 8'000'000, preset, EncoderKind::Software)) {
+            printf("  1080p %s: encoder refused\n", name);
+            continue;
+        }
+        constexpr int kBenchFrames = 10;
+        double ms = 0;
+        size_t benchBytes = 0;
+        for (int f = 0; f < kBenchFrames; ++f) {
+            for (UINT y = 0; y < BH; ++y) {
+                for (UINT x = 0; x < BW; ++x) {
+                    uint8_t* p = &pixels[(static_cast<size_t>(y) * BW + x) * 4];
+                    const uint8_t v = static_cast<uint8_t>(((x / 3) ^ ((y + f * 7) / 2)) * 37);
+                    p[0] = v; p[1] = static_cast<uint8_t>(v + x); p[2] = static_cast<uint8_t>(y + f); p[3] = 255;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(g.deviceMutex);
+                g.ctx->UpdateSubresource(busy.get(), 0, nullptr, pixels.data(), BW * 4, 0);
+                packer.Pack(busy.get(), RECT{ 0, 0, LONG(BW), LONG(BH) }, big.get());
+            }
+            std::vector<EncodedFrame> encoded;
+            QueryPerformanceCounter(&t0);
+            bench.Encode(big.get(), encoded);
+            QueryPerformanceCounter(&t1);
+            ms += 1000.0 * (t1.QuadPart - t0.QuadPart) / freq.QuadPart;
+            for (const auto& e : encoded) benchBytes += e.data.size();
+        }
+        printf("  1080p %s: %.1f ms a frame (at most about %.0f fps), %zu KB a frame\n", name,
+               ms / kBenchFrames, 1000.0 * kBenchFrames / ms, benchBytes / kBenchFrames / 1024);
     }
 }
 
@@ -1004,6 +1371,93 @@ static void SendId(RawPeer& peer, Msg msg, uint32_t id) {
     w.U8(static_cast<uint8_t>(msg));
     w.U32(id);
     peer.Send(w);
+}
+
+// The server encoding on the CPU, as it does wherever no hardware encoder can
+// be fed: frames from a mirror's cache reach a subscriber and decode to what
+// was captured. A raw peer receives them, since the real client decodes on
+// the GPU and some machines that need this have nothing to decode with.
+static void TestSoftwareLoopback() {
+    printf("CPU stream\n");
+    if (!SoftwareEncoder()) {
+        printf("  SKIP  no software H.264 encoder on this machine\n");
+        return;
+    }
+    auto& g = Gfx::Get();
+    const std::wstring key = L"cpu-stream-test-key";
+
+    // A 700x420 source whose crop, 480x270, straddles a colour split.
+    const uint8_t a[3]{ 40, 170, 230 }, b[3]{ 200, 80, 50 };   // B, G, R
+    const auto source = SplitSource(700, 420, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, a, b);
+    const RECT crop{ 110, 75, 590, 345 };
+
+    StreamSettings settings;
+    settings.enabled = true;
+    settings.port = 0;
+    settings.key = key;
+    settings.bitrateKbps = 3000;
+    settings.fps = 30;
+
+    StreamServer server;
+    server.ForceSoftwareEncoding(true);
+    server.SetFrameRequester([&](uint32_t id) {
+        std::lock_guard<std::mutex> lock(g.deviceMutex);
+        server.SubmitFrame(id, source.get(), crop);
+    });
+    Check(server.Start(settings), "server starts, encoding on the CPU");
+    server.SetMirrorList({ { 1, L"CPU mirror", 480, 270 } });
+
+    RawPeer peer;
+    Check(peer.Open(server.Port(), key) && peer.Handshake() && peer.PingPong(), "raw peer admitted");
+    SendId(peer, Msg::Subscribe, 1);
+
+    // A moving source for a second, while the peer listens.
+    std::atomic<bool> feeding{ true };
+    std::thread feeder([&] {
+        for (int f = 0; f < 30 && feeding; ++f) {
+            {
+                std::lock_guard<std::mutex> lock(g.deviceMutex);
+                server.SubmitFrame(1, source.get(), crop);
+            }
+            Sleep(33);
+        }
+    });
+    const auto messages = peer.Collect(2500);
+    feeding = false;
+    feeder.join();
+
+    FrameAssembler assembler;
+    std::vector<FrameAssembler::Frame> frames;
+    bool refused = false;
+    for (const auto& m : messages) {
+        if (m[0] == static_cast<uint8_t>(Msg::StreamStatus) && m.size() >= 6 && m[5] != 0) refused = true;
+        if (m[0] != static_cast<uint8_t>(Msg::Frame)) continue;
+        Reader r(m.data() + 1, m.size() - 1);
+        FrameHeader h;
+        if (ReadFrameHeader(r, h)) assembler.Accept(h, r.Ptr(), r.Left(), GetTickCount64(), frames);
+    }
+    Check(!refused, "the server never reports the stream as unencodable");
+    Check(frames.size() >= 5 && frames[0].keyframe, "frames arrive, starting with a keyframe");
+
+    SoftwareDecoder decoder;
+    Nv12Picture last;
+    int pictures = 0;
+    bool decoded = decoder.Init();
+    for (const auto& f : frames) decoded = decoded && decoder.Decode(f.data, last, pictures);
+    Check(decoded && pictures >= 5, "they decode");
+    printf("  %zu frames received, %d decoded\n", frames.size(), pictures);
+
+    if (!last.data.empty()) {
+        // 480x270 is encoded as is; the split falls 240 px into the crop.
+        const Yuv gotL = last.At(45, 135), gotR = last.At(300, 135);
+        const Yuv wantL = Bt709(a[2], a[1], a[0]), wantR = Bt709(b[2], b[1], b[0]);
+        printf("  left Y%3d Cb%3d Cr%3d (want %d %d %d)  right Y%3d Cb%3d Cr%3d (want %d %d %d)\n",
+               gotL.y, gotL.cb, gotL.cr, wantL.y, wantL.cb, wantL.cr, gotR.y, gotR.cb, gotR.cr,
+               wantR.y, wantR.cb, wantR.cr);
+        Check(WithinYuv(gotL, wantL, 8) && WithinYuv(gotR, wantR, 8),
+              "decoded colours match the mirror's crop");
+    }
+    server.Stop();
 }
 
 // Everything the audit found a client could abuse, tried against a live
@@ -1732,9 +2186,12 @@ int main(int argc, char** argv) {
         TestRateControl();
         TestEncoderPresets();
         TestConverterSources();
+        TestPacker();
+        TestSoftwareCodec();
         TestDesktopCapture();
         TestLoopback();
         TestWelcomeBinding();
+        TestSoftwareLoopback();
         TestHostileClients();
         TestEncoderSessionLimit();
         TestFrameRateCap();
