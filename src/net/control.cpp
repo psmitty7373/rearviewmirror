@@ -29,14 +29,26 @@ bool ReadInput(Reader& r, RemoteInput& e) {
     return Valid(e);
 }
 bool Inject(const RemoteInput& e) {
+    INPUT i = InputFor(e);
+    return SendInput(1, &i, sizeof(i)) == 1;
+}
+}
+
+INPUT InputFor(const RemoteInput& e) {
     INPUT i{};
     if (e.kind == InputKind::Key) {
         i.type = INPUT_KEYBOARD;
         i.ki.wVk = e.code;
         if (e.value && e.code != VK_PAUSE) {
+            const WORD scan = e.value & 0xff;
+            // A low-level hook reports right Shift as an extended key, a
+            // long-standing Windows quirk. Injected that way it reads as E0 36,
+            // the "fake shift" keyboards send around the navigation keys,
+            // which Windows discards: Shift would never be held.
+            const bool shift = scan == 0x2A || scan == 0x36;
             i.ki.wVk = 0;
-            i.ki.wScan = e.value & 0xff;
-            i.ki.dwFlags = KEYEVENTF_SCANCODE | ((e.value & 0x100) ? KEYEVENTF_EXTENDEDKEY : 0);
+            i.ki.wScan = scan;
+            i.ki.dwFlags = KEYEVENTF_SCANCODE | ((e.value & 0x100) && !shift ? KEYEVENTF_EXTENDEDKEY : 0);
         }
         if (!e.down) i.ki.dwFlags |= KEYEVENTF_KEYUP;
     } else {
@@ -55,8 +67,7 @@ bool Inject(const RemoteInput& e) {
             i.mi.mouseData = static_cast<DWORD>(static_cast<LONG>(e.value));
         }
     }
-    return SendInput(1, &i, sizeof(i)) == 1;
-}
+    return i;
 }
 
 struct ControlHost::Impl {

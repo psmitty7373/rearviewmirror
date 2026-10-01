@@ -26,6 +26,10 @@ struct RemoteInput {
 enum class ControlState : uint8_t { Idle, Pending, Active, Busy, Denied, Lost };
 constexpr uint64_t kControlLeaseMs = 1500;
 
+// What the default sink hands to SendInput for one event. Separate so tests
+// can check it without sending input to the machine.
+INPUT InputFor(const RemoteInput& e);
+
 // Network-thread only. One controlling viewer per server, regardless of the
 // number of desktop mirrors. Tests supply a sink instead of injecting input.
 class ControlHost {

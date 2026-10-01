@@ -145,10 +145,26 @@ void LostRepliesAndClockSkew() {
     c.Poll(now + 4);
     Check(c.State() == ControlState::Pending, "poll time read before a newer stamp does not expire control");
 }
+// What the hook reports for each key, as the client forwards it, and what
+// SendInput must be given for it. Nothing is injected.
+void KeyTranslation() {
+    const auto key = [](uint16_t vk, int16_t scan) {
+        RemoteInput e; e.kind = InputKind::Key; e.code = vk; e.value = scan; e.down = true;
+        return InputFor(e);
+    };
+    const auto extended = [](const INPUT& i) { return (i.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) != 0; };
+    const INPUT left = key(VK_LSHIFT, 0x2A), right = key(VK_RSHIFT, 0x136);   // The hook flags right Shift.
+    Check(left.ki.wScan == 0x2A && right.ki.wScan == 0x36 && !extended(left) && !extended(right),
+          "both Shifts are injected as plain scan codes, never as the fake E0 shift");
+    const INPUT rightCtrl = key(VK_RCONTROL, 0x11D), arrow = key(VK_LEFT, 0x14B), letter = key('A', 0x1E);
+    Check(extended(rightCtrl) && extended(arrow) && !extended(letter) && letter.ki.wScan == 0x1E,
+          "other keys keep their extended flag as reported");
+}
 }
 int main() {
     static_assert(RVM_REMOTE_CONTROL, "Control tests require the feature to be enabled");
     Reliability(); Admission(); BoundsAndReordering(); InjectionFailure(); LostRepliesAndClockSkew();
+    KeyTranslation();
     printf("%s\n", failures ? "FAILED" : "All control checks passed");
     return failures ? 1 : 0;
 }
