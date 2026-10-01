@@ -4,11 +4,12 @@ namespace rvm::login {
 
 namespace {
 
-// One monitor: wait on it, so a still screen costs nothing. Several: poll
-// each briefly in turn.
-constexpr UINT kSingleOutputWaitMs = 100;
-constexpr UINT kMultiOutputWaitMs  = 8;
+// How long a monitor's thread waits for a change when no compose is due: only
+// so that it notices being stopped.
+constexpr UINT kIdleWaitMs = 250;
 constexpr DWORD kRetryMs = 500;
+// More changed areas than this between composes: the whole picture is copied.
+constexpr size_t kMaxDamageRects = 32;
 
 // The pointer shape as premultiplied BGRA. Duplication reports three kinds;
 // the monochrome and masked ones can invert what is under them, which a
@@ -46,16 +47,24 @@ std::vector<uint32_t> PointerPixels(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& si, c
     return px;
 }
 
+D3D11_BOX Box(const RECT& r) {
+    return D3D11_BOX{ static_cast<UINT>(r.left), static_cast<UINT>(r.top), 0,
+                      static_cast<UINT>(r.right), static_cast<UINT>(r.bottom), 1 };
+}
+
 }  // namespace
 
 DuplicationCapture::~DuplicationCapture() {
     Stop();
 }
 
-bool DuplicationCapture::Start(FrameCallback onFrame, SizeCallback onSize) {
+bool DuplicationCapture::Start(FrameCallback onFrame, SizeCallback onSize, WantedCallback wanted, UINT fps) {
     Stop();
     onFrame_ = std::move(onFrame);
     onSize_ = std::move(onSize);
+    wanted_ = std::move(wanted);
+    interval_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::microseconds(1'000'000 / (std::max)(fps, 1u)));
     running_ = true;
     thread_ = std::thread([this] { Loop(); });
     return true;
@@ -69,6 +78,7 @@ void DuplicationCapture::Stop() {
         CloseDesktop(desktop_);
         desktop_ = nullptr;
     }
+    layout_.clear();
     std::lock_guard lock(Gfx::Get().deviceMutex);
     pointer_ = nullptr;
     target_ = nullptr;
@@ -76,11 +86,17 @@ void DuplicationCapture::Stop() {
     frame_ = nullptr;
     composite_ = nullptr;
     havePicture_ = false;
+    stale_ = false;
 }
 
 void DuplicationCapture::Repush() {
     std::lock_guard lock(Gfx::Get().deviceMutex);
-    if (havePicture_ && frame_ && onFrame_) onFrame_(frame_.get());
+    if (!havePicture_ || !frame_ || !onFrame_) return;
+    if (stale_) {
+        Compose();
+    } else {
+        onFrame_(frame_.get());
+    }
 }
 
 // Duplication works only for a thread on the input desktop, so the thread
@@ -109,9 +125,8 @@ bool DuplicationCapture::FollowInputDesktop() {
     return true;
 }
 
-// Under Gfx::deviceMutex.
 bool DuplicationCapture::EnsureTextures(UINT width, UINT height) {
-    if (composite_ && static_cast<UINT>(size_.cx) == width && static_cast<UINT>(size_.cy) == height) {
+    if (composite_ && static_cast<UINT>(bounds_.right) == width && static_cast<UINT>(bounds_.bottom) == height) {
         return true;
     }
     auto& g = Gfx::Get();
@@ -130,8 +145,6 @@ bool DuplicationCapture::EnsureTextures(UINT width, UINT height) {
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     HRESULT hr = g.d3d->CreateTexture2D(&d, nullptr, composite_.put());
     if (SUCCEEDED(hr)) hr = g.d3d->CreateTexture2D(&d, nullptr, frame_.put());
-    winrt::com_ptr<ID3D11RenderTargetView> rtv;
-    if (SUCCEEDED(hr)) hr = g.d3d->CreateRenderTargetView(composite_.get(), nullptr, rtv.put());
     if (SUCCEEDED(hr) && !d2d_) {
         hr = g.d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, d2d_.put());
     }
@@ -149,10 +162,27 @@ bool DuplicationCapture::EnsureTextures(UINT width, UINT height) {
         composite_ = nullptr;
         return false;
     }
-    // Monitors of other adapters, and gaps between monitors, stay black.
+    bounds_ = RECT{ 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
+    damage_.clear();
+    damageAll_ = true;
+    pointerDrawn_ = RECT{};
+    layout_.clear();   // So that Attach clears them.
+    return true;
+}
+
+// Monitors of other adapters, rotated ones, and gaps between monitors stay black.
+void DuplicationCapture::ClearComposite() {
+    auto& g = Gfx::Get();
+    winrt::com_ptr<ID3D11RenderTargetView> rtv;
+    const HRESULT hr = g.d3d->CreateRenderTargetView(composite_.get(), nullptr, rtv.put());
+    if (FAILED(hr)) {
+        g.CheckDevice(hr);
+        return;
+    }
     const float black[4]{ 0.0f, 0.0f, 0.0f, 1.0f };
     g.ctx->ClearRenderTargetView(rtv.get(), black);
-    return true;
+    damageAll_ = true;
+    stale_ = true;
 }
 
 bool DuplicationCapture::Attach() {
@@ -169,6 +199,7 @@ bool DuplicationCapture::Attach() {
     winrt::com_ptr<IDXGIAdapter> adapter;
     if (FAILED(g.dxgi->GetAdapter(adapter.put()))) return false;
     outputs_.clear();
+    std::vector<RECT> layout;
     for (UINT i = 0;; ++i) {
         winrt::com_ptr<IDXGIOutput> output;
         if (FAILED(adapter->EnumOutputs(i, output.put())) || !output) break;   // NOT_FOUND ends the list.
@@ -192,8 +223,20 @@ bool DuplicationCapture::Attach() {
                             static_cast<unsigned>(hr));
             continue;
         }
-        outputs_.push_back({ std::move(dup), POINT{ desc.DesktopCoordinates.left - vx,
-                                                    desc.DesktopCoordinates.top - vy } });
+        // Its frames would come unrotated, sideways over its place.
+        DXGI_OUTDUPL_DESC dd{};
+        dup->GetDesc(&dd);
+        if (dd.Rotation != DXGI_MODE_ROTATION_IDENTITY && dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED) {
+            if (rotated_.insert(desc.DeviceName).second) {
+                Log(L"login: %s is rotated, which is not supported; it shows black", desc.DeviceName);
+            }
+            continue;
+        }
+        rotated_.erase(desc.DeviceName);
+        RECT placed = desc.DesktopCoordinates;
+        OffsetRect(&placed, -vx, -vy);
+        outputs_.push_back({ std::move(dup), POINT{ placed.left, placed.top } });
+        layout.push_back(placed);
     }
     if (outputs_.empty()) {
         RVM_LOG_SAMPLED(50, L"login: no monitor could be duplicated; trying again");
@@ -206,6 +249,12 @@ bool DuplicationCapture::Attach() {
             outputs_.clear();
             return false;
         }
+        // A monitor gone, moved or turned leaves no old picture behind.
+        if (!std::equal(layout.begin(), layout.end(), layout_.begin(), layout_.end(),
+                        [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; })) {
+            ClearComposite();
+            layout_ = std::move(layout);
+        }
     }
     Log(L"login: duplicating %zu monitor(s), %ux%u", outputs_.size(), width, height);
     if (size_.cx != static_cast<LONG>(width) || size_.cy != static_cast<LONG>(height)) {
@@ -215,45 +264,107 @@ bool DuplicationCapture::Attach() {
     return true;
 }
 
-void DuplicationCapture::Detach() {
-    outputs_.clear();
+// What the frame changed, in the output's coordinates. False: unknown.
+bool DuplicationCapture::ReadChanges(Output& out, UINT bytes) {
+    if (bytes == 0) return false;
+    out.moves.resize(bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT) + 1);
+    out.dirty.resize(bytes / sizeof(RECT) + 1);
+    UINT moveBytes = 0, dirtyBytes = 0;
+    if (FAILED(out.dup->GetFrameMoveRects(static_cast<UINT>(out.moves.size() * sizeof(DXGI_OUTDUPL_MOVE_RECT)),
+                                          out.moves.data(), &moveBytes)) ||
+        FAILED(out.dup->GetFrameDirtyRects(static_cast<UINT>(out.dirty.size() * sizeof(RECT)), out.dirty.data(),
+                                           &dirtyBytes))) {
+        return false;
+    }
+    out.moves.resize(moveBytes / sizeof(DXGI_OUTDUPL_MOVE_RECT));
+    out.dirty.resize(dirtyBytes / sizeof(RECT));
+    return true;
 }
 
-// Under Gfx::deviceMutex, between AcquireNextFrame and ReleaseFrame.
-void DuplicationCapture::TakePointer(const Output& out, size_t index, const DXGI_OUTDUPL_FRAME_INFO& info) {
-    if (info.LastMouseUpdateTime.QuadPart != 0) {
-        if (info.PointerPosition.Visible) {
-            pointerVisible_ = true;
-            pointerOwner_ = index;
-            pointerAt_ = POINT{ out.at.x + info.PointerPosition.Position.x,
-                                out.at.y + info.PointerPosition.Position.y };
-        } else if (pointerOwner_ == index) {
-            pointerVisible_ = false;   // Left this monitor; another one reports it if it is shown.
-        }
-    }
-    if (info.PointerShapeBufferSize == 0) return;
+// The frame is the output's whole new image, so where something moved to is
+// copied from it just like a dirty area.
+void DuplicationCapture::CopyChanges(Output& out, ID3D11Texture2D* texture, bool whole) {
+    D3D11_TEXTURE2D_DESC td{};
+    texture->GetDesc(&td);
+    const RECT within{ 0, 0, (std::min)(static_cast<LONG>(td.Width), bounds_.right - out.at.x),
+                       (std::min)(static_cast<LONG>(td.Height), bounds_.bottom - out.at.y) };
+    if (out.at.x < 0 || out.at.y < 0 || IsRectEmpty(&within)) return;
 
-    shapeBuffer_.resize(info.PointerShapeBufferSize);
-    UINT used = 0;
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO si{};
-    if (FAILED(out.dup->GetFramePointerShape(static_cast<UINT>(shapeBuffer_.size()), shapeBuffer_.data(),
-                                             &used, &si)) ||
-        si.Width == 0 || si.Height == 0) {
+    auto& g = Gfx::Get();
+    const auto copy = [&](const RECT& changed) {
+        RECT r{};
+        if (!IntersectRect(&r, &changed, &within)) return;
+        const D3D11_BOX box = Box(r);
+        g.ctx->CopySubresourceRegion(composite_.get(), 0, static_cast<UINT>(out.at.x + r.left),
+                                     static_cast<UINT>(out.at.y + r.top), 0, texture, 0, &box);
+        OffsetRect(&r, out.at.x, out.at.y);
+        Damage(r);
+    };
+    if (whole) {
+        copy(within);
+    } else {
+        for (const auto& move : out.moves) copy(move.DestinationRect);
+        for (const RECT& dirty : out.dirty) copy(dirty);
+    }
+    out.whole = false;
+    havePicture_ = true;
+}
+
+void DuplicationCapture::Damage(const RECT& r) {
+    stale_ = true;
+    if (damageAll_) return;
+    if (damage_.size() == kMaxDamageRects) {
+        damageAll_ = true;
+        damage_.clear();
         return;
     }
-    UINT w = 0, h = 0;
-    const auto px = PointerPixels(si, shapeBuffer_.data(), w, h);
+    damage_.push_back(r);
+}
+
+void DuplicationCapture::TakePointer(const Output& out, size_t index, const DXGI_OUTDUPL_FRAME_INFO& info,
+                                     const std::vector<uint32_t>& shape, UINT shapeW, UINT shapeH) {
+    if (info.LastMouseUpdateTime.QuadPart != 0) {
+        if (info.PointerPosition.Visible) {
+            const POINT at{ out.at.x + info.PointerPosition.Position.x, out.at.y + info.PointerPosition.Position.y };
+            if (!pointerVisible_ || at.x != pointerAt_.x || at.y != pointerAt_.y) stale_ = true;
+            pointerVisible_ = true;
+            pointerOwner_ = index;
+            pointerAt_ = at;
+        } else if (pointerOwner_ == index && pointerVisible_) {
+            pointerVisible_ = false;   // Left this monitor; another one reports it if it is shown.
+            stale_ = true;
+        }
+    }
+    if (shape.empty() || !d2d_) return;
     pointer_ = nullptr;
     const auto props = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_NONE,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    if (d2d_) d2d_->CreateBitmap(D2D1::SizeU(w, h), px.data(), w * 4, &props, pointer_.put());
+    d2d_->CreateBitmap(D2D1::SizeU(shapeW, shapeH), shape.data(), shapeW * 4, &props, pointer_.put());
+    stale_ = true;
 }
 
-// Under Gfx::deviceMutex: the screen, the pointer over it, and out.
+// The screen, the pointer over it, and out. Only what changed is copied into
+// frame_, including the area the pointer covered last time.
 void DuplicationCapture::Compose() {
     auto& g = Gfx::Get();
-    g.ctx->CopyResource(frame_.get(), composite_.get());
+    const auto restore = [&](const RECT& r) {
+        if (IsRectEmpty(&r)) return;
+        const D3D11_BOX box = Box(r);
+        g.ctx->CopySubresourceRegion(frame_.get(), 0, static_cast<UINT>(r.left), static_cast<UINT>(r.top), 0,
+                                     composite_.get(), 0, &box);
+    };
+    if (damageAll_) {
+        g.ctx->CopyResource(frame_.get(), composite_.get());
+    } else {
+        for (const RECT& r : damage_) restore(r);
+        restore(pointerDrawn_);
+    }
+    damage_.clear();
+    damageAll_ = false;
+    stale_ = false;
+    pointerDrawn_ = RECT{};
+
     if (pointerVisible_ && pointer_ && d2d_ && target_) {
         const D2D1_SIZE_U size = pointer_->GetPixelSize();
         const float x = static_cast<float>(pointerAt_.x), y = static_cast<float>(pointerAt_.y);
@@ -264,66 +375,96 @@ void DuplicationCapture::Compose() {
         const HRESULT hr = d2d_->EndDraw();
         d2d_->SetTarget(nullptr);
         if (FAILED(hr)) g.CheckDevice(hr);
+        const RECT drawn{ pointerAt_.x, pointerAt_.y, pointerAt_.x + static_cast<LONG>(size.width),
+                          pointerAt_.y + static_cast<LONG>(size.height) };
+        IntersectRect(&pointerDrawn_, &drawn, &bounds_);
     }
+    const auto now = std::chrono::steady_clock::now();
+    nextCompose_ = (std::max)(nextCompose_, now - interval_) + interval_;
     if (onFrame_) onFrame_(frame_.get());
+}
+
+// Composes the latest picture if someone wants it and the frame rate allows.
+// Returns how long the caller may wait for the next change: if a compose is
+// put off, only until it is due, so the last change is never left out.
+UINT DuplicationCapture::ComposeIfDue() {
+    const bool wanted = wanted_ && wanted_();
+    std::lock_guard lock(Gfx::Get().deviceMutex);
+    if (!wanted || !stale_ || !havePicture_ || !frame_) return kIdleWaitMs;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < nextCompose_) {
+        return static_cast<UINT>(std::chrono::ceil<std::chrono::milliseconds>(nextCompose_ - now).count());
+    }
+    Compose();
+    return kIdleWaitMs;
+}
+
+void DuplicationCapture::RunOutput(size_t index) {
+    // A new thread starts on the process's desktop, not the input desktop.
+    if (index > 0 && desktop_) SetThreadDesktop(desktop_);
+    Output& out = outputs_[index];
+    auto& g = Gfx::Get();
+    UINT waitMs = kIdleWaitMs;
+    std::vector<uint32_t> shape;
+    while (running_ && !lost_) {
+        DXGI_OUTDUPL_FRAME_INFO info{};
+        winrt::com_ptr<IDXGIResource> resource;
+        const HRESULT hr = out.dup->AcquireNextFrame(waitMs, &info, resource.put());
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            waitMs = ComposeIfDue();
+            continue;
+        }
+        if (FAILED(hr)) {
+            // DXGI_ERROR_ACCESS_LOST: the desktop switched or the mode changed.
+            Log(L"login: duplication ended (0x%08X); attaching again", static_cast<unsigned>(hr));
+            g.CheckDevice(hr);
+            lost_ = true;
+            break;
+        }
+
+        // Everything that needs no device lock first.
+        const bool presented = info.LastPresentTime.QuadPart != 0 && resource;
+        const bool whole = presented && (out.whole || !ReadChanges(out, info.TotalMetadataBufferSize));
+        UINT shapeW = 0, shapeH = 0;
+        shape.clear();
+        if (info.PointerShapeBufferSize > 0) {
+            out.shape.resize(info.PointerShapeBufferSize);
+            UINT used = 0;
+            DXGI_OUTDUPL_POINTER_SHAPE_INFO si{};
+            if (SUCCEEDED(out.dup->GetFramePointerShape(static_cast<UINT>(out.shape.size()), out.shape.data(),
+                                                        &used, &si)) &&
+                si.Width != 0 && si.Height != 0) {
+                shape = PointerPixels(si, out.shape.data(), shapeW, shapeH);
+            }
+        }
+        {
+            std::lock_guard lock(g.deviceMutex);
+            if (presented) {
+                if (auto texture = resource.try_as<ID3D11Texture2D>()) CopyChanges(out, texture.get(), whole);
+            }
+            if (info.LastMouseUpdateTime.QuadPart != 0 || !shape.empty()) {
+                TakePointer(out, index, info, shape, shapeW, shapeH);
+            }
+        }
+        out.dup->ReleaseFrame();
+        waitMs = ComposeIfDue();
+    }
 }
 
 void DuplicationCapture::Loop() {
     while (running_) {
-        if (outputs_.empty() && !Attach()) {
+        if (!Attach()) {
             for (DWORD waited = 0; waited < kRetryMs && running_; waited += 50) Sleep(50);
             continue;
         }
-        const UINT waitMs = outputs_.size() == 1 ? kSingleOutputWaitMs : kMultiOutputWaitMs;
-        bool changed = false, lost = false;
-        auto& g = Gfx::Get();
-        for (size_t i = 0; i < outputs_.size() && running_; ++i) {
-            Output& out = outputs_[i];
-            DXGI_OUTDUPL_FRAME_INFO info{};
-            winrt::com_ptr<IDXGIResource> resource;
-            const HRESULT hr = out.dup->AcquireNextFrame(waitMs, &info, resource.put());
-            if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-            if (FAILED(hr)) {
-                // DXGI_ERROR_ACCESS_LOST: the desktop switched or the mode changed.
-                Log(L"login: duplication ended (0x%08X); attaching again", static_cast<unsigned>(hr));
-                g.CheckDevice(hr);
-                lost = true;
-                break;
-            }
-            {
-                std::lock_guard lock(g.deviceMutex);
-                if (info.LastPresentTime.QuadPart != 0 && resource) {
-                    if (auto texture = resource.try_as<ID3D11Texture2D>()) {
-                        D3D11_TEXTURE2D_DESC td{};
-                        texture->GetDesc(&td);
-                        const LONG right = (std::min)(static_cast<LONG>(td.Width), size_.cx - out.at.x);
-                        const LONG bottom = (std::min)(static_cast<LONG>(td.Height), size_.cy - out.at.y);
-                        if (out.at.x >= 0 && out.at.y >= 0 && right > 0 && bottom > 0) {
-                            const D3D11_BOX box{ 0, 0, 0, static_cast<UINT>(right), static_cast<UINT>(bottom), 1 };
-                            g.ctx->CopySubresourceRegion(composite_.get(), 0, static_cast<UINT>(out.at.x),
-                                                         static_cast<UINT>(out.at.y), 0, texture.get(), 0, &box);
-                            havePicture_ = true;
-                            changed = true;
-                        }
-                    }
-                }
-                if (info.LastMouseUpdateTime.QuadPart != 0 || info.PointerShapeBufferSize > 0) {
-                    TakePointer(out, i, info);
-                    changed = true;
-                }
-            }
-            out.dup->ReleaseFrame();
-        }
-        if (lost) {
-            Detach();
-            continue;
-        }
-        if (changed) {
-            std::lock_guard lock(g.deviceMutex);
-            if (havePicture_) Compose();
-        }
+        // The first monitor on this thread: one monitor needs no other.
+        lost_ = false;
+        std::vector<std::thread> others;
+        for (size_t i = 1; i < outputs_.size(); ++i) others.emplace_back([this, i] { RunOutput(i); });
+        RunOutput(0);
+        for (auto& t : others) t.join();
+        outputs_.clear();
     }
-    Detach();
 }
 
 }  // namespace rvm::login

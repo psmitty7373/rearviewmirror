@@ -22,14 +22,16 @@ SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
 HANDLE g_stop = nullptr;   // The service is to stop.
 HANDLE g_wake = nullptr;   // A session changed: look again.
 
-void Report(DWORD state, DWORD waitHintMs = 0) {
+bool g_trustedDir = false;
+
+void Report(DWORD state, DWORD waitHintMs = 0, DWORD exitCode = NO_ERROR) {
     static DWORD checkpoint = 1;
     SERVICE_STATUS s{};
     s.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     s.dwCurrentState = state;
     s.dwControlsAccepted =
         state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE : 0;
-    s.dwWin32ExitCode = NO_ERROR;
+    s.dwWin32ExitCode = exitCode;
     s.dwWaitHint = waitHintMs;
     s.dwCheckPoint = (state == SERVICE_RUNNING || state == SERVICE_STOPPED) ? 0 : checkpoint++;
     SetServiceStatus(g_statusHandle, &s);
@@ -83,8 +85,9 @@ bool SignedIn(DWORD session) {
 }
 
 // The helper is this executable again, as SYSTEM like the service, but in the
-// console session and on its sign-in desktop, where the screen is.
-HANDLE LaunchHelper(DWORD session) {
+// console session and on its sign-in desktop, where the screen is. Handles
+// cannot be inherited across sessions, so it duplicates `stopEvent` from here.
+HANDLE LaunchHelper(DWORD session, HANDLE stopEvent) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
 
@@ -95,7 +98,8 @@ HANDLE LaunchHelper(DWORD session) {
         SetTokenInformation(token, TokenSessionId, &session, sizeof(session))) {
         STARTUPINFOW si{ sizeof(si) };
         si.lpDesktop = const_cast<wchar_t*>(L"winsta0\\winlogon");
-        std::wstring command = L"\"" + std::wstring(exe) + L"\" --helper";
+        std::wstring command = L"\"" + std::wstring(exe) + L"\" --helper " + std::to_wstring(GetCurrentProcessId()) +
+                               L" " + std::to_wstring(reinterpret_cast<uintptr_t>(stopEvent));
         PROCESS_INFORMATION pi{};
         if (CreateProcessAsUserW(token, exe, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
                                  nullptr, nullptr, &si, &pi)) {
@@ -133,13 +137,15 @@ Console ConsoleShows(DWORD session) {
 }
 
 // Keeps exactly one helper running, in the console session, while the console
-// shows a sign-in or lock screen, and none otherwise.
-void Supervise() {
-    HANDLE helperStop = CreateEventW(nullptr, TRUE, FALSE, kHelperStopEvent);
+// shows a sign-in or lock screen, and none otherwise. Returns why it stopped.
+DWORD Supervise() {
+    HANDLE helperStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!helperStop) {
-        Log(L"service: cannot create the helper's stop event (%lu)", GetLastError());
-        return;
+        const DWORD error = GetLastError();
+        Log(L"service: cannot create the helper's stop event (%lu)", error);
+        return error;
     }
+    DWORD result = NO_ERROR;
     HANDLE helper = nullptr;
     DWORD helperSession = kNoSession;
     ULONGLONG helperStarted = 0, nextLaunch = 0;
@@ -178,7 +184,7 @@ void Supervise() {
         }
         if (wanted && !helper && now >= nextLaunch) {
             ResetEvent(helperStop);
-            helper = LaunchHelper(console);
+            helper = LaunchHelper(console, helperStop);
             if (helper) {
                 helperSession = console;
                 helperStarted = now;
@@ -198,29 +204,51 @@ void Supervise() {
         const HANDLE waits[] = { g_stop, g_wake, helper };
         const DWORD woke = WaitForMultipleObjects(helper ? 3 : 2, waits, FALSE, timeout);
         if (woke == WAIT_OBJECT_0) break;
+        if (woke == WAIT_FAILED) {
+            result = GetLastError();
+            Log(L"service: waiting failed (%lu); stopping", result);
+            break;
+        }
     }
     if (helper) StopHelper(helper, helperStop, L"the service is stopping");
     CloseHandle(helperStop);
+    return result;
 }
 
 void WINAPI ServiceMain(DWORD, LPWSTR*) {
     g_statusHandle = RegisterServiceCtrlHandlerExW(kServiceName, &Control, nullptr);
     if (!g_statusHandle) return;
+    if (!g_trustedDir) {
+        // Nowhere safe to log: Windows records the error.
+        Report(SERVICE_STOPPED, 0, ERROR_ACCESS_DENIED);
+        return;
+    }
     g_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_stop || !g_wake) {
+        const DWORD error = GetLastError();
+        Log(L"service: cannot create its events (%lu)", error);
+        Report(SERVICE_STOPPED, 0, error);
+        return;
+    }
     Report(SERVICE_RUNNING);
     Log(L"service: running");
-    Supervise();
+    const DWORD result = Supervise();
     Log(L"service: stopped");
-    Report(SERVICE_STOPPED);
+    Report(SERVICE_STOPPED, 0, result);
 }
 
 }  // namespace
 
 int RunService() {
-    SetConfigDir(MachineDir());
-    LogOpen(L"service");
-    InstallCrashHandler(L"service");
+    // A folder anyone else could have made or changed is not trusted with
+    // the key, nor written to as SYSTEM.
+    g_trustedDir = MachineDirTrusted();
+    if (g_trustedDir) {
+        SetConfigDir(MachineDir());
+        LogOpen(L"service");
+        InstallCrashHandler(L"service");
+    }
     SERVICE_TABLE_ENTRYW table[] = { { const_cast<wchar_t*>(kServiceName), &ServiceMain }, { nullptr, nullptr } };
     if (!StartServiceCtrlDispatcherW(table)) {
         if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {

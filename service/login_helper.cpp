@@ -29,8 +29,12 @@ BOOL WINAPI OnConsoleCtrl(DWORD) {
 // Started by hand (--helper-test), it does the same for the current session
 // with the current user's streaming settings, to try the capture and stream
 // without installing anything.
-int RunLoginHelper(bool byService, uint16_t portOverride) {
-    if (byService) SetConfigDir(MachineDir());
+int RunLoginHelper(const ServiceLink* service, uint16_t portOverride) {
+    const bool byService = service != nullptr;
+    if (byService) {
+        if (!MachineDirTrusted()) return 5;   // Not even to log: see RunService.
+        SetConfigDir(MachineDir());
+    }
     LogOpen(L"login");
     InstallCrashHandler(L"login");
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -45,7 +49,7 @@ int RunLoginHelper(bool byService, uint16_t portOverride) {
     StreamSettings settings;
     if (byService) {
         if (!LoadLoginSettings(settings)) {
-            Log(L"login: no sign-in settings; run RearViewMirrorService.exe --install");
+            Log(L"login: no usable sign-in settings; run RearViewMirrorService.exe --install");
             return 2;
         }
     } else {
@@ -58,10 +62,21 @@ int RunLoginHelper(bool byService, uint16_t portOverride) {
     }
     if (portOverride) settings.port = portOverride;
 
-    HANDLE stop = byService ? OpenEventW(SYNCHRONIZE, FALSE, kHelperStopEvent)
-                            : CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    // Started by the service: its stop event, and the service itself, so that
+    // a helper whose service died does not hold the port on its own.
+    HANDLE stop = nullptr, serviceProcess = nullptr;
+    if (byService) {
+        serviceProcess = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, service->pid);
+        if (serviceProcess && !DuplicateHandle(serviceProcess, reinterpret_cast<HANDLE>(service->stopEvent),
+                                               GetCurrentProcess(), &stop, SYNCHRONIZE, FALSE, 0)) {
+            stop = nullptr;
+        }
+    } else {
+        stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
     if (!stop) {
         Log(L"login: no stop event (%lu)", GetLastError());
+        if (serviceProcess) CloseHandle(serviceProcess);
         return 2;
     }
     if (!byService) {
@@ -99,14 +114,16 @@ int RunLoginHelper(bool byService, uint16_t portOverride) {
             // The whole virtual screen, so it can be controlled where control is built.
             server.SetMirrorList({ { kLoginScreenMirrorId, L"Sign-in screen", static_cast<UINT>(size.cx),
                                      static_cast<UINT>(size.cy), RVM_REMOTE_CONTROL != 0 } });
-        });
+        },
+        [&server] { return server.Watched(kLoginScreenMirrorId); }, settings.fps);
     if (!byService) {
         wprintf(L"Streaming this session's screen on UDP port %u. Ctrl+C stops.\n", settings.port);
     }
 
     // The app may still hold the port for a moment after a sign-out, or for
     // good if someone left it running in a disconnected session: keep trying.
-    const HANDLE waits[] = { stop, lost };
+    const HANDLE waits[] = { stop, lost, serviceProcess };
+    const DWORD waitCount = serviceProcess ? 3 : 2;
     bool warned = false;
     for (;;) {
         if (!server.Running()) {
@@ -118,9 +135,8 @@ int RunLoginHelper(bool byService, uint16_t portOverride) {
                 warned = true;
             }
         }
-        const DWORD woke = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE,
-                                                  server.Running() ? INFINITE : 3000);
-        if (woke == WAIT_OBJECT_0 || woke == WAIT_OBJECT_0 + 1) break;
+        const DWORD woke = WaitForMultipleObjects(waitCount, waits, FALSE, server.Running() ? INFINITE : 3000);
+        if (woke != WAIT_TIMEOUT) break;
     }
     const bool deviceLost = WaitForSingleObject(lost, 0) == WAIT_OBJECT_0;
 
@@ -128,7 +144,8 @@ int RunLoginHelper(bool byService, uint16_t portOverride) {
     server.Stop();   // Says goodbye: clients reconnect to whatever serves the port next.
     Log(L"login: helper stopped");
     CloseHandle(lost);
-    if (!byService) CloseHandle(stop);
+    CloseHandle(stop);
+    if (serviceProcess) CloseHandle(serviceProcess);
     if (SUCCEEDED(com)) CoUninitialize();
     return deviceLost ? 4 : 0;
 }

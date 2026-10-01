@@ -54,6 +54,57 @@ int ReadInt(const wchar_t* key, int fallback, const std::wstring& path) {
     return static_cast<int>(GetPrivateProfileIntW(L"Login", key, fallback, path.c_str()));
 }
 
+bool SystemOrAdmins(PSID sid) {
+    return sid && (IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid));
+}
+
+// The entry itself, never what it links to.
+HANDLE OpenEntry(const std::wstring& path, DWORD access) {
+    return CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                       OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+// A real folder, not a link, owned by SYSTEM or Administrators, allowing
+// nobody else anything.
+bool Trusted(HANDLE dir) {
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandleEx(dir, FileBasicInfo, &basic, sizeof(basic)) ||
+        (basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || !(basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return false;
+    }
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (GetSecurityInfo(dir, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner,
+                        nullptr, &dacl, nullptr, &sd) != ERROR_SUCCESS) {
+        return false;
+    }
+    bool ok = SystemOrAdmins(owner) && dacl;   // A null DACL allows everyone everything.
+    for (WORD i = 0; ok && i < dacl->AceCount; ++i) {
+        void* ace = nullptr;
+        ok = GetAce(dacl, i, &ace);
+        const auto* header = static_cast<const ACE_HEADER*>(ace);
+        if (ok && header->AceType != ACCESS_DENIED_ACE_TYPE) {
+            ok = header->AceType == ACCESS_ALLOWED_ACE_TYPE &&
+                 SystemOrAdmins(&static_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart);
+        }
+    }
+    LocalFree(sd);
+    return ok;
+}
+
+// Out of the way: a link is removed (the link, not its target), anything else
+// renamed, since its contents are not ours to delete.
+bool RemoveUntrusted(const std::wstring& path, std::wstring& movedAside) {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return (attrs & FILE_ATTRIBUTE_DIRECTORY) ? RemoveDirectoryW(path.c_str()) : DeleteFileW(path.c_str());
+    }
+    movedAside = path + L".untrusted-" + std::to_wstring(GetTickCount64());
+    return MoveFileExW(path.c_str(), movedAside.c_str(), 0);
+}
+
 }  // namespace
 
 std::wstring MachineDir() {
@@ -66,7 +117,8 @@ std::wstring MachineDir() {
     return dir;
 }
 
-bool SecureMachineDir() {
+bool SecureMachineDir(std::wstring& movedAside) {
+    movedAside.clear();
     const std::wstring dir = MachineDir();
     if (dir.empty()) return false;
 
@@ -75,28 +127,48 @@ bool SecureMachineDir() {
                                                               nullptr)) {
         return false;
     }
-    SECURITY_ATTRIBUTES sa{ sizeof(sa), sd, FALSE };
-    bool ok = CreateDirectoryW(dir.c_str(), &sa) || GetLastError() == ERROR_ALREADY_EXISTS;
-    if (ok) {
-        // Whether just made or found: the rules are applied either way, owner
-        // included, so a folder planted in advance is not trusted as found.
-        BOOL present = FALSE, defaulted = FALSE;
-        PACL dacl = nullptr;
-        PSID owner = nullptr;
-        ok = GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) &&
-             GetSecurityDescriptorOwner(sd, &owner, &defaulted) &&
-             SetNamedSecurityInfoW(const_cast<wchar_t*>(dir.c_str()), SE_FILE_OBJECT,
-                                   OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
-                                       PROTECTED_DACL_SECURITY_INFORMATION,
-                                   owner, nullptr, dacl, nullptr) == ERROR_SUCCESS;
+    constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES;
+    HANDLE handle = OpenEntry(dir, kAccess);
+    const DWORD openError = GetLastError();
+    bool ok = true;
+    if (handle == INVALID_HANDLE_VALUE ? openError != ERROR_FILE_NOT_FOUND : !Trusted(handle)) {
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        handle = INVALID_HANDLE_VALUE;
+        ok = RemoveUntrusted(dir, movedAside);
     }
+    if (ok && handle == INVALID_HANDLE_VALUE) {
+        // Has to be new: one that appeared meanwhile is not ours either.
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), sd, FALSE };
+        if (CreateDirectoryW(dir.c_str(), &sa)) handle = OpenEntry(dir, kAccess);
+    }
+    BOOL present = FALSE, defaulted = FALSE;
+    PACL dacl = nullptr;
+    PSID owner = nullptr;
+    ok = ok && handle != INVALID_HANDLE_VALUE && GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) &&
+         GetSecurityDescriptorOwner(sd, &owner, &defaulted) &&
+         SetSecurityInfo(handle, SE_FILE_OBJECT,
+                         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                             PROTECTED_DACL_SECURITY_INFORMATION,
+                         owner, nullptr, dacl, nullptr) == ERROR_SUCCESS &&
+         Trusted(handle);
+    if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
     LocalFree(sd);
+    return ok;
+}
+
+bool MachineDirTrusted() {
+    const std::wstring dir = MachineDir();
+    if (dir.empty()) return false;
+    const HANDLE handle = OpenEntry(dir, READ_CONTROL | FILE_READ_ATTRIBUTES);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    const bool ok = Trusted(handle);
+    CloseHandle(handle);
     return ok;
 }
 
 bool SaveLoginSettings(const StreamSettings& s) {
     std::vector<uint8_t> blob;
-    if (s.key.empty() || !ProtectForMachine(s.key, blob)) return false;
+    if (s.key.size() < kMinLoginKeyChars || !ProtectForMachine(s.key, blob)) return false;
     std::wstring text = L"[Login]\r\n";
     text += L"Port=" + std::to_wstring(s.port) + L"\r\n";
     text += L"BitrateKbps=" + std::to_wstring(s.bitrateKbps) + L"\r\n";
@@ -111,7 +183,7 @@ bool LoadLoginSettings(StreamSettings& s) {
     wchar_t hex[4096]{};
     GetPrivateProfileStringW(L"Login", L"KeyBlob", L"", hex, ARRAYSIZE(hex), path.c_str());
     std::wstring key;
-    if (!UnprotectForMachine(net::FromHex(hex), key) || key.empty()) return false;
+    if (!UnprotectForMachine(net::FromHex(hex), key) || key.size() < kMinLoginKeyChars) return false;
     s = StreamSettings{};
     s.enabled     = true;
     s.key         = std::move(key);

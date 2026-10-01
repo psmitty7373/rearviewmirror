@@ -29,22 +29,27 @@ constexpr wchar_t kServiceDescription[] =
     L"Streams the Windows sign-in screen to Rear View Mirror clients while nobody is signed in, "
     L"so the PC can be signed in to remotely after a restart.";
 
-// Set by the service to stop the helper it started.
-constexpr wchar_t kHelperStopEvent[] = L"Global\\RearViewMirrorLogin.Stop";
-
 // The sign-in screen's mirror id: far above the app's ids, which count up
 // from 1, so a client never mistakes one for the other.
 constexpr uint32_t kLoginScreenMirrorId = 0x7F000001;
+
+// How the service's helper is started: `--helper <service pid> <stop event>`,
+// the event being the service's handle to an unnamed event, which the helper
+// duplicates. Nothing named that anyone could make first or signal.
+struct ServiceLink {
+    DWORD     pid = 0;
+    uintptr_t stopEvent = 0;
+};
 
 int RunInstall();
 int RunUninstall();
 int RunService();
 
-// `byService`: started by the service, which stops it through
-// kHelperStopEvent, with the machine's sign-in settings. Otherwise it was
-// started by hand (--helper-test), for testing in the current session with the
-// current user's streaming settings, and stops on Ctrl+C. `portOverride`, if
-// not 0, serves on that port instead, beside a running app.
-int RunLoginHelper(bool byService, uint16_t portOverride = 0);
+// `service`: started by the service, which stops it through its event, with
+// the machine's sign-in settings. Null: started by hand (--helper-test), for
+// testing in the current session with the current user's streaming settings,
+// and stops on Ctrl+C. `portOverride`, if not 0, serves on that port instead,
+// beside a running app.
+int RunLoginHelper(const ServiceLink* service, uint16_t portOverride = 0);
 
 }  // namespace rvm::login

@@ -125,9 +125,11 @@ int RunInstall() {
     // The current user's streaming settings: the sign-in screen is served on
     // the same port with the same key, so a client sees one server.
     const StreamSettings user = LoadStreamSettings();
-    if (user.key.empty()) {
-        fwprintf(stderr, L"Rear View Mirror has no streaming key for this account. Open Streaming in the "
-                         L"manager, set a key, and run this again.\n");
+    if (user.key.size() < kMinLoginKeyChars) {
+        fwprintf(stderr, L"This account's streaming key is missing or shorter than %zu characters: too weak to "
+                         L"guard the sign-in screen. Press Generate in Rear View Mirror's Streaming dialog, then "
+                         L"run --install again.\n",
+                 kMinLoginKeyChars);
         return 1;
     }
 
@@ -152,7 +154,11 @@ int RunInstall() {
         CopyFileW((SelfDir() + L"\\" + kPdbName).c_str(), (dir + L"\\" + kPdbName).c_str(), FALSE);
     }
 
-    if (!SecureMachineDir()) return Fail(L"Cannot create the settings folder in ProgramData.");
+    std::wstring movedAside;
+    if (!SecureMachineDir(movedAside)) return Fail(L"Cannot create the settings folder in ProgramData.");
+    if (!movedAside.empty()) {
+        wprintf(L"A folder someone else made was in the way; it is now %s\n", movedAside.c_str());
+    }
     if (!SaveLoginSettings(user)) return Fail(L"Cannot save the sign-in settings.");
     const bool firewall = SetFirewallRule(&exe, user.port);
 
@@ -226,9 +232,10 @@ int RunUninstall() {
         DeleteFileOrLater(dir + L"\\" + kPdbName);
         RemoveDirectoryW(dir.c_str());   // Only if nothing else is in it.
     }
-    // The settings, with the key, and the logs: the folder is ours alone.
+    // The settings, with the key, and the logs, if the folder is ours: one
+    // someone else made, or a link, is no place to delete things in.
     const std::wstring data = MachineDir();
-    if (!data.empty()) {
+    if (!data.empty() && MachineDirTrusted()) {
         WIN32_FIND_DATAW found{};
         HANDLE find = FindFirstFileW((data + L"\\*").c_str(), &found);
         if (find != INVALID_HANDLE_VALUE) {
