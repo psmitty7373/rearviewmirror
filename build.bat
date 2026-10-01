@@ -6,6 +6,7 @@ set "ROOT=%~dp0"
 set "CFG="
 set "TGT="
 set "FEATURES="
+set "LOGIN="
 set "SIGNING="
 set "NO_PAUSE="
 
@@ -29,6 +30,17 @@ if /i "%~1"=="--streaming-only" (
 )
 if /i "%~1"=="--mirrors-only" (
     set "FEATURES=-DRVM_STREAMING=OFF -DRVM_REMOTE_CONTROL=OFF"
+    set "LOGIN=-DRVM_LOGIN_SERVICE=OFF"
+    shift
+    goto args
+)
+if /i "%~1"=="--login-service" (
+    set "LOGIN=-DRVM_LOGIN_SERVICE=ON"
+    shift
+    goto args
+)
+if /i "%~1"=="--no-login-service" (
+    set "LOGIN=-DRVM_LOGIN_SERVICE=OFF"
     shift
     goto args
 )
@@ -85,7 +97,7 @@ if errorlevel 1 (
 )
 
 cd /d "%ROOT%" || goto fail
-cmake -G Ninja -S . -B build "-DCMAKE_BUILD_TYPE=%CFG%" %FEATURES% %SIGNING% || goto fail
+cmake -G Ninja -S . -B build "-DCMAKE_BUILD_TYPE=%CFG%" %FEATURES% %LOGIN% %SIGNING% || goto fail
 if defined TGT (
     cmake --build build --target "%TGT%" || goto fail
 ) else (
@@ -104,6 +116,8 @@ echo.
 echo   --remote-control  Build streaming and full-desktop control
 echo   --streaming-only  Build streaming without remote control
 echo   --mirrors-only    Build local mirrors without networking or the client
+echo   --login-service   Also build the sign-in screen service (needs streaming)
+echo   --no-login-service  Leave the sign-in screen service out
 echo   --no-sign         Disable executable signing
 echo   --sign            Re-enable signing after an earlier --no-sign
 echo   --no-pause        Exit without waiting for a key

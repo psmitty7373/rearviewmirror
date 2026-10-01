@@ -9,11 +9,18 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     // A relaunch after a lost graphics device waits for the old process to go.
     const bool relaunched = rvm::WaitForPreviousInstance();
 
-    // Only one instance: a second launch just asks the first for a new mirror.
+    // Only one instance: a second launch brings up the first one's manager.
+    // Mirrors are only ever made when asked for, from the manager, the tray
+    // or the hotkey.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\RearViewMirror.Instance");
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND existing = FindWindowW(rvm::kAppWindowClass, nullptr)) {
-            PostMessageW(existing, rvm::WM_RVM_NEW_MIRROR, 0, 0);
+            // This process was just launched, so it may take the foreground;
+            // pass that on, or the manager would open behind other windows.
+            DWORD pid = 0;
+            GetWindowThreadProcessId(existing, &pid);
+            AllowSetForegroundWindow(pid);
+            PostMessageW(existing, rvm::WM_RVM_SHOW_MANAGER, 0, 0);
         }
         CloseHandle(mutex);
         return 0;

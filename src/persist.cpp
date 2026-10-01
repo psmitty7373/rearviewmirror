@@ -214,7 +214,16 @@ BOOL CALLBACK MonitorContainsProc(HMONITOR, HDC, LPRECT, LPARAM lp) {
 
 }  // namespace
 
+namespace {
+std::wstring g_configDirOverride;
+}
+
+void SetConfigDir(const std::wstring& dir) {
+    g_configDirOverride = dir;
+}
+
 std::wstring ConfigDir() {
+    if (!g_configDirOverride.empty()) return g_configDirOverride;
     static const std::wstring dir = [] {
         // The roaming AppData folder from the shell, not the environment,
         // which can be missing or overridden.

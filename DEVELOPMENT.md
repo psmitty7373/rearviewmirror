@@ -27,6 +27,7 @@ How Rear View Mirror works inside, and why. For using and building it, see
 | `src/stream_server.*` | Serves mirrors: encoders, sessions, retransmits, limits |
 | `src/stream_settings.*` | Streaming settings file and dialog |
 | `client/` | Client: connection, decode, canvas, pop-out windows, settings |
+| `service/` | Optional sign-in screen service: install, session supervisor, Desktop Duplication helper |
 | `tests/net_test.cpp` | Headless tests for the streaming stack |
 | `tools/sign.ps1` | Code-signing certificate management and signing |
 
@@ -390,6 +391,91 @@ unsubscribe, capability loss, disconnect, shutdown, or a 1.5-second lease
 timeout. Missing acknowledgements or a full client queue also end control.
 Reconnect restores viewing only. Tests inject into a recording sink, never
 the machine's actual keyboard or mouse.
+
+## Optional sign-in screen service
+
+`RVM_LOGIN_SERVICE` (default `OFF`, requires `RVM_STREAMING`) builds
+`RearViewMirrorService.exe` from `service/`. It is a separate executable. Its
+hooks in shared code are `SetConfigDir`, which points a process's logs and crash
+dumps somewhere other than a user's AppData, the `StreamServer` it reuses as is,
+and the app's handoff below, compiled only with the option
+(`src/login_handoff.*`, `#if RVM_LOGIN_SERVICE`).
+
+**Why a service, and why a helper.** Services run in session 0, which has no
+screen. The sign-in screen is the Winlogon desktop of the console session, and
+only a LocalSystem process on that desktop can capture it or send it input.
+So the service runs nothing but a supervisor. Its helper is the same executable
+with `--helper`, launched as SYSTEM into the console session: the service's own
+token is duplicated, given the console's session id, and passed to
+`CreateProcessAsUserW` with the desktop `winsta0\winlogon`.
+
+**When it runs.** The rule is that whatever the console shows is what gets
+streamed. The supervisor keeps exactly one helper alive, in the console
+session, while that session has nobody signed in or is locked, and none
+otherwise. Session-change notifications (sign-in, sign-out, lock, unlock,
+console connect) wake it, and it checks every 5 s regardless. Signing in counts
+from the moment Windows records a user name, which is before the desktop
+appears. A helper that exits is started again, with a
+backoff from 1 s to a minute if it keeps exiting quickly. It is stopped through
+a named event, and ended after 5 s if it does not stop.
+
+**What the helper does.** Windows Graphics Capture is not built for secure
+desktops, so `DuplicationCapture` uses DXGI Desktop Duplication instead. It
+copies each monitor of the device's adapter to its place in one virtual-screen
+texture, draws the pointer, which duplication reports separately, on top with
+Direct2D, and tees the result into a `StreamServer` as mirror `0x7F000001`,
+"Sign-in screen". It serves on the app's port with the app's key, so a client
+sees one server throughout: the sign-in screen, a brief reconnect, then the
+app's mirrors. Duplication ends at every desktop switch or mode change; the
+capture thread then moves itself to the new input desktop with
+`OpenInputDesktop` and `SetThreadDesktop` and attaches again.
+
+**The handoff.** Both serve on one port, so the app lets go of it whenever its
+session is not what the console shows: locked, disconnected after Remote
+Desktop, remote while Remote Desktop is connected, or switched away from. It
+watches its own session's changes (`WTSRegisterSessionNotification`) and pauses
+`Streaming`, which stops the server without touching the settings. It does so
+only while the service is running, so without the service a locked app streams
+as it always did. Back on the console and unlocked, it unpauses, trying each
+second for half a minute while the helper lets go of the port; the app also
+starts that way, since right after signing in the helper may still hold it.
+While handed off it looks again every 5 s, in case a notification came while
+the console was between sessions, or the service stopped.
+
+**Remote input needs nothing new.** Every thread of the helper starts on the
+Winlogon desktop, and that stays the input desktop for as long as the helper
+runs, since it is stopped the moment the console shows a desktop. So the existing
+`ControlHost` injects from the server's network thread exactly as it does in
+the app, with `MOUSEEVENTF_VIRTUALDESK` addressing the same whole-screen
+picture.
+
+**Settings and trust.** Nobody is signed in when the helper runs, so neither
+`%APPDATA%` nor a key encrypted to a user will do. `--install` (elevated) copies
+the current user's port, key, bitrate, frame rate and preset to
+`%ProgramData%\RearViewMirror\login.ini`, with the key encrypted to the machine
+(DPAPI local-machine scope). The folder's protected DACL, owned by
+Administrators and granting only SYSTEM and Administrators, is what keeps it
+private, and it is re-applied on every install, so a folder planted in advance
+is taken over rather than trusted. The service binary is copied to
+`%ProgramFiles%\RearViewMirror` first: a SYSTEM service running from a folder
+its user can write would hand that user SYSTEM. Logs and crash dumps go to the
+same ProgramData folder. Windows Firewall would ask before letting the helper's
+port in, and nobody can answer at the sign-in screen, so `--install` adds a
+rule as narrow as it can be: that program, inbound UDP, that port, private and
+domain networks. `--uninstall` removes it.
+
+**Not covered yet.**
+- An app from before the handoff, or one built without the option, keeps the
+  port in a locked or disconnected session; the helper keeps trying until it is
+  free.
+- While Remote Desktop is connected, the app's session is remote, so the client
+  sees the console's sign-in screen rather than the Remote Desktop session.
+- Ctrl+Alt+Delete is not sent (`SendSAS`). Windows 11 does not ask for it at
+  sign-in unless a policy requires it.
+- Monitors on a second adapter are not duplicated; they stay black.
+- Inverting pointer pixels (the text I-beam) are drawn black.
+- Secure desktops cannot be tested headlessly. `--helper-test` runs the
+  capture and stream in the current session, by hand.
 
 ## Platform notes
 

@@ -45,6 +45,13 @@ public:
     // Mirrors were added, removed, switched or resized: republish the list.
     void MirrorsChanged();
 
+    // Paused, nothing is served and the port is free for someone else: the
+    // sign-in service, while this session is not the one on the console. The
+    // settings are untouched. Unpausing serves again if they say so; false if
+    // that should happen but could not, most likely because the port has not
+    // been let go yet, for the caller to try again.
+    bool SetPaused(bool paused);
+
     bool   Running() const;
     size_t Clients() const;
 

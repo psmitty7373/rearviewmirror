@@ -314,6 +314,9 @@ void Mirror::Orphan() {
 bool Mirror::RestartDesktop() {
     if (!hwnd_ || !IsDesktop() || !state_.enabled) return true;
     StopCapture();
+    // Stopping pumps messages (a COM call waits inside it), and one of them
+    // can retire this mirror; a retired one must not start capturing again.
+    if (!hwnd_) return true;
     if (StartCapture()) {
         orphaned_ = false;
         UpdateVisibility();

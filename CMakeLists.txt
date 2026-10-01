@@ -72,6 +72,13 @@ option(RVM_REMOTE_CONTROL "Allow focused mouse and keyboard control of full-desk
 if(RVM_REMOTE_CONTROL AND NOT RVM_STREAMING)
     message(FATAL_ERROR "RVM_REMOTE_CONTROL requires RVM_STREAMING=ON")
 endif()
+option(RVM_LOGIN_SERVICE "Build the service that streams the sign-in screen while nobody is signed in" OFF)
+if(RVM_LOGIN_SERVICE AND NOT RVM_STREAMING)
+    message(FATAL_ERROR "RVM_LOGIN_SERVICE requires RVM_STREAMING=ON")
+endif()
+# Like RVM_REMOTE_CONTROL: numeric, for #if, defined in every build. The app's
+# side of it is letting go of the port while the service streams the console.
+target_compile_definitions(rvm_options INTERFACE RVM_LOGIN_SERVICE=$<BOOL:${RVM_LOGIN_SERVICE}>)
 # A numeric definition, shared by every target so public class layouts agree.
 # Use #if RVM_REMOTE_CONTROL: the macro is defined as 0 in disabled builds.
 target_compile_definitions(rvm_options INTERFACE RVM_REMOTE_CONTROL=$<BOOL:${RVM_REMOTE_CONTROL}>)
@@ -115,6 +122,9 @@ if(RVM_STREAMING)
     target_link_libraries(rvmclientnet PUBLIC rvmnet)
 
     list(APPEND RVM_APP_SOURCES src/streaming.cpp src/stream_settings.cpp)
+    if(RVM_LOGIN_SERVICE)
+        list(APPEND RVM_APP_SOURCES src/login_handoff.cpp)
+    endif()
 else()
     list(APPEND RVM_APP_SOURCES src/streaming_off.cpp)
 endif()
@@ -122,6 +132,9 @@ endif()
 add_executable(rearviewmirror WIN32 ${RVM_APP_SOURCES})
 if(RVM_STREAMING)
     target_link_libraries(rearviewmirror PRIVATE rvmserver)
+    if(RVM_LOGIN_SERVICE)
+        target_link_libraries(rearviewmirror PRIVATE wtsapi32)
+    endif()
 else()
     target_link_libraries(rearviewmirror PRIVATE rvmcore)
 endif()
@@ -148,4 +161,24 @@ if(RVM_STREAMING)
     # Headless tests for the parts that can be exercised without a screen.
     add_executable(rvmnet_test tests/net_test.cpp src/capture.cpp)
     target_link_libraries(rvmnet_test PRIVATE rvmserver rvmclientnet)
+endif()
+
+# The sign-in screen service, all of it in service/: a separate executable the
+# app knows nothing about. A console program, for --install and --uninstall;
+# the service starts its helper with no window.
+if(RVM_LOGIN_SERVICE)
+    add_executable(rvmservice
+        service/main.cpp
+        service/install.cpp
+        service/supervisor.cpp
+        service/login_helper.cpp
+        service/duplication.cpp
+        service/login_config.cpp
+        src/stream_settings.cpp   # Reads the current user's settings at install.
+        src/app.manifest
+    )
+    target_include_directories(rvmservice PRIVATE service)
+    target_link_libraries(rvmservice PRIVATE rvmserver wtsapi32 advapi32)
+    set_target_properties(rvmservice PROPERTIES OUTPUT_NAME "RearViewMirrorService")
+    rvm_sign(rvmservice)
 endif()

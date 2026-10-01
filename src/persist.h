@@ -49,6 +49,11 @@ uint32_t GroupFromIdentity(const MirrorState& state);
 std::wstring ConfigDir();
 std::wstring ConfigPath();
 
+// Puts this process's files (logs, crash dumps) somewhere other than the
+// user's AppData: for processes with no user, like the login service. Call
+// first thing, before any thread starts or anything reads ConfigDir().
+void SetConfigDir(const std::wstring& dir);
+
 // Writes to a sibling temp file, then renames over the target, as UTF-16 with
 // a BOM: a crash mid-write leaves the previous file intact.
 bool WriteTextAtomically(const std::wstring& path, const std::wstring& text);

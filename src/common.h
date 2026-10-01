@@ -52,6 +52,7 @@ constexpr UINT WM_RVM_MIRROR_ORPHANED = WM_APP + 8;   // wParam: mirror id
 constexpr UINT WM_RVM_FOREGROUND_CHANGED = WM_APP + 9;
 constexpr UINT WM_RVM_STREAM_WANT_FRAME = WM_APP + 10;   // wParam: mirror id
 constexpr UINT WM_RVM_DEVICE_LOST = WM_APP + 11;
+constexpr UINT WM_RVM_SHOW_MANAGER = WM_APP + 12;   // A second launch asks the first for its window.
 
 // Relaunching after a lost graphics device: the new process is started with
 // this argument and the old one's process id, and waits for it to exit.

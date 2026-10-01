@@ -49,6 +49,19 @@ private:
     void MarkDirty();
     void SaveNow();
 
+    // Desktop mirrors start over after a display change, one change at a time.
+    void RestartDesktops();
+    bool restartingDesktops_ = false;
+    bool displayChanged_ = false;   // A change still to catch up.
+
+#if RVM_LOGIN_SERVICE
+    // Lets go of the streaming port while the sign-in service streams the
+    // console, and takes it back after (see login_handoff.h).
+    void UpdateHandoff();
+    bool handedOff_ = false;
+    int  resumeTries_ = 0;
+#endif
+
     void RestoreSaved();
     int  TryRestorePending();
     int  TryRebindOrphans();

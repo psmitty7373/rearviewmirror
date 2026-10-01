@@ -23,6 +23,10 @@ void Streaming::Attach(Mirror&) {}
 
 void Streaming::MirrorsChanged() {}
 
+bool Streaming::SetPaused(bool) {
+    return true;
+}
+
 bool Streaming::Running() const {
     return false;
 }

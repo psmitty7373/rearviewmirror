@@ -5,13 +5,16 @@ mirrors live to other PCs. Windows 10 (1903) or newer.
 
 ## Quick start
 
-1. Run `RearViewMirror.exe`. It starts in pick mode.
-2. Hover a window (it is outlined) and **click** it.
-3. **Click** again for the whole window, or **drag** a rectangle for part of it.
+1. Run `RearViewMirror.exe`. With no saved mirrors, the manager opens.
+2. Press **New mirror** (or `Ctrl+Alt+M`, or *New mirror…* on the tray icon).
+3. Hover a window (it is outlined) and **click** it.
+4. **Click** again for the whole window, or **drag** a rectangle for part of it.
    `Esc` cancels.
 
 The mirror appears top-right. The app lives in the notification area and
-restores your mirrors on the next launch.
+restores your mirrors on the next launch, without opening anything else. It
+never starts a mirror you did not ask for. Running it again while it is
+running opens the manager.
 
 ## Desktop
 
@@ -129,6 +132,41 @@ return one to the canvas to control it.
 Input uses the server's keyboard layout and Windows input permissions. Secure
 desktops (including UAC prompts), Ctrl+Alt+Delete, and applications running at a
 higher privilege level cannot be controlled by an ordinary unelevated server.
+The sign-in screen can, through the optional service below.
+
+### Sign-in screen (optional build)
+
+After a restart nobody is signed in, so the app isn't running. Build with
+`build.bat --login-service` and install the service to stream the Windows
+sign-in screen in the meantime. With desktop control also built, you can sign
+in through it from the client. Once you're signed in, the app takes over.
+
+1. In Rear View Mirror, set up streaming (port and key) as usual.
+2. From an administrator prompt, run
+   `build\RearViewMirrorService.exe --install`. It copies itself to
+   `Program Files\RearViewMirror`, keeps this account's port and key for the
+   machine, lets that UDP port in through Windows Firewall (private and domain
+   networks only; nobody could answer a firewall prompt at the sign-in screen),
+   and starts the service. Run it again after changing the port or key.
+3. Make Rear View Mirror start when you sign in, for example with a shortcut in
+   `shell:startup`.
+
+In the client nothing changes: the same server lists **Sign-in screen** while
+the PC's screen shows a sign-in or lock screen, and your own mirrors otherwise.
+Between the two it disconnects for a moment and reconnects by itself. That
+covers more than restarts: locking the PC, signing out, and leaving it after a
+Remote Desktop connection all put the PC's screen on a sign-in or lock screen.
+Rear View Mirror then stops serving until its session is back on the screen,
+unlocked.
+
+`RearViewMirrorService.exe --uninstall` removes the service, its files, settings
+and logs. `--helper-test` streams your current session the same way without
+installing anything, to try it out.
+
+This runs as SYSTEM and answers on the network whenever nobody is signed in.
+Anyone with the streaming key sees the sign-in screen, and with desktop control
+can type into it; they still need a Windows password to get further. Keep the
+port off the open internet, behind a VPN.
 
 **Frame rate:** a stream can't exceed the refresh rate of the monitor showing
 the source window, and a window that isn't changing sends few frames. For high
@@ -168,6 +206,10 @@ and target arguments still work, for example
 builds, or `--help` to list the options. These options set the corresponding
 `RVM_STREAMING`, `RVM_REMOTE_CONTROL`, and `RVM_SIGN` CMake cache variables.
 
+`--login-service` also builds `RearViewMirrorService.exe` (`RVM_LOGIN_SERVICE`;
+see [Sign-in screen](#sign-in-screen-optional-build)), and `--no-login-service`
+leaves it out again. It is remembered like the other options.
+
 Protocol version 3 adds desktop-control capabilities; update the server and client
 together, including when control is disabled.
 
@@ -184,6 +226,7 @@ and add it again.
 | `stream.ini` | Streaming settings and key |
 | `client.ini` | Client servers, keys and layout |
 | `server.log`, `client.log` | Diagnostics |
+| `%ProgramData%\RearViewMirror\` | The sign-in service's settings and key (administrators only) and its `service.log` and `login.log` |
 | `server-crash-*.dmp`, `client-crash-*.dmp` | Written if the app or client crashes |
 
 Internals, design notes and tests are in [DEVELOPMENT.md](DEVELOPMENT.md).

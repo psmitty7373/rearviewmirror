@@ -8,6 +8,7 @@ struct Streaming::Impl {
     Hooks          hooks;
     StreamServer   server;
     StreamSettings settings;
+    bool           paused = false;
 
     void Changed() {
         if (hooks.changed) hooks.changed();
@@ -33,12 +34,12 @@ struct Streaming::Impl {
         server.SetMirrorList(std::move(list));
     }
 
-    // Stops the server, and starts it again if the settings say it should run.
-    // False if it should run but could not.
+    // Stops the server, and starts it again if the settings say it should run
+    // and it is not paused. False if it should run but could not.
     bool Apply() {
         server.Stop();
         Changed();
-        if (!settings.enabled) return true;
+        if (!settings.enabled || paused) return true;
         // The server asks on its network thread; the mirror lives on the app's.
         server.SetFrameRequester([hwnd = hooks.window](uint32_t mirrorId) {
             PostMessageW(hwnd, WM_RVM_STREAM_WANT_FRAME, mirrorId, 0);
@@ -61,15 +62,25 @@ bool Streaming::Available() {
 void Streaming::Start(Hooks hooks) {
     impl_->hooks = std::move(hooks);
     impl_->settings = LoadStreamSettings();
-    if (!impl_->Apply()) {
-        if (impl_->settings.key.empty() && !impl_->settings.lockedKey.empty()) {
-            impl_->Notify(L"Streaming is off: the saved key could not be decrypted by this Windows "
-                          L"account. Open Streaming and enter it again.");
-        } else {
-            impl_->Notify(L"Streaming could not start on UDP port " +
-                          std::to_wstring(impl_->settings.port) + L". Is another program using it?");
-        }
+    const bool lockedKey = impl_->settings.key.empty() && !impl_->settings.lockedKey.empty();
+    if (lockedKey && impl_->settings.enabled) {
+        impl_->Notify(L"Streaming is off: the saved key could not be decrypted by this Windows "
+                      L"account. Open Streaming and enter it again.");
+        return;
     }
+    if (!impl_->Apply()) {
+        impl_->Notify(L"Streaming could not start on UDP port " +
+                      std::to_wstring(impl_->settings.port) + L". Is another program using it?");
+    }
+}
+
+bool Streaming::SetPaused(bool paused) {
+    Impl& s = *impl_;
+    if (s.paused == paused && (paused || s.server.Running())) return true;
+    s.paused = paused;
+    // With no usable key there is nothing to retry; Start said why.
+    if (!paused && (!s.settings.enabled || s.settings.key.empty())) return true;
+    return s.Apply();
 }
 
 void Streaming::Shutdown() {

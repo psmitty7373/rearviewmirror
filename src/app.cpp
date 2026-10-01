@@ -1,5 +1,6 @@
 #include "app.h"
 #include "crash.h"
+#include "login_handoff.h"
 #include "picker.h"
 #include "region.h"
 
@@ -12,6 +13,14 @@ namespace {
 // Startup-folder launch can win the race against the programs it watches.
 constexpr UINT_PTR kTimerRestore = 1;
 constexpr UINT_PTR kTimerSave    = 2;
+constexpr UINT_PTR kTimerHandoff = 3;
+// While handed off, look again now and then: the console can be between
+// sessions at the moment of a notification, and the service can stop.
+constexpr UINT kHandoffRecheckMs = 5000;
+// Taking the port back: the service's helper lets go of it a moment after the
+// session returns, so try each second for half a minute before saying so.
+constexpr UINT kResumeRetryMs = 1000;
+constexpr int  kResumeTries   = 30;
 constexpr UINT kRestoreMinPeriodMs = 2000;
 constexpr UINT kRestoreMaxPeriodMs = 8000;
 constexpr ULONGLONG kRestorePassMinGapMs = 500;   // Alt-tab spam must not become enumeration spam.
@@ -371,6 +380,61 @@ void App::EnsureRestoreTimer() {
 
 // One attempt to bind everything that is waiting. The mirror reappearing is
 // its own feedback, so no balloon here; only the launch-time restore announces.
+// Monitors came, went or changed resolution: desktop mirrors start over on the
+// new layout. Stopping a capture waits on a COM call, and this thread pumps
+// messages meanwhile, so the next WM_DISPLAYCHANGE (moving a session between
+// Remote Desktop and the console sends them in a burst) arrives in the middle
+// of it. Restarting again from there deadlocked inside Windows Graphics
+// Capture, on a lock the unfinished stop still held. Such a change is now
+// only noted, and caught up once the restart in progress is done.
+void App::RestartDesktops() {
+    restartingDesktops_ = true;
+    bool any = false;
+    while (displayChanged_) {
+        displayChanged_ = false;
+        // By id: a nested message can retire a mirror meanwhile.
+        std::vector<uint32_t> ids;
+        for (const auto& m : mirrors_) {
+            if (m->IsDesktop()) ids.push_back(m->Id());
+        }
+        for (const uint32_t id : ids) {
+            if (Mirror* m = FindMirror(id)) {
+                m->RestartDesktop();
+                any = true;
+            }
+        }
+    }
+    restartingDesktops_ = false;
+    if (any) {
+        streaming_.MirrorsChanged();
+        manager_.Refresh();
+    }
+}
+
+#if RVM_LOGIN_SERVICE
+void App::UpdateHandoff() {
+    const bool handOff = LoginServiceTakesOver();
+    if (handOff != handedOff_) {
+        Log(handOff ? L"app: this session is not on the console; the sign-in service streams it"
+                    : L"app: this session is on the console again; streaming resumes");
+        handedOff_ = handOff;
+        resumeTries_ = 0;
+    }
+    KillTimer(hwnd_, kTimerHandoff);
+    if (streaming_.SetPaused(handOff)) {
+        resumeTries_ = 0;
+        if (handOff) SetTimer(hwnd_, kTimerHandoff, kHandoffRecheckMs, nullptr);
+        return;
+    }
+    if (++resumeTries_ < kResumeTries) {
+        SetTimer(hwnd_, kTimerHandoff, kResumeRetryMs, nullptr);
+    } else {
+        resumeTries_ = 0;
+        ShowBalloon(L"Streaming could not start: its UDP port is still in use.");
+    }
+}
+#endif
+
 int App::RunRestorePass() {
     const ULONGLONG now = GetTickCount64();
     if (now - lastRestorePassTick_ < kRestorePassMinGapMs) return 0;
@@ -416,7 +480,10 @@ int App::TryRestorePending() {
 void App::RestoreSaved() {
     pending_ = LoadMirrorStates();
     if (pending_.empty()) {
-        RequestNewMirror();   // Nothing to bring back: go straight to picking.
+        // Nothing to bring back: show the manager, where a mirror is a click
+        // away, but never start one unasked. Not after a device-loss restart,
+        // which only puts back what was there.
+        if (!relaunched_) manager_.Open(this);
         return;
     }
 
@@ -442,22 +509,14 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         NewMirror();
         return 0;
 
-    case WM_DISPLAYCHANGE: {
-        // Monitors came, went or changed resolution: desktop mirrors start
-        // over on the new layout.
-        bool any = false;
-        for (auto& m : mirrors_) {
-            if (m->IsDesktop()) {
-                m->RestartDesktop();
-                any = true;
-            }
-        }
-        if (any) {
-            streaming_.MirrorsChanged();
-            manager_.Refresh();
-        }
+    case WM_RVM_SHOW_MANAGER:
+        manager_.Open(this);
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        displayChanged_ = true;
+        if (!restartingDesktops_) RestartDesktops();
         break;
-    }
 
     case WM_RVM_MIRROR_CLOSED:
         CloseMirror(static_cast<uint32_t>(wp));
@@ -490,7 +549,19 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+#if RVM_LOGIN_SERVICE
+    case WM_WTSSESSION_CHANGE:
+        UpdateHandoff();
+        return 0;
+#endif
+
     case WM_TIMER:
+#if RVM_LOGIN_SERVICE
+        if (wp == kTimerHandoff) {
+            UpdateHandoff();
+            return 0;
+        }
+#endif
         if (wp == kTimerSave) {
             SaveNow();
         } else if (wp == kTimerRestore) {
@@ -530,6 +601,10 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         SaveNow();   // Placements, before anything is torn down.
         streaming_.Shutdown();   // Before the mirrors its frame tees point at.
         KillTimer(hwnd_, kTimerRestore);
+#if RVM_LOGIN_SERVICE
+        KillTimer(hwnd_, kTimerHandoff);
+        WatchSessionChanges(hwnd_, false);
+#endif
         manager_.Destroy();
         // Retire rather than delete: this can run inside a nested loop that is
         // still executing a Mirror method further up the stack.
@@ -586,7 +661,17 @@ int App::Run(bool relaunched) {
     hooks.mirrors = &mirrors_;
     hooks.changed = [this] { manager_.Refresh(); };
     hooks.notify  = [this](const std::wstring& text) { ShowBalloon(text); };
+#if RVM_LOGIN_SERVICE
+    // Not served at once: right after signing in, the service's helper can
+    // still hold the port for a moment, and this session may not even be the
+    // console's. UpdateHandoff serves when it can, retrying until it does.
+    streaming_.SetPaused(true);
     streaming_.Start(std::move(hooks));
+    WatchSessionChanges(hwnd_, true);
+    UpdateHandoff();
+#else
+    streaming_.Start(std::move(hooks));
+#endif
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
