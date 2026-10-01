@@ -465,6 +465,7 @@ void ClientWindow::PopOut(Tile& tile) {
         popout->Render();
     }
     tile.popout = std::move(popout);
+    tile.seenFrames = UINT64_MAX;   // Fed afresh by the stream's next event.
     if (focused_ == tile.key) focused_ = {};
     SaveConfig();
 }
@@ -492,20 +493,23 @@ void ClientWindow::Dock(Tile& tile) {
 // Straight from the connection, not the canvas's snapshot: that is only
 // refreshed when the canvas redraws, which a frame shown only in pop-outs,
 // or a minimised window, does not cause.
-void ClientWindow::FeedPopouts(uint32_t serverTag) {
-    Server* server = FindServer(serverTag);
-    if (!server) return;
-    std::vector<StreamView> views;
-    bool fetched = false;
+bool ClientWindow::FeedStreams(Server& server, std::vector<StreamView>& views) {
+    bool canvas = false, fetched = false;
     for (auto& t : tiles_) {
-        if (!t.popout || t.key.server != serverTag) continue;
+        if (t.key.server != server.tag) continue;
         if (!fetched) {
-            views = server->client->Views();
+            views = server.client->Views();
             fetched = true;
         }
         const auto v = std::find_if(views.begin(), views.end(),
                                     [&](const StreamView& view) { return view.id == t.key.id; });
-        if (v == views.end()) continue;
+        if (v == views.end() || (v->frames == t.seenFrames && v->state == t.seenState)) continue;
+        t.seenFrames = v->frames;
+        t.seenState = v->state;
+        if (!t.popout) {
+            canvas = canvas || focused_.server == 0 || focused_ == t.key;
+            continue;
+        }
         UINT w = v->width, h = v->height;
         ShownSizeOf(&*v, MirrorFor(t.key), w, h);
         t.popout->SetFrame(v->texture, w, h, v->frames);
@@ -513,6 +517,7 @@ void ClientWindow::FeedPopouts(uint32_t serverTag) {
         t.popout->SetWaitingText(stalled ? stalled : L"Waiting for the first frame…");
         t.popout->Render();
     }
+    return canvas;
 }
 
 // Size the box so the stream shows at 100%, as far as the canvas allows.
@@ -918,18 +923,22 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 #if RVM_REMOTE_CONTROL
         if (controlKey_.server == server->tag) PollControl();
 #endif
-        // A new frame only changes the canvas if one of this server's boxes
-        // is on it; streams shown only in pop-outs leave the canvas alone.
-        bool redraw = event != ClientEvent::FrameReady;
-        if (!redraw && !IsIconic(Hwnd())) {
-            for (const auto& t : tiles_) {
-                if (!t.popout && t.key.server == server->tag) { redraw = true; break; }
+        if (event != ClientEvent::FrameReady) Render();
+        // Only what changed is drawn again: a pop-out when its own stream has
+        // a new frame or state, the canvas when one of its boxes has. Frames
+        // change only pictures, so the rest of the snapshot stands.
+        std::vector<StreamView> views;
+        if (FeedStreams(*server, views) && !IsIconic(Hwnd())) {
+            if (event == ClientEvent::FrameReady) {
+                for (auto& v : views_) {
+                    if (v.tag != server->tag) continue;
+                    v.views = std::move(views);
+                    snapshotFresh_ = true;
+                }
             }
+            Render();
+            snapshotFresh_ = false;
         }
-        if (redraw) Render();
-        // Pop-outs follow every event: frames, and the server's word on why a
-        // stream is not coming.
-        FeedPopouts(server->tag);
         return 0;
     }
 
@@ -1210,19 +1219,21 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 void ClientWindow::PrepareDraw() {
     drawNowMs_ = GetTickCount64();
     ScheduleChipTimer();
-    views_.clear();
-    for (const auto& s : servers_) {
-        ServerView v;
-        v.tag       = s->tag;
-        v.label     = s->label;
-        v.status    = s->client->Status();
-        v.connected = s->client->Connected();
-        v.rttUs     = s->client->RttUs();
-        v.mirrors   = s->client->Mirrors();
-        v.views     = s->client->Views();
-        views_.push_back(std::move(v));
+    if (!snapshotFresh_) {
+        views_.clear();
+        for (const auto& s : servers_) {
+            ServerView v;
+            v.tag       = s->tag;
+            v.label     = s->label;
+            v.status    = s->client->Status();
+            v.connected = s->client->Connected();
+            v.rttUs     = s->client->RttUs();
+            v.mirrors   = s->client->Mirrors();
+            v.views     = s->client->Views();
+            views_.push_back(std::move(v));
+        }
+        BuildRows();
     }
-    BuildRows();
 
     // Bitmaps wrap textures; forget any whose texture is gone.
     for (auto it = bitmaps_.begin(); it != bitmaps_.end();) {

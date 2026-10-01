@@ -31,10 +31,35 @@ public:
     // Bytes received, 0 on timeout, -1 on error.
     int Receive(void* buf, size_t cap, Endpoint& from, int timeoutMs);
 
+    // Event-driven receiving, for a loop that sleeps until it has work. Wait
+    // returns when a datagram is waiting (take it, and any more, with
+    // Receive(..., 0)), when Wake() is called from any thread, or after
+    // `timeoutMs` (INFINITE for never), timed to the millisecond. A wake
+    // given while nobody waits is kept for the next Wait.
+    enum class WaitResult { Readable, Woken, Timeout, Error };
+    WaitResult Wait(DWORD timeoutMs);
+    void Wake();
+
     static bool Resolve(const std::wstring& host, uint16_t port, Endpoint& out);
 
 private:
+    // 1: done, 0: a datagram was discarded instead, -1: error.
+    int PostReceive();
+    int CompleteReceive();
+
     SOCKET sock_ = INVALID_SOCKET;
+
+    // Wait's machinery: one overlapped receive into held_, so the socket
+    // itself stays blocking for senders.
+    HANDLE wake_ = nullptr;    // Auto-reset.
+    HANDLE timer_ = nullptr;   // High resolution, where the OS has it.
+    WSAOVERLAPPED recv_{};
+    bool posted_ = false;
+    bool held_ = false;
+    DWORD recvFlags_ = 0;
+    DWORD heldLen_ = 0;
+    Endpoint heldFrom_;
+    std::vector<uint8_t> heldBuf_;
 };
 
 }  // namespace rvm::net

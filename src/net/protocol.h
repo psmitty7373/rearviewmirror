@@ -112,6 +112,11 @@ struct FrameHeader {
 constexpr size_t kFrameHeaderBytes = 1 + 4 + 4 + 2 + 2 + 1;   // Msg byte included.
 constexpr size_t kMaxChunk = kMaxPlain - kFrameHeaderBytes;
 
+// The most packets one frame may take, about 9.5 MB: more than a 4096x4096
+// keyframe at the 100 Mbps ceiling should ever need. A sender drops a larger
+// frame; a receiver refuses one rather than set memory aside for it.
+constexpr uint16_t kMaxFramePackets = 8192;
+
 // Little-endian serialisation.
 class Writer {
 public:

@@ -84,6 +84,8 @@ private:
         std::unique_ptr<PopoutWindow> popout;   // Set while popped out.
         PopoutWindow::Settings popSettings;     // Remembered while docked.
         uint64_t chipSince = 0;   // When the name chip last had a reason to show.
+        uint64_t seenFrames = 0;  // The stream's frame count and state when last fed.
+        uint8_t  seenState = 0;
     };
     struct Drag {
         bool    active = false;
@@ -119,7 +121,10 @@ private:
     void  PopOut(Tile& tile);
     void  Dock(Tile& tile);
     void  Retire(std::unique_ptr<PopoutWindow> popout);
-    void  FeedPopouts(uint32_t serverTag);
+    // Hands each of the server's pop-outs a new frame or state of its own
+    // stream. True if a box on the canvas has one too; `views` is then the
+    // server's current set.
+    bool  FeedStreams(Server& server, std::vector<StreamView>& views);
     void  FitToStream(Tile& tile);
     // The size to present a stream at: the decoded picture, reshaped to the
     // mirror's true proportions where the encoder had to pad or squeeze it.
@@ -207,9 +212,11 @@ private:
     TileKey focused_{};                      // Double-clicked box shown alone, or server 0.
     Drag    drag_;
 
-    // Snapshot for OnDraw and hit testing, built in PrepareDraw.
+    // Snapshot for OnDraw and hit testing, built in PrepareDraw unless a new
+    // frame has just refreshed the pictures in it.
     std::vector<ServerView> views_;
     std::vector<Row>        rows_;
+    bool snapshotFresh_ = false;
 
     std::map<ID3D11Texture2D*, winrt::com_ptr<ID2D1Bitmap1>> bitmaps_;
 
