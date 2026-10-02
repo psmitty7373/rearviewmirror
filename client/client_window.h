@@ -135,7 +135,10 @@ private:
     // The plain title, or the title with a control status appended.
     void  SetTitle(const wchar_t* status = nullptr);
     void  PollControl();
-    bool  ControlMessage(UINT msg, WPARAM wp, LPARAM lp);
+    // `from` is the canvas or a pop-out; only the one showing the stream counts.
+    bool  ControlMessage(HWND from, UINT msg, WPARAM wp, LPARAM lp);
+    HWND  ControlWindow();
+    void  ShowControl(TileKey key);   // Redraws the window showing that stream.
     bool  DrawControlTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1_RECT_F& cell);
     TileKey controlKey_{};
     net::ControlKeyboard controlKeyboard_;

@@ -9,21 +9,40 @@ void ClientWindow::BeginControl(TileKey key) {
     const RemoteMirror* mirror = MirrorFor(key);
     const StreamView* view = ViewFor(key);
     Server* server = FindServer(key.server);
-    if (!tile || tile->popout || !mirror || !mirror->controllable ||
+    if (!tile || !mirror || !mirror->controllable || (tile->popout && tile->popout->ClickThrough()) ||
         !view || !view->frames || !server || !server->client->Connected()) return;
     EndDrag(true);
-    BringToFront(key);
-    SetFocus(Hwnd());
+    if (tile->popout) {
+        SetForegroundWindow(tile->popout->Hwnd());   // The keyboard hook follows the foreground.
+        SetFocus(tile->popout->Hwnd());
+    } else {
+        BringToFront(key);
+        SetFocus(Hwnd());
+    }
     controlKey_ = key;
     controlState_ = net::ControlState::Pending;
     server->client->Control().Begin(key.id, net::ControlNowMs());
     SetTimer(Hwnd(), kControlTimer, 50, nullptr);
     SetTitle(L"Requesting desktop control…");
-    Render();
+    ShowControl(key);
+}
+
+// The pop-out showing the controlled stream, else the canvas.
+HWND ClientWindow::ControlWindow() {
+    const Tile* tile = FindTile(controlKey_);
+    return tile && tile->popout ? tile->popout->Hwnd() : Hwnd();
+}
+
+void ClientWindow::ShowControl(TileKey key) {
+    Tile* tile = FindTile(key);
+    if (!tile || !tile->popout) { Render(); return; }
+    tile->popout->SetControlLabel(controlKey_ != key ? L""
+        : controlState_ == net::ControlState::Active ? L"Control · Ctrl+Alt+F12" : L"Requesting control…");
 }
 
 void ClientWindow::EndControl(const wchar_t* message) {
     const TileKey key = controlKey_;
+    const HWND window = ControlWindow();
     controlKey_ = {};
     controlState_ = net::ControlState::Idle;
     controlKeyboard_.Stop();
@@ -31,11 +50,11 @@ void ClientWindow::EndControl(const wchar_t* message) {
     controlButtons_ = 0;
     if (key.server) {
         if (Server* server = FindServer(key.server)) server->client->Control().End(net::ControlNowMs());
-        if (GetCapture() == Hwnd()) ReleaseCapture();
+        if (GetCapture() == window) ReleaseCapture();
         KillTimer(Hwnd(), kControlTimer);
         SetTitle(message);
         if (message) SetTimer(Hwnd(), kTitleTimer, kStatusTitleMs, nullptr);
-        Render();
+        ShowControl(key);
     }
 }
 
@@ -43,9 +62,10 @@ void ClientWindow::PollControl() {
     if (!controlKey_.server) return;
     Server* server = FindServer(controlKey_.server);
     const Tile* tile = FindTile(controlKey_);
-    if (!server || !tile || tile->popout || !server->client->Controllable(controlKey_.id) ||
+    const HWND window = ControlWindow();
+    if (!server || !tile || !server->client->Controllable(controlKey_.id) ||
         !server->client->Connected() ||
-        GetForegroundWindow() != Hwnd() || IsIconic(Hwnd())) { EndControl(); return; }
+        GetForegroundWindow() != window || IsIconic(window)) { EndControl(); return; }
     const auto state = server->client->Control().State();
     if (state != net::ControlState::Pending && state != net::ControlState::Active) {
         EndControl(state == net::ControlState::Busy
@@ -54,7 +74,7 @@ void ClientWindow::PollControl() {
         return;
     }
     if (state == net::ControlState::Active && !controlKeyboardOn_) {
-        controlKeyboardOn_ = controlKeyboard_.Start(Hwnd(),
+        controlKeyboardOn_ = controlKeyboard_.Start(window,
             [this](const net::RemoteInput& e) {
                 if (Server* s = FindServer(controlKey_.server)) s->client->Control().Push(e);
             }, [window = Hwnd()] { PostMessageW(window, net::WM_RELEASE_CONTROL, 0, 0); });
@@ -64,7 +84,7 @@ void ClientWindow::PollControl() {
         }
         SetTitle(L"Controlling desktop · Ctrl+Alt+F12 to release");
     }
-    if (controlState_ != state) { controlState_ = state; Render(); }
+    if (controlState_ != state) { controlState_ = state; ShowControl(controlKey_); }
 }
 
 void ClientWindow::SetTitle(const wchar_t* status) {
@@ -73,7 +93,7 @@ void ClientWindow::SetTitle(const wchar_t* status) {
 }
 
 bool ClientWindow::DrawControlTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1_RECT_F& cell) {
-    if (controlKey_ != tile.key) return false;
+    if (controlKey_ != tile.key || tile.popout) return false;
     const bool narrow = cell.right - cell.left < S(240.0f);
     const wchar_t* label = controlState_ == net::ControlState::Active
         ? (narrow ? L"Control" : L"Control · Ctrl+Alt+F12")
@@ -86,12 +106,12 @@ bool ClientWindow::DrawControlTile(ID2D1DeviceContext* dc, const Tile& tile, con
     return true;
 }
 
-bool ClientWindow::ControlMessage(UINT msg, WPARAM wp, LPARAM lp) {
+bool ClientWindow::ControlMessage(HWND from, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == net::WM_RELEASE_CONTROL) { EndControl(); return true; }
-    if (!controlKey_.server) return false;
+    if (!controlKey_.server || from != ControlWindow()) return false;
     if (msg == WM_KILLFOCUS || msg == WM_CANCELMODE || msg == WM_ENTERSIZEMOVE ||
         (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) ||
-        (msg == WM_CAPTURECHANGED && controlButtons_ && reinterpret_cast<HWND>(lp) != Hwnd())) {
+        (msg == WM_CAPTURECHANGED && controlButtons_ && reinterpret_cast<HWND>(lp) != from)) {
         EndControl(); return false;
     }
     if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP ||
@@ -124,11 +144,13 @@ bool ClientWindow::ControlMessage(UINT msg, WPARAM wp, LPARAM lp) {
     const Tile* tile = FindTile(controlKey_);
     Server* server = FindServer(controlKey_.server);
     if (!tile || !server) { EndControl(); return false; }
-    const auto picture = PictureRect(*tile);
+    const auto picture = tile->popout   // Always the stream's shape: all picture.
+        ? D2D1::RectF(0, 0, static_cast<float>(tile->popout->Width()), static_cast<float>(tile->popout->Height()))
+        : PictureRect(*tile);
     const float w = picture.right - picture.left, h = picture.bottom - picture.top;
     if (w <= 0 || h <= 0) { EndControl(); return false; }
     POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-    if (e.kind == net::InputKind::Wheel) ScreenToClient(Hwnd(), &pt);
+    if (e.kind == net::InputKind::Wheel) ScreenToClient(from, &pt);
     const bool inside = pt.x >= picture.left && pt.x < picture.right &&
                         pt.y >= picture.top && pt.y < picture.bottom;
     if (!inside && !controlButtons_) {
@@ -143,14 +165,14 @@ bool ClientWindow::ControlMessage(UINT msg, WPARAM wp, LPARAM lp) {
     if (button) {
         e.kind = net::InputKind::Button;
         const unsigned bit = 1u << e.code;
-        if (e.value) { controlButtons_ |= bit; SetCapture(Hwnd()); }
+        if (e.value) { controlButtons_ |= bit; SetCapture(from); }
         else {
             if (!(controlButtons_ & bit)) return true;
             controlButtons_ &= ~bit;
         }
     }
     server->client->Control().Push(e);
-    if (button && !controlButtons_ && GetCapture() == Hwnd()) ReleaseCapture();
+    if (button && !controlButtons_ && GetCapture() == from) ReleaseCapture();
     return true;
 }
 }  // namespace rvm

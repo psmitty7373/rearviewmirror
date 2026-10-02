@@ -23,6 +23,7 @@ public:
     RECT EffectiveCrop() const;
 
     // Lock-free: WM_SIZING and the manager's draw need this without contention.
+    // A draw that changes it posts WM_RVM_CROP_RESHAPED to the window.
     SIZE EffectiveCropSize() const;
 
     void SetOpacity(float opacity);
@@ -75,6 +76,7 @@ private:
     mutable std::mutex mutex_;
     std::mutex presentMutex_;   // One draw-and-present, or resize, at a time.
     CompSurface comp_;
+    HWND hwnd_ = nullptr;
 
     // The cache holds the effective crop (and a pixel round it, for filtering)
     // of the latest frames. When minifying, frames go straight into the top of

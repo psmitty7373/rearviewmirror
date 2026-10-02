@@ -330,7 +330,6 @@ std::vector<MirrorState> LoadMirrorStates() {
         s.placement.bottom = s.placement.top + ReadExtent(section, L"H", path);
 
         s.opacity      = ClampI(ReadInt(section, L"Opacity", 100, path), 5, 100) / 100.0f;
-        s.aspectLocked = ReadInt(section, L"AspectLock", 1, path) != 0;
         s.track = ReadInt(section, L"Track", 0, path) == 1 ? TrackMode::Proportional
                                                           : TrackMode::Anchored;
         s.enabled = ReadInt(section, L"Enabled", 1, path) != 0;
@@ -373,7 +372,6 @@ bool SaveMirrorStates(const std::vector<MirrorState>& states) {
         Line(text, L"W", RectW(s.placement));
         Line(text, L"H", RectH(s.placement));
         Line(text, L"Opacity", static_cast<int>(std::lround(s.opacity * 100.0f)));
-        Line(text, L"AspectLock", s.aspectLocked ? 1 : 0);
         Line(text, L"Track", s.track == TrackMode::Proportional ? 1 : 0);
         Line(text, L"Enabled", s.enabled ? 1 : 0);
         Line(text, L"ClickThrough", s.clickThrough ? 1 : 0);

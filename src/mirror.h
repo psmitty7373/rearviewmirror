@@ -105,6 +105,7 @@ private:
     void PlaceInitially();
     void NotifyStateChanged();
     void ConstrainSizing(WPARAM edge, RECT* rect);
+    void FollowCropShape();
 
     WindowCapture  capture_;
     DesktopCapture desktop_;   // Used instead of capture_ for a desktop mirror.

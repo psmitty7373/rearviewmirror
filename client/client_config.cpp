@@ -79,7 +79,6 @@ bool ReadTile(const std::wstring& section, const std::wstring& path, int unit, T
     t.popRect.bottom = t.popRect.top  + ClampI(ReadInt(section, L"PopH", 0, path), 0, kMaxExtent);
     t.popOpacity = ClampI(ReadInt(section, L"PopOpacity", 100, path), 5, 100) / 100.0f;
     t.popClickThrough = ReadInt(section, L"PopClickThrough", 0, path) != 0;
-    t.popAspectLocked = ReadInt(section, L"PopAspectLock", 1, path) != 0;
     return true;
 }
 
@@ -166,7 +165,6 @@ bool SaveClientConfig(const ClientConfig& config) {
         Line(text, L"PopH", RectH(t.popRect));
         Line(text, L"PopOpacity", static_cast<int>(std::lround(t.popOpacity * 100.0f)));
         Line(text, L"PopClickThrough", t.popClickThrough ? 1 : 0);
-        Line(text, L"PopAspectLock", t.popAspectLocked ? 1 : 0);
     }
     return WriteTextAtomically(SettingsPath(), text);
 }

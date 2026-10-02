@@ -12,9 +12,8 @@ constexpr int kScreenMargin = 24;
 
 enum MenuId : UINT {
     kIdReturn = 100,
-    kIdAspectLock,
+    kIdControl,
     kIdClickThrough,
-    kIdZoom50 = 200, kIdZoom100, kIdZoom150, kIdZoom200,
     kIdOpacity100 = 300, kIdOpacity90, kIdOpacity75, kIdOpacity50, kIdOpacity25,
 };
 
@@ -39,10 +38,9 @@ bool PopoutWindow::Create(HWND notify, LPARAM token, const Settings& settings, U
     nativeH_ = (std::max)(nativeH, 1u);
     opacity_ = Clampf(settings.opacity, 0.05f, 1.0f);
     clickThrough_ = settings.clickThrough;
-    aspectLocked_ = settings.aspectLocked;
 
-    RECT bounds{ 0, 0, ClampExtent(static_cast<int>(nativeW_), kMinWidth),
-                 ClampExtent(static_cast<int>(nativeH_), kMinHeight) };
+    const SIZE size = ScaleNative(Native(), 1.0, { kMinWidth, kMinHeight });
+    RECT bounds{ 0, 0, size.cx, size.cy };
     const DWORD ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE;
     if (!CreateStyled(kPopoutClass, kAppName, bounds, WS_POPUP | WS_THICKFRAME, ex, CS_DBLCLKS)) return false;
 
@@ -65,14 +63,11 @@ void PopoutWindow::PlaceInitially(HWND placeNear) {
     const int maxW = static_cast<int>(RectW(work) * 0.6);
     const int maxH = static_cast<int>(RectH(work) * 0.6);
 
-    int w = (std::max)(static_cast<int>(nativeW_), kMinWidth);
-    int h = (std::max)(static_cast<int>(nativeH_), kMinHeight);
-    const float scale = (std::min)(1.0f, (std::min)(static_cast<float>(maxW) / w,
-                                                    static_cast<float>(maxH) / h));
-    w = ClampExtent(static_cast<int>(w * scale), kMinWidth);
-    h = ClampExtent(static_cast<int>(h * scale), kMinHeight);
-    SetWindowPos(hwnd_, HWND_TOPMOST, work.right - w - kScreenMargin, work.top + kScreenMargin,
-                 w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const double scale = (std::min)(1.0, (std::min)(static_cast<double>(maxW) / nativeW_,
+                                                    static_cast<double>(maxH) / nativeH_));
+    const SIZE s = ScaleNative(Native(), scale, { kMinWidth, kMinHeight });
+    SetWindowPos(hwnd_, HWND_TOPMOST, work.right - s.cx - kScreenMargin, work.top + kScreenMargin,
+                 s.cx, s.cy, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 PopoutWindow::Settings PopoutWindow::CurrentSettings() const {
@@ -80,7 +75,6 @@ PopoutWindow::Settings PopoutWindow::CurrentSettings() const {
     if (hwnd_) GetWindowRect(hwnd_, &s.rect);
     s.opacity = opacity_;
     s.clickThrough = clickThrough_;
-    s.aspectLocked = aspectLocked_;
     return s;
 }
 
@@ -90,10 +84,28 @@ void PopoutWindow::SetFrame(const winrt::com_ptr<ID3D11Texture2D>& texture, UINT
     frameW_ = width;
     frameH_ = height;
     frames_ = frames;
-    if (width > 0 && height > 0) {
+    if (width > 0 && height > 0 && (width != nativeW_ || height != nativeH_)) {
         nativeW_ = width;
         nativeH_ = height;
+        FollowShape();
     }
+}
+
+// The window keeps its width and takes the stream's new shape.
+void PopoutWindow::FollowShape() {
+    if (!hwnd_) return;
+    RECT r{};
+    GetWindowRect(hwnd_, &r);
+    const SIZE s = ScaleNative(Native(), static_cast<double>(RectW(r)) / nativeW_, { kMinWidth, kMinHeight });
+    if (s.cx == RectW(r) && std::abs(s.cy - RectH(r)) <= 1) return;   // A size the encoder rounded.
+    SetWindowPos(hwnd_, nullptr, 0, 0, s.cx, s.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    Notify(PopoutEvent::Changed);
+}
+
+void PopoutWindow::SetControlLabel(std::wstring_view label) {
+    if (controlLabel_ == label) return;
+    controlLabel_.assign(label);
+    Invalidate();
 }
 
 void PopoutWindow::Notify(PopoutEvent event) {
@@ -101,15 +113,13 @@ void PopoutWindow::Notify(PopoutEvent event) {
 }
 
 void PopoutWindow::ConstrainSizing(WPARAM edge, RECT* rect) {
-    snapped_ = ConstrainToNative(edge, rect, { static_cast<LONG>(nativeW_), static_cast<LONG>(nativeH_) },
-                                 aspectLocked_, { kMinWidth, kMinHeight });
+    snapped_ = ConstrainToNative(edge, rect, Native(), { kMinWidth, kMinHeight });
 }
 
 void PopoutWindow::SetZoom(float factor) {
     if (!hwnd_) return;
-    const int w = ClampExtent(static_cast<int>(nativeW_ * factor), kMinWidth);
-    const int h = ClampExtent(static_cast<int>(nativeH_ * factor), kMinHeight);
-    SetWindowPos(hwnd_, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const SIZE s = ScaleNative(Native(), factor, { kMinWidth, kMinHeight });
+    SetWindowPos(hwnd_, nullptr, 0, 0, s.cx, s.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     Notify(PopoutEvent::Changed);
 }
 
@@ -134,6 +144,9 @@ void PopoutWindow::ApplyClickThroughStyle() {
 }
 
 LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
+    if (filter_ && filter_(hwnd_, msg, wp, lp)) {
+        return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP || msg == WM_XBUTTONDBLCLK ? TRUE : 0;
+    }
     switch (msg) {
     case WM_NCCALCSIZE:
         if (wp) return 0;
@@ -173,6 +186,10 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZING:
         ConstrainSizing(wp, reinterpret_cast<RECT*>(lp));
         return TRUE;
+
+    case WM_WINDOWPOSCHANGING:
+        HoldAspect(reinterpret_cast<WINDOWPOS*>(lp), Native(), { kMinWidth, kMinHeight });
+        break;
 
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
@@ -225,11 +242,6 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void PopoutWindow::ShowContextMenu(POINT screenPt) {
-    HMENU zoom = CreatePopupMenu();
-    AppendMenuW(zoom, MF_STRING, kIdZoom50,  L"50%");
-    AppendMenuW(zoom, MF_STRING, kIdZoom100, L"100%  (actual size)");
-    AppendMenuW(zoom, MF_STRING, kIdZoom150, L"150%");
-    AppendMenuW(zoom, MF_STRING, kIdZoom200, L"200%");
 
     HMENU opacity = CreatePopupMenu();
     for (const auto& lv : kOpacityLevels) {
@@ -238,11 +250,13 @@ void PopoutWindow::ShowContextMenu(POINT screenPt) {
     }
 
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(zoom), L"Zoom");
+    if (controllable_) {
+        AppendMenuW(menu, MF_STRING | (clickThrough_ ? MF_GRAYED : 0), kIdControl, L"Control desktop");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(opacity), L"Opacity");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (aspectLocked_ ? MF_CHECKED : 0), kIdAspectLock,
-                L"Lock aspect ratio");
     AppendMenuW(menu, MF_STRING | (clickThrough_ ? MF_CHECKED : 0), kIdClickThrough,
                 L"Click-through");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -258,12 +272,9 @@ void PopoutWindow::ShowContextMenu(POINT screenPt) {
 
     switch (cmd) {
     case kIdReturn:       Notify(PopoutEvent::ReturnToCanvas); break;
-    case kIdAspectLock:   aspectLocked_ = !aspectLocked_; Render(); Notify(PopoutEvent::Changed); break;
+    case kIdControl:      Notify(PopoutEvent::Control); break;
     case kIdClickThrough: SetClickThrough(!clickThrough_); break;
-    case kIdZoom50:  SetZoom(0.5f); break;
-    case kIdZoom100: SetZoom(1.0f); break;
-    case kIdZoom150: SetZoom(1.5f); break;
-    case kIdZoom200: SetZoom(2.0f); break;
+
     default:
         for (const auto& lv : kOpacityLevels) {
             if (cmd == lv.id) {
@@ -296,15 +307,8 @@ void PopoutWindow::OnDraw(ID2D1DeviceContext* dc) {
             }
         }
         if (bitmap_) {
-            D2D1_RECT_F dest = D2D1::RectF(0, 0, w, h);
-            if (!aspectLocked_) {
-                // Letterbox, since the window may no longer match the stream.
-                const float scale = (std::min)(w / frameW_, h / frameH_);
-                const float dw = frameW_ * scale, dh = frameH_ * scale;
-                dest = D2D1::RectF((w - dw) * 0.5f, (h - dh) * 0.5f, (w + dw) * 0.5f, (h + dh) * 0.5f);
-            }
-            const bool shrinking = (dest.right - dest.left) < frameW_;
-            dc->DrawBitmap(bitmap_.get(), dest, opacity_,
+            const bool shrinking = w < frameW_;
+            dc->DrawBitmap(bitmap_.get(), D2D1::RectF(0, 0, w, h), opacity_,
                            shrinking ? D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR
                                      : D2D1_INTERPOLATION_MODE_LINEAR);
         }
@@ -314,7 +318,12 @@ void PopoutWindow::OnDraw(ID2D1DeviceContext* dc) {
         DrawChip(dc, waitingText_, w * 0.5f, h * 0.5f, 1, 1);
     }
 
-    if (snapped_) {
+    if (!controlLabel_.empty()) {
+        DrawChip(dc, controlLabel_, 10.0f * chipScale_, 10.0f * chipScale_, 0, 0, 0.75f);
+        brush_->SetColor(D2D1::ColorF(kAccentR, kAccentG, kAccentB));
+        const float inset = 1.5f * chipScale_;
+        dc->DrawRectangle(D2D1::RectF(inset, inset, w - inset, h - inset), brush_.get(), 3.0f * chipScale_);
+    } else if (snapped_) {
         brush_->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f));
         dc->DrawRectangle(D2D1::RectF(0.75f, 0.75f, w - 0.75f, h - 0.75f), brush_.get(), 1.5f);
     } else if (hovered_) {

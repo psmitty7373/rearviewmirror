@@ -6,7 +6,7 @@ namespace rvm {
 // Posted to the window given to Create() when the user acts on a pop-out.
 // wParam is a PopoutEvent, lParam the token given to Create().
 constexpr UINT WM_RVM_POPOUT_EVENT = WM_APP + 21;
-enum class PopoutEvent : WPARAM { ReturnToCanvas = 1, Changed };
+enum class PopoutEvent : WPARAM { ReturnToCanvas = 1, Changed, Control };
 
 // A stream in its own borderless always-on-top window, handled like the app's
 // local mirror window. The client window feeds it frames.
@@ -16,7 +16,6 @@ public:
         RECT  rect{};                // Empty means "place it".
         float opacity = 1.0f;
         bool  clickThrough = false;
-        bool  aspectLocked = true;
     };
 
     bool Create(HWND notify, LPARAM token, const Settings& settings, UINT nativeW, UINT nativeH,
@@ -33,6 +32,14 @@ public:
     void SetClickThrough(bool on);
     bool ClickThrough() const { return clickThrough_; }
 
+    // Remote control: offered on the menu, which then sends PopoutEvent::Control.
+    // While controlling, `filter` sees each message first and may take it.
+    void SetControllable(bool on) { controllable_ = on; }
+    using InputFilter = std::function<bool(HWND, UINT, WPARAM, LPARAM)>;
+    void SetInputFilter(InputFilter filter) { filter_ = std::move(filter); }
+    // Shown on the picture while controlling; empty for none.
+    void SetControlLabel(std::wstring_view label);
+
     LRESULT OnMessage(UINT msg, WPARAM wp, LPARAM lp) override;
 
 protected:
@@ -40,7 +47,9 @@ protected:
 
 private:
     void PlaceInitially(HWND placeNear);
+    SIZE Native() const { return { static_cast<LONG>(nativeW_), static_cast<LONG>(nativeH_) }; }
     void ConstrainSizing(WPARAM edge, RECT* rect);
+    void FollowShape();
     void SetZoom(float factor);
     void ShowContextMenu(POINT screenPt);
     void ApplyClickThroughStyle();
@@ -52,7 +61,9 @@ private:
     UINT  nativeW_ = 0, nativeH_ = 0;
     float opacity_ = 1.0f;
     bool  clickThrough_ = false;
-    bool  aspectLocked_ = true;
+    bool  controllable_ = false;
+    InputFilter  filter_;
+    std::wstring controlLabel_;
 
     winrt::com_ptr<ID3D11Texture2D> texture_;
     UINT     frameW_ = 0, frameH_ = 0;

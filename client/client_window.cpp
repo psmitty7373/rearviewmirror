@@ -315,7 +315,6 @@ void ClientWindow::AddTile(TileKey key) {
         tile.popSettings.rect = saved->popRect;
         tile.popSettings.opacity = saved->popOpacity;
         tile.popSettings.clickThrough = saved->popClickThrough;
-        tile.popSettings.aspectLocked = saved->popAspectLocked;
         popped = saved->popped;
         pendingTiles_.erase(saved);
     } else {
@@ -352,7 +351,6 @@ TileLayout ClientWindow::ToLayout(const Tile& tile) const {
     l.popRect = s.rect;
     l.popOpacity = s.opacity;
     l.popClickThrough = s.clickThrough;
-    l.popAspectLocked = s.aspectLocked;
     return l;
 }
 
@@ -452,6 +450,13 @@ void ClientWindow::PopOut(Tile& tile) {
 
     auto popout = std::make_unique<PopoutWindow>();
     if (!popout->Create(Hwnd(), TokenOf(tile.key), tile.popSettings, nativeW, nativeH, Hwnd())) return;
+#if RVM_REMOTE_CONTROL
+    const RemoteMirror* mirror = MirrorFor(tile.key);
+    popout->SetControllable(mirror && mirror->controllable);
+    popout->SetInputFilter([this](HWND from, UINT msg, WPARAM wp, LPARAM lp) {
+        return ControlMessage(from, msg, wp, lp);
+    });
+#endif
     if (const StreamView* v = ViewFor(tile.key)) {
         UINT w = v->width, h = v->height;
         ShownSize(tile.key, w, h);
@@ -479,6 +484,9 @@ void ClientWindow::FreeRetired() {
 
 void ClientWindow::Dock(Tile& tile) {
     if (!tile.popout) return;
+#if RVM_REMOTE_CONTROL
+    if (controlKey_ == tile.key) EndControl();
+#endif
     tile.popSettings = tile.popout->CurrentSettings();
     Retire(std::move(tile.popout));
     SaveConfig();
@@ -506,6 +514,10 @@ bool ClientWindow::FeedStreams(Server& server, std::vector<StreamView>& views) {
         UINT w = v->width, h = v->height;
         ShownSizeOf(&*v, MirrorFor(t.key), w, h);
         t.popout->SetFrame(v->texture, w, h, v->frames);
+#if RVM_REMOTE_CONTROL
+        const RemoteMirror* mirror = MirrorFor(t.key);
+        t.popout->SetControllable(mirror && mirror->controllable);
+#endif
         const wchar_t* stalled = StreamStateText(v->state);
         t.popout->SetWaitingText(stalled ? stalled : L"Waiting for the first frame…");
         t.popout->Invalidate();
@@ -540,7 +552,7 @@ void ClientWindow::ShowTileMenu(TileKey key, POINT screenPt) {
     HMENU menu = CreatePopupMenu();
 #if RVM_REMOTE_CONTROL
     const RemoteMirror* mirror = MirrorFor(key);
-    if (!popped && mirror && mirror->controllable) {
+    if (mirror && mirror->controllable && !(popped && tile->popout->ClickThrough())) {
         const StreamView* view = ViewFor(key);
         const ServerView* server = FindView(key.server);
         const bool ready = view && view->frames && server && server->connected;
@@ -908,7 +920,7 @@ void ClientWindow::Repaint() {
 
 LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 #if RVM_REMOTE_CONTROL
-    if (ControlMessage(msg, wp, lp)) {
+    if (ControlMessage(Hwnd(), msg, wp, lp)) {
         return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP || msg == WM_XBUTTONDBLCLK ? TRUE : 0;
     }
 #endif
@@ -958,8 +970,13 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RVM_POPOUT_EVENT: {
         Tile* tile = FindTile(KeyOf(lp));
         if (!tile || !tile->popout) return 0;
-        if (static_cast<PopoutEvent>(wp) == PopoutEvent::ReturnToCanvas) Dock(*tile);
-        else                                                            SaveConfig();
+        switch (static_cast<PopoutEvent>(wp)) {
+        case PopoutEvent::ReturnToCanvas: Dock(*tile); break;
+#if RVM_REMOTE_CONTROL
+        case PopoutEvent::Control:        BeginControl(tile->key); break;
+#endif
+        default:                          SaveConfig(); break;
+        }
         Render();
         return 0;
     }

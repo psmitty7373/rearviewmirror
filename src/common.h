@@ -55,6 +55,7 @@ constexpr UINT WM_RVM_DEVICE_LOST = WM_APP + 11;
 constexpr UINT WM_RVM_SHOW_MANAGER = WM_APP + 12;   // A second launch asks the first for its window.
 constexpr UINT WM_RVM_MIRROR_IDLE    = WM_APP + 30;   // wParam: mirror id. Hidden, and a frame nobody wanted.
 constexpr UINT WM_RVM_MIRROR_RESTART = WM_APP + 31;   // wParam: mirror id. Needs RestartCapture().
+constexpr UINT WM_RVM_CROP_RESHAPED  = WM_APP + 32;   // To a mirror window: the drawn crop changed size.
 
 // Passed, with the old process id, to a relaunch after a lost graphics device.
 constexpr wchar_t kRestartArg[] = L"--after-device-loss";
@@ -110,9 +111,16 @@ RECT WorkAreaFor(HWND hwnd);
 // the rest is client area, where a press starts a caption drag.
 LRESULT ResizeBorderHitTest(HWND hwnd, LPARAM lp);
 void BeginWindowDrag(HWND hwnd, LPARAM lp);
-// Fits a WM_SIZING rect to native's aspect when locked, sticks it at native
-// size unless Ctrl is down, and clamps it. True when it lands on native size.
-bool ConstrainToNative(WPARAM edge, RECT* rect, SIZE native, bool aspectLocked, SIZE minimum);
+// Their picture is always shown whole and unstretched, so the window keeps
+// native's shape. `native` must not be empty.
+// native scaled, then kept within minimum and kMaxExtent without bending.
+SIZE ScaleNative(SIZE native, double scale, SIZE minimum);
+// Fits a WM_SIZING rect, sticking at native size unless Ctrl is down. True
+// when it lands on native size.
+bool ConstrainToNative(WPARAM edge, RECT* rect, SIZE native, SIZE minimum);
+// For WM_WINDOWPOSCHANGING: any other new size (a snap, a restored place)
+// shrinks to the shape inside it.
+void HoldAspect(WINDOWPOS* pos, SIZE native, SIZE minimum);
 
 // Shared, cached per size; never destroy the result.
 HICON LoadAppIcon(int size);

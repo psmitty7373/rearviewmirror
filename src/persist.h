@@ -23,7 +23,6 @@ struct MirrorState {
     RECT placement{};  // Mirror window rect in screen pixels; empty means "auto".
 
     float     opacity      = 1.0f;
-    bool      aspectLocked = true;
     TrackMode track        = TrackMode::Anchored;
 
     // A disabled mirror keeps its place in the list but stops capturing.

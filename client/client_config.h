@@ -24,7 +24,6 @@ struct TileLayout {
     RECT  popRect{};              // Screen pixels; empty means "place it".
     float popOpacity = 1.0f;
     bool  popClickThrough = false;
-    bool  popAspectLocked = true;
 };
 
 constexpr size_t kMaxSavedServers = 16;

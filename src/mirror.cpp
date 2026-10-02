@@ -12,7 +12,6 @@ constexpr int kScreenMargin = 24;
 
 enum MenuId : UINT {
     kIdReselectRegion = 100,
-    kIdAspectLock,
     kIdClickThrough,
     kIdHide,
     kIdClose,
@@ -65,7 +64,7 @@ Mirror::~Mirror() {
 void Mirror::ConstrainSizing(WPARAM edge, RECT* rect) {
     const SIZE native = renderer_.EffectiveCropSize();
     if (native.cx <= 0 || native.cy <= 0) return;
-    const bool nowSnapped = ConstrainToNative(edge, rect, native, state_.aspectLocked, { kMinWidth, kMinHeight });
+    const bool nowSnapped = ConstrainToNative(edge, rect, native, { kMinWidth, kMinHeight });
     if (nowSnapped != snapped_) {
         snapped_ = nowSnapped;
         UpdateBorder();   // The WM_SIZE that follows repaints.
@@ -77,17 +76,14 @@ void Mirror::PlaceInitially() {
     const int maxW = static_cast<int>(RectW(work) * 0.6);
     const int maxH = static_cast<int>(RectH(work) * 0.6);
 
-    int w = (std::max)(RectW(state_.crop), kMinWidth);
-    int h = (std::max)(RectH(state_.crop), kMinHeight);
-
-    const float scale = (std::min)(1.0f, (std::min)(static_cast<float>(maxW) / w,
-                                                    static_cast<float>(maxH) / h));
-    w = ClampExtent(static_cast<int>(w * scale), kMinWidth);
-    h = ClampExtent(static_cast<int>(h * scale), kMinHeight);
+    const SIZE native{ (std::max)(RectW(state_.crop), 1), (std::max)(RectH(state_.crop), 1) };
+    const double scale = (std::min)(1.0, (std::min)(static_cast<double>(maxW) / native.cx,
+                                                    static_cast<double>(maxH) / native.cy));
+    const SIZE s = ScaleNative(native, scale, { kMinWidth, kMinHeight });
 
     // Top-right corner of the target's monitor, out of the way.
-    SetWindowPos(hwnd_, HWND_TOPMOST, work.right - w - kScreenMargin,
-                 work.top + kScreenMargin, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(hwnd_, HWND_TOPMOST, work.right - s.cx - kScreenMargin,
+                 work.top + kScreenMargin, s.cx, s.cy, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 bool Mirror::StartCapture() {
@@ -178,19 +174,20 @@ void Mirror::FollowDesktopSize(SIZE now) {
     const SIZE was = state_.baseSize;
     if (now.cx <= 0 || now.cy <= 0 || (now.cx == was.cx && now.cy == was.cy) || !WholeDesktop()) return;
 
-    RECT r{};
-    GetWindowRect(hwnd_, &r);
-    const int w = was.cx > 0 ? static_cast<int>(std::lround(static_cast<double>(RectW(r)) * now.cx / was.cx)) : now.cx;
-    const int h = was.cy > 0 ? static_cast<int>(std::lround(static_cast<double>(RectH(r)) * now.cy / was.cy)) : now.cy;
-    r.right = r.left + ClampExtent(w, kMinWidth);
-    r.bottom = r.top + ClampExtent(h, kMinHeight);
-    const RECT p = ClampToVisibleMonitor(r);
-    SetWindowPos(hwnd_, nullptr, p.left, p.top, RectW(p), RectH(p),
-                 SWP_NOZORDER | SWP_NOACTIVATE);
-
+    // The new crop first: the window is held to its shape.
     state_.crop = RECT{ 0, 0, now.cx, now.cy };
     state_.baseSize = now;
     renderer_.SetCrop(state_.crop, state_.baseSize);
+
+    RECT r{};
+    GetWindowRect(hwnd_, &r);
+    const SIZE s = ScaleNative(now, was.cx > 0 ? static_cast<double>(RectW(r)) / was.cx : 1.0,
+                               { kMinWidth, kMinHeight });
+    r.right = r.left + s.cx;
+    r.bottom = r.top + s.cy;
+    const RECT p = ClampToVisibleMonitor(r);
+    SetWindowPos(hwnd_, nullptr, p.left, p.top, RectW(p), RectH(p),
+                 SWP_NOZORDER | SWP_NOACTIVATE);
     NotifyStateChanged();
 }
 
@@ -258,6 +255,7 @@ bool Mirror::Create(const MirrorState& state, HWND target, HWND notify) {
     }
     renderer_.SetCrop(state_.crop, state_.baseSize);
     renderer_.SetTracking(state_.track);
+    FollowCropShape();   // A restored place may predate a reshaped source.
     renderer_.SetOpacity(state_.opacity);
     if (state_.clickThrough) ApplyClickThroughStyle();
 
@@ -481,10 +479,21 @@ void Mirror::SetZoom(float factor, bool persist) {
     if (!hwnd_) return;
     const SIZE native = renderer_.EffectiveCropSize();
     if (native.cx <= 0 || native.cy <= 0) return;
-    const int w = ClampExtent(static_cast<int>(native.cx * factor), kMinWidth);
-    const int h = ClampExtent(static_cast<int>(native.cy * factor), kMinHeight);
-    SetWindowPos(hwnd_, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const SIZE s = ScaleNative(native, factor, { kMinWidth, kMinHeight });
+    SetWindowPos(hwnd_, nullptr, 0, 0, s.cx, s.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     if (persist) NotifyStateChanged();
+}
+
+// The source reshaped the drawn crop: the window keeps its width and takes the new shape.
+void Mirror::FollowCropShape() {
+    const SIZE native = renderer_.EffectiveCropSize();
+    if (!hwnd_ || native.cx <= 0 || native.cy <= 0) return;
+    RECT r{};
+    GetWindowRect(hwnd_, &r);
+    const SIZE s = ScaleNative(native, static_cast<double>(RectW(r)) / native.cx, { kMinWidth, kMinHeight });
+    if (s.cx == RectW(r) && s.cy == RectH(r)) return;
+    SetWindowPos(hwnd_, nullptr, 0, 0, s.cx, s.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    NotifyStateChanged();
 }
 
 void Mirror::ReselectRegion() {
@@ -554,6 +563,14 @@ LRESULT Mirror::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZING:
         ConstrainSizing(wp, reinterpret_cast<RECT*>(lp));
         return TRUE;
+
+    case WM_WINDOWPOSCHANGING:
+        HoldAspect(reinterpret_cast<WINDOWPOS*>(lp), renderer_.EffectiveCropSize(), { kMinWidth, kMinHeight });
+        break;
+
+    case WM_RVM_CROP_RESHAPED:
+        FollowCropShape();
+        return 0;
 
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
@@ -634,8 +651,6 @@ void Mirror::ShowContextMenu(POINT screenPt) {
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(opacity), L"Opacity");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(track), L"When source resizes");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (state_.aspectLocked ? MF_CHECKED : 0), kIdAspectLock,
-                L"Lock aspect ratio");
     AppendMenuW(menu, MF_STRING | (state_.clickThrough ? MF_CHECKED : 0), kIdClickThrough,
                 L"Click-through");
     AppendMenuW(menu, MF_STRING, kIdHide, L"Hide");
@@ -652,8 +667,6 @@ void Mirror::ShowContextMenu(POINT screenPt) {
 
     switch (cmd) {
     case kIdReselectRegion:    ReselectRegion(); break;
-    case kIdAspectLock:        state_.aspectLocked = !state_.aspectLocked;
-                               NotifyStateChanged(); break;
     case kIdClickThrough:      SetClickThrough(!state_.clickThrough); break;
     case kIdHide:              SetHidden(true); break;
     case kIdTrackAnchored:     SetTracking(TrackMode::Anchored); break;

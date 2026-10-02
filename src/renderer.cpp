@@ -130,6 +130,7 @@ const Pipeline& GetPipeline() {
 
 bool MirrorRenderer::Init(HWND hwnd, UINT width, UINT height) {
     std::lock_guard lock(mutex_);
+    hwnd_ = hwnd;
     return comp_.Create(hwnd, width, height) && GetPipeline().ok;
 }
 
@@ -475,8 +476,9 @@ bool MirrorRenderer::RenderLocked() {
     if (RectW(crop) < 1 || RectH(crop) < 1) return false;
     drawPending_ = false;
 
-    effCropW_.store(RectW(crop), std::memory_order_relaxed);
-    effCropH_.store(RectH(crop), std::memory_order_relaxed);
+    const bool reshaped = (effCropW_.exchange(RectW(crop), std::memory_order_relaxed) != RectW(crop)) |
+                          (effCropH_.exchange(RectH(crop), std::memory_order_relaxed) != RectH(crop));
+    if (reshaped) PostMessageW(hwnd_, WM_RVM_CROP_RESHAPED, 0, 0);
 
     const UINT outW = comp_.Width();
     const UINT outH = comp_.Height();

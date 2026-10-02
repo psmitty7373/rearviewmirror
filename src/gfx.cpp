@@ -145,55 +145,51 @@ void BeginWindowDrag(HWND hwnd, LPARAM lp) {
     SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(pt.x, pt.y));
 }
 
-bool ConstrainToNative(WPARAM edge, RECT* rect, SIZE native, bool aspectLocked, SIZE minimum) {
-    constexpr int kSnapPx = 14;   // Grab range around 100%.
-    int w = RectW(*rect);
-    int h = RectH(*rect);
-    const bool horizontal = (edge == WMSZ_LEFT || edge == WMSZ_RIGHT);
-    const bool vertical   = (edge == WMSZ_TOP  || edge == WMSZ_BOTTOM);
-    const double aspect   = static_cast<double>(native.cx) / static_cast<double>(native.cy);
+SIZE ScaleNative(SIZE native, double scale, SIZE minimum) {
+    scale = (std::max)(scale, (std::max)(static_cast<double>(minimum.cx) / native.cx,
+                                         static_cast<double>(minimum.cy) / native.cy));
+    scale = (std::min)(scale, static_cast<double>(kMaxExtent) / (std::max)(native.cx, native.cy));
+    return SIZE{ ClampI(static_cast<int>(std::lround(native.cx * scale)), 1, kMaxExtent),
+                 ClampI(static_cast<int>(std::lround(native.cy * scale)), 1, kMaxExtent) };
+}
 
-    if (aspectLocked) {
-        if (horizontal) {
-            h = static_cast<int>(std::lround(w / aspect));
-        } else if (vertical) {
-            w = static_cast<int>(std::lround(h * aspect));
-        } else {
-            // Corner drag: project onto the aspect line.
-            const double projected = (w + h / aspect) * (aspect * aspect) / (aspect * aspect + 1.0);
-            w = static_cast<int>(std::lround(projected));
-            h = static_cast<int>(std::lround(projected / aspect));
-        }
-    }
+bool ConstrainToNative(WPARAM edge, RECT* rect, SIZE native, SIZE minimum) {
+    constexpr int kSnapPx = 14;   // Grab range around 100%.
+    const double w = RectW(*rect), h = RectH(*rect);
+    const double aspect = static_cast<double>(native.cx) / native.cy;
+    double scale;
+    if (edge == WMSZ_LEFT || edge == WMSZ_RIGHT)      scale = w / native.cx;
+    else if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM) scale = h / native.cy;
+    else scale = (w + h / aspect) * (aspect * aspect) / (aspect * aspect + 1.0) / native.cx;   // Corner: onto the aspect line.
 
     // Ctrl slides straight past 100%.
-    if (!(GetKeyState(VK_CONTROL) & 0x8000)) {
-        if (aspectLocked) {
-            if (std::abs(w - native.cx) <= kSnapPx) {
-                w = native.cx;
-                h = native.cy;
-            }
-        } else {
-            if (std::abs(w - native.cx) <= kSnapPx) w = native.cx;
-            if (std::abs(h - native.cy) <= kSnapPx) h = native.cy;
-        }
-    }
-
-    w = ClampI(w, minimum.cx, kMaxExtent);
-    h = ClampI(h, minimum.cy, kMaxExtent);
+    if (!(GetKeyState(VK_CONTROL) & 0x8000) && std::abs(scale * native.cx - native.cx) <= kSnapPx) scale = 1.0;
+    const SIZE s = ScaleNative(native, scale, minimum);
 
     // Keep whichever edges the user is not dragging pinned.
     if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT) {
-        rect->left = rect->right - w;
+        rect->left = rect->right - s.cx;
     } else {
-        rect->right = rect->left + w;
+        rect->right = rect->left + s.cx;
     }
     if (edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT) {
-        rect->top = rect->bottom - h;
+        rect->top = rect->bottom - s.cy;
     } else {
-        rect->bottom = rect->top + h;
+        rect->bottom = rect->top + s.cy;
     }
-    return w == native.cx && h == native.cy;
+    return s.cx == native.cx && s.cy == native.cy;
+}
+
+void HoldAspect(WINDOWPOS* pos, SIZE native, SIZE minimum) {
+    if ((pos->flags & SWP_NOSIZE) || native.cx <= 0 || native.cy <= 0 || pos->cx <= 0 || pos->cy <= 0) return;
+    // Within rounding of the shape already, as every drag through ConstrainToNative is.
+    const double aspect = static_cast<double>(native.cx) / native.cy;
+    if (std::abs(std::lround(pos->cx / aspect) - pos->cy) <= 1 ||
+        std::abs(std::lround(pos->cy * aspect) - pos->cx) <= 1) return;
+    const SIZE s = ScaleNative(native, (std::min)(static_cast<double>(pos->cx) / native.cx,
+                                                  static_cast<double>(pos->cy) / native.cy), minimum);
+    pos->cx = s.cx;
+    pos->cy = s.cy;
 }
 
 HICON LoadAppIcon(int size) {
