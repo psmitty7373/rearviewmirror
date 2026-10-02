@@ -5,6 +5,10 @@
 
 namespace rvm {
 
+// Mirror to app, wParam the mirror's id.
+constexpr UINT WM_RVM_MIRROR_IDLE    = WM_APP + 30;   // Hidden, and a frame nobody wanted.
+constexpr UINT WM_RVM_MIRROR_RESTART = WM_APP + 31;   // Needs RestartCapture().
+
 // One floating always-on-top view of a rectangular slice of another window,
 // or of the whole desktop.
 class Mirror : public WindowHost {
@@ -36,7 +40,21 @@ public:
 
     // Bind an orphaned mirror to a window that has since appeared. Windows in
     // `exclude` are already someone else's source.
-    bool TryRebind(const std::vector<HWND>& exclude, HWND preferred = nullptr);
+    bool TryRebind(const std::vector<HWND>& exclude, HWND preferred = nullptr,
+                   ExeNameCache* exes = nullptr);
+
+    // Hidden with nobody watching, a mirror sleeps: capture stops until it is
+    // shown or watched. It reports such a frame to `notify`; the app, which
+    // knows who watches, calls Sleep.
+    void Sleep();
+    bool Sleeping() const { return sleeping_; }
+    // Whether an unwanted frame was reported since last asked.
+    bool TakeIdleReport() { return idleReported_.exchange(false); }
+
+    // Captures afresh: a sleeping mirror wakes, and a running one starts over
+    // so a still source sends a whole new frame. The mirror asks for this
+    // through `notify`, as starting a capture must wait for any other.
+    void RestartCapture();
 
     std::wstring DisplayName() const;
     MirrorState SaveState() const;
@@ -46,8 +64,9 @@ public:
     void SetClickThrough(bool enabled);
     bool ClickThrough() const { return state_.clickThrough; }
 
-    // Hidden keeps capturing and streaming with no window on screen. Since a
-    // hidden mirror cannot be right-clicked, the manager and tray bring it back.
+    // Hidden keeps streaming with no window on screen, capturing only while
+    // watched (see Sleep). Since a hidden mirror cannot be right-clicked, the
+    // manager and tray bring it back.
     void SetHidden(bool hidden);
     bool Hidden() const { return state_.hidden; }
 
@@ -72,7 +91,9 @@ public:
     SIZE NativeSize() const;
     float CurrentScale() const;
 
-    void SetFrameSink(MirrorRenderer::FrameSink sink) { renderer_.SetFrameSink(std::move(sink)); }
+    void SetFrameSink(MirrorRenderer::FrameSink sink, std::function<bool()> wanted) {
+        renderer_.SetFrameSink(std::move(sink), std::move(wanted));
+    }
     void RepushFrame() { renderer_.RepushFrame(); }
 
     LRESULT WndProc(UINT msg, WPARAM wp, LPARAM lp);
@@ -80,14 +101,20 @@ public:
 private:
     bool StartCapture();
     void StopCapture();
+    // A frame nobody wanted, from any thread: tells `notify`, once until asked.
+    void ReportIdle();
+    void RequestRestart();
+    // The source can't be captured now: wait and retry like an orphan.
+    void WaitForSource();
     // The crop is the whole desktop as it was when last sized.
     bool WholeDesktop() const;
-    // An entire-desktop mirror follows the desktop to its current size.
-    void FollowDesktopSize();
+    // An entire-desktop mirror follows the desktop to the size it now has.
+    void FollowDesktopSize(SIZE now);
     SIZE ContentSize() const;
+    bool SourceAlive() const;
     void ShowContextMenu(POINT screenPt);
     void ApplyClickThroughStyle();
-    void UpdateVisibility();   // Shown only when on, bound and not hidden.
+    void UpdateVisibility();   // Shown only when on, bound, not hidden and awake.
     void UpdateBorder();
     void PlaceInitially();
     void NotifyStateChanged();
@@ -100,11 +127,15 @@ private:
 
     const uint32_t id_;
     HWND target_ = nullptr;
+    DWORD targetThread_ = 0, targetProcess_ = 0;   // Whose target_ was, when captured.
     HWND notify_ = nullptr;
 
     bool hovered_  = false;
     bool snapped_  = false;   // Held at 100% by the resize detent.
     bool orphaned_ = false;
+    bool sleeping_ = false;
+    std::atomic<bool> idleReported_{ false };
+    RECT sizeMoveStart_{};
     // Capture is starting or stopping, which pumps messages; nothing nested
     // may start or stop it meanwhile.
     bool transitioning_ = false;

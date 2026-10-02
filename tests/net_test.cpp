@@ -570,10 +570,10 @@ static void TestEncoderPresets() {
     }
 }
 
-// The whole desktop as one texture the size of the virtual screen. Capture
-// sends every monitor's current picture as soon as it starts, so frames come
-// without anything on screen changing. Only frames are counted; no pixel is
-// ever read back.
+// The whole desktop, each monitor's frames placed in the virtual screen.
+// Capture sends every monitor's current picture as soon as it starts, so
+// frames come without anything on screen changing. Only frames are counted;
+// no pixel is ever read back.
 template <class Pred>
 static bool WaitFor(Pred pred, int timeoutMs);
 
@@ -585,21 +585,25 @@ static void TestDesktopCapture() {
     }
     const RECT bounds = DesktopCapture::Bounds();
     std::atomic<int> frames{ 0 };
-    std::atomic<bool> sizeOk{ true };
+    std::atomic<int> afterFrames{ 0 };
+    std::atomic<bool> placeOk{ true };
     DesktopCapture capture;
-    const bool started = capture.Start([&](ID3D11Texture2D* texture, UINT w, UINT h) {
+    const bool started = capture.Start([&](const DesktopFrame& f) {
         D3D11_TEXTURE2D_DESC d{};
-        texture->GetDesc(&d);
-        if (w != static_cast<UINT>(RectW(bounds)) || h != static_cast<UINT>(RectH(bounds)) ||
-            d.Width != w || d.Height != h) {
-            sizeOk = false;
+        f.texture->GetDesc(&d);
+        if (f.desktop.cx != RectW(bounds) || f.desktop.cy != RectH(bounds) ||
+            f.width > d.Width || f.height > d.Height || f.at.x < 0 || f.at.y < 0 ||
+            f.at.x + static_cast<LONG>(f.width) > f.desktop.cx ||
+            f.at.y + static_cast<LONG>(f.height) > f.desktop.cy) {
+            placeOk = false;
         }
         ++frames;
-    });
+    }, [&] { ++afterFrames; });
     Check(started, "desktop capture starts");
     if (!started) return;
     Check(WaitFor([&] { return frames.load() >= 1; }, 3000), "a desktop frame arrives");
-    Check(sizeOk.load(), "desktop frames span the whole virtual screen");
+    Check(placeOk.load(), "monitor frames lie within the virtual screen");
+    Check(WaitFor([&] { return afterFrames.load() >= 1; }, 1000), "the after-frame hook runs");
     const SIZE content = capture.ContentSize();
     Check(content.cx == RectW(bounds) && content.cy == RectH(bounds), "content size is the virtual screen");
     printf("  %ldx%ld virtual screen, %d frame(s) so far\n", RectW(bounds), RectH(bounds),

@@ -146,19 +146,32 @@ void Mirror::PlaceInitially() {
 
 bool Mirror::StartCapture() {
     const Busy busy(transitioning_);
-    const auto onFrame = [this](ID3D11Texture2D* tex, UINT w, UINT h) {
-        renderer_.SubmitFrame(tex, w, h);
-    };
-    HWND self = hwnd_;
-    const bool started = IsDesktop()
-        ? desktop_.Start(onFrame)
-        : capture_.Start(target_, onFrame, [self] { PostMessageW(self, WM_RVM_TARGET_LOST, 0, 0); });
+    idleReported_ = false;
+    const auto present = [this] { renderer_.PresentFrames(); };
+    bool started = false;
+    if (IsDesktop()) {
+        // Monitors may have moved: nothing of the old layout may linger.
+        renderer_.DropFrames(/*blank=*/false);
+        const RECT desk = DesktopCapture::Bounds();
+        FollowDesktopSize(SIZE{ RectW(desk), RectH(desk) });
+        started = desktop_.Start([this](const DesktopFrame& f) {
+            if (!renderer_.SubmitFrame(f.texture, f.width, f.height, f.at, f.desktop)) ReportIdle();
+        }, present);
+    } else {
+        targetThread_ = GetWindowThreadProcessId(target_, &targetProcess_);
+        HWND self = hwnd_;
+        started = capture_.Start(target_,
+            [this](ID3D11Texture2D* tex, UINT w, UINT h) {
+                const SIZE whole{ static_cast<LONG>(w), static_cast<LONG>(h) };
+                if (!renderer_.SubmitFrame(tex, w, h, POINT{}, whole)) ReportIdle();
+            },
+            present, [self] { PostMessageW(self, WM_RVM_TARGET_LOST, 0, 0); });
+    }
     if (!started) return false;
     if (!hwnd_) {   // Destroyed while starting.
         StopCapture();
         return false;
     }
-    if (IsDesktop()) FollowDesktopSize();
     return true;
 }
 
@@ -166,6 +179,46 @@ void Mirror::StopCapture() {
     const Busy busy(transitioning_);
     capture_.Stop();
     desktop_.Stop();
+}
+
+void Mirror::ReportIdle() {
+    if (notify_ && !idleReported_.exchange(true)) {
+        PostMessageW(notify_, WM_RVM_MIRROR_IDLE, id_, 0);
+    }
+}
+
+void Mirror::RequestRestart() {
+    if (notify_) PostMessageW(notify_, WM_RVM_MIRROR_RESTART, id_, 0);
+}
+
+void Mirror::Sleep() {
+    if (!hwnd_ || transitioning_ || sleeping_ || !state_.enabled || orphaned_ || !state_.hidden) return;
+    sleeping_ = true;   // First: being shown while stopping must wake it after.
+    StopCapture();
+    // A window keeps its last picture, as a minimized one sends none on waking.
+    // Monitors always do, so the desktop's memory can go.
+    if (hwnd_ && IsDesktop()) renderer_.DropFrames(/*blank=*/true);
+}
+
+void Mirror::RestartCapture() {
+    if (!hwnd_ || transitioning_ || !state_.enabled || orphaned_) return;
+    if (!sleeping_) {
+        StopCapture();
+        if (!hwnd_) return;
+    }
+    sleeping_ = false;
+    if (SourceAlive() && StartCapture()) {
+        UpdateVisibility();
+        return;
+    }
+    if (hwnd_) WaitForSource();
+}
+
+void Mirror::WaitForSource() {
+    target_ = nullptr;
+    orphaned_ = true;
+    UpdateVisibility();
+    if (notify_) PostMessageW(notify_, WM_RVM_MIRROR_ORPHANED, id_, 0);
 }
 
 bool Mirror::WholeDesktop() const {
@@ -177,8 +230,7 @@ bool Mirror::WholeDesktop() const {
 // entire desktop stays the entire desktop, and the window keeps its zoom so
 // it covers the same share of the screen. A region keeps its tracking mode,
 // as a window mirror does.
-void Mirror::FollowDesktopSize() {
-    const SIZE now = desktop_.ContentSize();
+void Mirror::FollowDesktopSize(SIZE now) {
     const SIZE was = state_.baseSize;
     if (now.cx <= 0 || now.cy <= 0 || (now.cx == was.cx && now.cy == was.cy) || !WholeDesktop()) return;
 
@@ -199,7 +251,19 @@ void Mirror::FollowDesktopSize() {
 }
 
 SIZE Mirror::ContentSize() const {
-    return IsDesktop() ? desktop_.ContentSize() : capture_.ContentSize();
+    if (!IsDesktop()) return sleeping_ ? CaptureItemSize(target_) : capture_.ContentSize();
+    if (!sleeping_) return desktop_.ContentSize();
+    const RECT desk = DesktopCapture::Bounds();
+    return SIZE{ RectW(desk), RectH(desk) };
+}
+
+// Asleep, nothing reports the window closing, and its handle may since have
+// been reused by another window.
+bool Mirror::SourceAlive() const {
+    if (IsDesktop()) return true;
+    DWORD process = 0;
+    const DWORD thread = GetWindowThreadProcessId(target_, &process);
+    return thread != 0 && thread == targetThread_ && process == targetProcess_;
 }
 
 bool Mirror::Create(const MirrorState& state, HWND target, HWND notify) {
@@ -265,7 +329,7 @@ bool Mirror::Create(const MirrorState& state, HWND target, HWND notify) {
 
 void Mirror::UpdateVisibility() {
     if (!hwnd_) return;
-    const bool visible = state_.enabled && !orphaned_ && !state_.hidden;
+    const bool visible = state_.enabled && !orphaned_ && !state_.hidden && !sleeping_;
     renderer_.SetPresenting(visible);
     if (visible) {
         SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
@@ -284,6 +348,7 @@ bool Mirror::SetEnabled(bool enabled, const std::vector<HWND>& exclude, HWND pre
         StopCapture();
         state_.enabled = false;
         orphaned_ = false;   // Off is a deliberate state; nothing to wait for.
+        sleeping_ = false;
         UpdateVisibility();
         NotifyStateChanged();
         return true;
@@ -291,7 +356,7 @@ bool Mirror::SetEnabled(bool enabled, const std::vector<HWND>& exclude, HWND pre
 
     // The source may have closed or restarted while we were off. Another
     // mirror of the same window already knows where it is now.
-    if (!IsDesktop() && !IsWindow(target_)) {
+    if (!SourceAlive()) {
         HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude);
         if (!found) return false;
         target_ = found;
@@ -312,6 +377,11 @@ void Mirror::SetHidden(bool hidden) {
     if (!hwnd_ || state_.hidden == hidden) return;
     state_.hidden = hidden;
     UpdateVisibility();
+    if (hidden) {
+        ReportIdle();   // Sleeps now if nobody watches, not at the next frame.
+    } else if (sleeping_) {
+        RequestRestart();
+    }
     NotifyStateChanged();
 }
 
@@ -320,11 +390,13 @@ void Mirror::Orphan() {
     StopCapture();
     target_ = nullptr;
     orphaned_ = true;
+    sleeping_ = false;
     UpdateVisibility();
 }
 
+// A sleeping one starts on the new layout when it wakes.
 bool Mirror::RestartDesktop() {
-    if (!hwnd_ || transitioning_ || !IsDesktop() || !state_.enabled) return true;
+    if (!hwnd_ || transitioning_ || !IsDesktop() || !state_.enabled || sleeping_) return true;
     StopCapture();
     // Stopping pumps messages, and one of them can retire this mirror.
     if (!hwnd_) return true;
@@ -333,15 +405,12 @@ bool Mirror::RestartDesktop() {
         UpdateVisibility();
         return true;
     }
-    // Mid-reconfiguration the monitors can refuse for a moment: wait and
-    // retry on the same timer as a mirror whose window has gone.
-    orphaned_ = true;
-    UpdateVisibility();
-    if (notify_) PostMessageW(notify_, WM_RVM_MIRROR_ORPHANED, id_, 0);
+    // Mid-reconfiguration the monitors can refuse for a moment.
+    WaitForSource();
     return false;
 }
 
-bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred) {
+bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred, ExeNameCache* exes) {
     if (!hwnd_ || transitioning_ || !orphaned_) return false;
 
     if (IsDesktop()) {
@@ -351,7 +420,7 @@ bool Mirror::TryRebind(const std::vector<HWND>& exclude, HWND preferred) {
         return true;
     }
 
-    HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude);
+    HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude, exes);
     if (!found) return false;
 
     target_ = found;
@@ -379,8 +448,8 @@ std::wstring Mirror::DisplayName() const {
 #if RVM_REMOTE_CONTROL
 bool Mirror::IsFullDesktop() const {
     if (!IsDesktop() || !Enabled() || Orphaned()) return false;
-    const SIZE size = desktop_.ContentSize();
     const RECT bounds = DesktopCapture::Bounds();
+    const SIZE size = sleeping_ ? SIZE{ RectW(bounds), RectH(bounds) } : desktop_.ContentSize();
     const bool whole = state_.baseSize.cx > 0 && state_.baseSize.cy > 0 &&
         state_.crop.left == 0 && state_.crop.top == 0 && state_.crop.right == state_.baseSize.cx &&
         state_.crop.bottom == state_.baseSize.cy;
@@ -465,7 +534,7 @@ float Mirror::CurrentScale() const {
 
 void Mirror::SetTracking(TrackMode mode) {
     state_.track = mode;
-    renderer_.SetTracking(mode);
+    if (renderer_.SetTracking(mode)) RequestRestart();
     renderer_.Redraw();
     NotifyStateChanged();
 }
@@ -481,7 +550,7 @@ void Mirror::SetZoom(float factor, bool persist) {
 }
 
 void Mirror::ReselectRegion() {
-    if (!IsDesktop() && !IsWindow(target_)) return;
+    if (!SourceAlive()) return;
     const SIZE content = ContentSize();
     if (content.cx <= 0 || content.cy <= 0) return;
 
@@ -497,7 +566,7 @@ void Mirror::ReselectRegion() {
 
     state_.crop     = picked;
     state_.baseSize = content;
-    renderer_.SetCrop(state_.crop, state_.baseSize);
+    if (renderer_.SetCrop(state_.crop, state_.baseSize)) RequestRestart();
     SetZoom(1.0f, /*persist=*/false);
     renderer_.Redraw();
     NotifyStateChanged();
@@ -587,14 +656,21 @@ LRESULT Mirror::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_EXITSIZEMOVE:
+    case WM_ENTERSIZEMOVE:
+        GetWindowRect(hwnd_, &sizeMoveStart_);
+        return 0;
+
+    case WM_EXITSIZEMOVE: {
         if (snapped_) {   // The detent cue belongs to the drag, not the size.
             snapped_ = false;
             UpdateBorder();
             renderer_.Redraw();
         }
-        NotifyStateChanged();
+        RECT r{};
+        GetWindowRect(hwnd_, &r);
+        if (!EqualRect(&r, &sizeMoveStart_)) NotifyStateChanged();   // Not for a plain click.
         return 0;
+    }
 
     case WM_RBUTTONUP: {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };

@@ -65,15 +65,19 @@ constexpr int kMaxMirrors = 32;
 std::vector<MirrorState> LoadMirrorStates();
 
 // Writes the whole file atomically, as UTF-16 with a BOM so titles in any
-// script round-trip.
+// script round-trip; skipped if it would not change. UI thread only.
 bool SaveMirrorStates(const std::vector<MirrorState>& states);
 
 // Record which window a mirror is watching, so it can be found again later.
 void FillIdentity(HWND hwnd, MirrorState& state);
 
+// Executable names by process id, for the searches of one pass to share.
+using ExeNameCache = std::vector<std::pair<DWORD, std::wstring>>;
+
 // The live window that best matches a saved identity, or nullptr. Windows in
 // `exclude` are never chosen, so two saved mirrors cannot share one source.
-HWND FindMatchingWindow(const MirrorState& state, const std::vector<HWND>& exclude = {});
+HWND FindMatchingWindow(const MirrorState& state, const std::vector<HWND>& exclude = {},
+                        ExeNameCache* exes = nullptr);
 
 // Nudge a saved rect back onto a currently-connected monitor.
 RECT ClampToVisibleMonitor(const RECT& rect);

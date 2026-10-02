@@ -69,29 +69,30 @@ WindowCapture::~WindowCapture() {
 
 SIZE WindowCapture::ContentSize() const {
     if (!shared_) return SIZE{ 0, 0 };
-    std::lock_guard lock(shared_->mutex);
-    return SIZE{ shared_->poolSize.Width, shared_->poolSize.Height };
+    return SIZE{ shared_->poolW.load(), shared_->poolH.load() };
 }
 
-bool WindowCapture::Start(HWND target, FrameCallback onFrame, std::function<void()> onClosed) {
+bool WindowCapture::Start(HWND target, FrameCallback onFrame, AfterFrame afterFrame,
+                          std::function<void()> onClosed) {
     Stop();
     try {
         auto item = CreateItemForWindow(target);
         if (!item) return false;
         // The window's pixels, not the pointer hovering over them.
-        return StartItem(item, /*cursor=*/false, std::move(onFrame), std::move(onClosed));
+        return StartItem(item, /*cursor=*/false, std::move(onFrame), std::move(afterFrame),
+                         std::move(onClosed));
     } catch (...) {
         return false;
     }
 }
 
-bool WindowCapture::StartMonitor(HMONITOR monitor, FrameCallback onFrame) {
+bool WindowCapture::StartMonitor(HMONITOR monitor, FrameCallback onFrame, AfterFrame afterFrame) {
     Stop();
     try {
         auto item = CreateItemForMonitor(monitor);
         if (!item) return false;
         // Someone watching a screen needs to see where the pointer is.
-        return StartItem(item, /*cursor=*/true, std::move(onFrame), nullptr);
+        return StartItem(item, /*cursor=*/true, std::move(onFrame), std::move(afterFrame), nullptr);
     } catch (...) {
         return false;
     }
@@ -100,19 +101,22 @@ bool WindowCapture::StartMonitor(HMONITOR monitor, FrameCallback onFrame) {
 // Built in locals and kept only once running: these calls can pump messages,
 // and a nested Stop must not find a half-built capture.
 bool WindowCapture::StartItem(wgc::GraphicsCaptureItem item, bool cursor, FrameCallback onFrame,
-                              std::function<void()> onClosed) {
+                              AfterFrame afterFrame, std::function<void()> onClosed) {
     auto& g = Gfx::Get();
 
     wgc::Direct3D11CaptureFramePool pool{ nullptr };
     wgc::GraphicsCaptureSession session{ nullptr };
     try {
         auto shared = std::make_shared<Shared>();
-        shared->onFrame  = std::move(onFrame);
-        shared->onClosed = std::move(onClosed);
-        shared->poolSize = item.Size();
+        shared->onFrame    = std::move(onFrame);
+        shared->afterFrame = std::move(afterFrame);
+        shared->onClosed   = std::move(onClosed);
+        const auto size = item.Size();
+        shared->poolW = size.Width;
+        shared->poolH = size.Height;
 
         pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            g.winrtDevice, kFormat, kBufferCount, shared->poolSize);
+            g.winrtDevice, kFormat, kBufferCount, size);
         session = pool.CreateCaptureSession(item);
 
         // No yellow capture frame; the pointer only where asked for.
@@ -127,12 +131,7 @@ bool WindowCapture::StartItem(wgc::GraphicsCaptureItem item, bool cursor, FrameC
         // however fast the source and the display are. Frames still only
         // arrive when the window changes, so a still source costs nothing.
         if (SessionHasProperty(L"MinUpdateInterval")) {
-            try {
-                const auto before = session.MinUpdateInterval();
-                session.MinUpdateInterval(std::chrono::milliseconds(1));
-                RVM_LOG_SAMPLED(20, L"capture: minimum update interval %.2f ms -> %.2f ms",
-                                before.count() / 10000.0, session.MinUpdateInterval().count() / 10000.0);
-            } catch (...) {}
+            try { session.MinUpdateInterval(std::chrono::milliseconds(1)); } catch (...) {}
         }
 
         std::weak_ptr<Shared> weak = shared;
@@ -180,10 +179,14 @@ void WindowCapture::Stop() {
     closed.revoke();
 
     if (shared) {
-        // Blocks until any frame already inside the callback has finished.
-        std::lock_guard lock(shared->mutex);
-        shared->onFrame = nullptr;
-        shared->onClosed = nullptr;
+        // Blocks until any frame already inside the callbacks has finished.
+        {
+            std::lock_guard lock(shared->mutex);
+            shared->onFrame = nullptr;
+            shared->onClosed = nullptr;
+        }
+        std::lock_guard lock(shared->afterMutex);
+        shared->afterFrame = nullptr;
     }
 
     if (session) {
@@ -203,16 +206,15 @@ void WindowCapture::OnFrame(Shared& state, wgc::Direct3D11CaptureFramePool const
         if (!frame) return;
         const auto contentSize = frame.ContentSize();
 
+        // Recorded only once the pool really is that size, so a failed
+        // recreate is tried again on the next frame.
+        if (contentSize.Width != state.poolW.load() || contentSize.Height != state.poolH.load()) {
+            needsResize = true;
+            newSize = contentSize;
+        }
+
         {
             std::lock_guard lock(state.mutex);
-            if (contentSize.Width != state.poolSize.Width ||
-                contentSize.Height != state.poolSize.Height) {
-                // Recorded only once the pool really is that size, so a failed
-                // recreate is tried again on the next frame.
-                needsResize = true;
-                newSize = contentSize;
-            }
-
             if (state.onFrame) {
                 auto access = frame.Surface().as<
                     ::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
@@ -235,12 +237,15 @@ void WindowCapture::OnFrame(Shared& state, wgc::Direct3D11CaptureFramePool const
     if (needsResize && newSize.Width > 0 && newSize.Height > 0) {
         try {
             pool.Recreate(Gfx::Get().winrtDevice, kFormat, kBufferCount, newSize);
-            std::lock_guard lock(state.mutex);
-            state.poolSize = newSize;
+            state.poolW = newSize.Width;
+            state.poolH = newSize.Height;
         } catch (const winrt::hresult_error& e) {
             Gfx::Get().CheckDevice(e.code());
         } catch (...) {}
     }
+
+    std::lock_guard lock(state.afterMutex);
+    if (state.afterFrame) state.afterFrame();
 }
 
 // ---------------------------------------------------------------------------
@@ -257,15 +262,8 @@ RECT DesktopCapture::Bounds() {
                  y + GetSystemMetrics(SM_CYVIRTUALSCREEN) };
 }
 
-SIZE DesktopCapture::ContentSize() const {
-    if (!shared_) return SIZE{ 0, 0 };
-    std::lock_guard lock(shared_->mutex);
-    return shared_->size;
-}
-
-bool DesktopCapture::Start(FrameCallback onFrame) {
+bool DesktopCapture::Start(FrameCallback onFrame, WindowCapture::AfterFrame afterFrame) {
     Stop();
-    auto& g = Gfx::Get();
 
     const RECT bounds = Bounds();
     const int width = RectW(bounds), height = RectH(bounds);
@@ -273,36 +271,7 @@ bool DesktopCapture::Start(FrameCallback onFrame) {
         Log(L"capture: desktop %dx%d cannot be captured as one texture", width, height);
         return false;
     }
-
-    auto shared = std::make_shared<Shared>();
-    shared->onFrame = std::move(onFrame);
-    shared->size = SIZE{ width, height };
-
-    // Opaque black to start with: the gaps between monitors stay that way,
-    // and a monitor shows black until its first frame, never garbage.
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width      = static_cast<UINT>(width);
-    desc.Height     = static_cast<UINT>(height);
-    desc.MipLevels  = 1;
-    desc.ArraySize  = 1;
-    desc.Format     = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc = { 1, 0 };
-    desc.Usage      = D3D11_USAGE_DEFAULT;
-    desc.BindFlags  = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    {
-        std::lock_guard device(g.deviceMutex);
-        HRESULT hr = g.d3d->CreateTexture2D(&desc, nullptr, shared->composite.put());
-        winrt::com_ptr<ID3D11RenderTargetView> rtv;
-        if (SUCCEEDED(hr)) hr = g.d3d->CreateRenderTargetView(shared->composite.get(), nullptr, rtv.put());
-        if (FAILED(hr)) {
-            g.CheckDevice(hr);
-            Log(L"capture: desktop texture %dx%d failed 0x%08X", width, height,
-                static_cast<unsigned>(hr));
-            return false;
-        }
-        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-        g.ctx->ClearRenderTargetView(rtv.get(), black);
-    }
+    const SIZE size{ width, height };
 
     std::vector<std::pair<HMONITOR, RECT>> monitors;
     EnumDisplayMonitors(nullptr, nullptr,
@@ -318,7 +287,6 @@ bool DesktopCapture::Start(FrameCallback onFrame) {
 
     // Kept only once complete, as in WindowCapture::StartItem.
     std::vector<std::unique_ptr<WindowCapture>> captures;
-    std::weak_ptr<Shared> weak = shared;
     for (const auto& [monitor, rect] : monitors) {
         const LONG atX = rect.left - bounds.left;
         const LONG atY = rect.top - bounds.top;
@@ -326,29 +294,14 @@ bool DesktopCapture::Start(FrameCallback onFrame) {
 
         auto capture = std::make_unique<WindowCapture>();
         const bool started = capture->StartMonitor(monitor,
-            [weak, atX, atY](ID3D11Texture2D* frame, UINT contentW, UINT contentH) {
-                auto s = weak.lock();
-                if (!s) return;
-                // One monitor at a time: the copy and the hand-on are a unit,
-                // so each frame passed on includes every copy before it.
-                std::lock_guard lock(s->mutex);
-                if (!s->onFrame || !s->composite) return;
-
+            [onFrame, atX, atY, size](ID3D11Texture2D* frame, UINT contentW, UINT contentH) {
                 D3D11_TEXTURE2D_DESC fd{};
                 frame->GetDesc(&fd);
-                const UINT w = (std::min)({ contentW, fd.Width, static_cast<UINT>(s->size.cx - atX) });
-                const UINT h = (std::min)({ contentH, fd.Height, static_cast<UINT>(s->size.cy - atY) });
-                if (w == 0 || h == 0) return;
-                {
-                    auto& gfx = Gfx::Get();
-                    std::lock_guard device(gfx.deviceMutex);
-                    const D3D11_BOX box{ 0, 0, 0, w, h, 1 };
-                    gfx.ctx->CopySubresourceRegion(s->composite.get(), 0, static_cast<UINT>(atX),
-                                                   static_cast<UINT>(atY), 0, frame, 0, &box);
-                }
-                s->onFrame(s->composite.get(), static_cast<UINT>(s->size.cx),
-                           static_cast<UINT>(s->size.cy));
-            });
+                const UINT w = (std::min)({ contentW, fd.Width, static_cast<UINT>(size.cx - atX) });
+                const UINT h = (std::min)({ contentH, fd.Height, static_cast<UINT>(size.cy - atY) });
+                if (w > 0 && h > 0) onFrame(DesktopFrame{ frame, w, h, POINT{ atX, atY }, size });
+            },
+            afterFrame);
         if (started) {
             captures.push_back(std::move(capture));
         } else {
@@ -358,23 +311,17 @@ bool DesktopCapture::Start(FrameCallback onFrame) {
 
     if (captures.empty()) return false;
     Log(L"capture: desktop %dx%d from %zu monitor(s)", width, height, captures.size());
-    shared_ = std::move(shared);
+    size_ = size;
     monitors_ = std::move(captures);
     return true;
 }
 
 void DesktopCapture::Stop() {
-    // Taken out first, as in WindowCapture::Stop.
+    // Taken out first, as in WindowCapture::Stop. Each monitor's Stop waits
+    // out a frame already in its callbacks.
     auto monitors = std::exchange(monitors_, {});
-    auto shared   = std::exchange(shared_, nullptr);
-    // Each monitor's Stop waits out a frame already in its callback, which
-    // may be waiting for the shared lock; so that lock is not held here.
+    size_ = SIZE{};
     for (auto& m : monitors) m->Stop();
-    if (shared) {
-        std::lock_guard lock(shared->mutex);
-        shared->onFrame = nullptr;
-        shared->composite = nullptr;
-    }
 }
 
 }  // namespace rvm

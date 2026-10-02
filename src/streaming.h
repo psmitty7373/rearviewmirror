@@ -42,8 +42,12 @@ public:
     // A new mirror: from now on its frames can be streamed. Safe before Start.
     void Attach(Mirror& mirror);
 
-    // Mirrors were added, removed, switched or resized: republish the list.
+    // Mirrors were added, removed, switched or resized: republish the list,
+    // if what clients see of it changed.
     void MirrorsChanged();
+
+    // Whether any client watches the mirror; any thread, cheap.
+    bool Watched(uint32_t mirrorId) const;
 
     // Paused, nothing is served and the port is free for someone else: the
     // sign-in service, while this session is not the one on the console. The

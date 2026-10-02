@@ -78,11 +78,13 @@ private:
 #endif
 
     void RestoreSaved();
-    int  TryRestorePending();
-    int  TryRebindOrphans();
+    int  TryRestorePending(ExeNameCache& exes);
+    int  TryRebindOrphans(ExeNameCache& exes);
     int  RunRestorePass();
     bool AnythingWaiting() const;
     void EnsureRestoreTimer();
+    void UpdateForegroundHook();
+    void SleepIdleMirrors();
     // Mirrors of one window share a group (see MirrorState::group).
     std::vector<HWND> TargetsOfOtherGroups(uint32_t group) const;
     HWND TargetOfGroup(uint32_t group, const Mirror* except) const;
@@ -113,7 +115,8 @@ private:
     ULONGLONG lastRestorePassTick_ = 0;
 
     // Reopening an app brings its window to the foreground, so that event is
-    // the cue to rebind right away instead of waiting for the next poll.
+    // the cue to rebind right away instead of waiting for the next poll. Hooked
+    // only while something waits.
     HWINEVENTHOOK foregroundHook_ = nullptr;
 
     uint32_t nextId_ = 1;
