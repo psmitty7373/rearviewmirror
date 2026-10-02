@@ -3,18 +3,17 @@
 
 namespace rvm {
 
-// Everything needed to bring a mirror back after a restart.
 // What a mirror shows.
 enum class SourceKind {
     Window,    // One application window, found again by its identity.
     Desktop,   // Every monitor, as one picture; always available.
 };
 
+// Everything needed to bring a mirror back after a restart.
 struct MirrorState {
     SourceKind source = SourceKind::Window;
 
-    // Window handles are not stable across runs, so a mirror is re-bound by
-    // matching this identity against the live windows at startup.
+    // Handles do not survive restarts; this identity finds the window again.
     std::wstring exeName;
     std::wstring className;
     std::wstring title;
@@ -36,36 +35,31 @@ struct MirrorState {
     // No window on screen, but capture (and so streaming) carries on.
     bool      hidden       = false;
 
-    // Mirrors made from the same window share a group, so they bind to one
-    // window together; different groups never share a window. Never 0 once
-    // loaded or created.
+    // Mirrors of one window share a group and bind together; groups never
+    // share a window. Never 0 once loaded or created.
     uint32_t  group        = 0;
 };
 
-// A group number for a mirror with nothing better to go on: the same for the
-// same saved identity, so mirrors saved from one window still end up together.
+// A fallback group, the same for the same identity: mirrors of one window stay together.
 uint32_t GroupFromIdentity(const MirrorState& state);
 
+// Roaming AppData\RearViewMirror (else the exe's folder), unless SetConfigDir moved it.
 std::wstring ConfigDir();
 std::wstring ConfigPath();
 
-// Puts this process's files (logs, crash dumps) somewhere other than the
-// user's AppData: for processes with no user, like the login service. Call
-// first thing, before any thread starts or anything reads ConfigDir().
+// For processes with no user, like the login service. Call before any thread
+// starts or anything reads ConfigDir().
 void SetConfigDir(const std::wstring& dir);
 
-// Writes to a sibling temp file, then renames over the target, as UTF-16 with
-// a BOM: a crash mid-write leaves the previous file intact.
+// UTF-16 with a BOM, via a temp file and rename: a crash keeps the old file.
 bool WriteTextAtomically(const std::wstring& path, const std::wstring& text);
 
-// The most mirrors the file holds, waiting ones included, and so the most the
-// app makes.
+// The most mirrors the file holds, waiting ones included.
 constexpr int kMaxMirrors = 32;
 
 std::vector<MirrorState> LoadMirrorStates();
 
-// Writes the whole file atomically, as UTF-16 with a BOM so titles in any
-// script round-trip; skipped if it would not change. UI thread only.
+// Skipped if the file would not change. UI thread only.
 bool SaveMirrorStates(const std::vector<MirrorState>& states);
 
 // Record which window a mirror is watching, so it can be found again later.
@@ -74,8 +68,7 @@ void FillIdentity(HWND hwnd, MirrorState& state);
 // Executable names by process id, for the searches of one pass to share.
 using ExeNameCache = std::vector<std::pair<DWORD, std::wstring>>;
 
-// The live window that best matches a saved identity, or nullptr. Windows in
-// `exclude` are never chosen, so two saved mirrors cannot share one source.
+// The live window best matching a saved identity, never one in `exclude`.
 HWND FindMatchingWindow(const MirrorState& state, const std::vector<HWND>& exclude = {},
                         ExeNameCache* exes = nullptr);
 

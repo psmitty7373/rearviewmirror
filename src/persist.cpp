@@ -10,13 +10,10 @@ constexpr int kMaxValueChars = 256;
 constexpr int kMaxCoord = 1 << 20;   // Screen positions; extents use kMaxExtent.
 constexpr int kScreenMargin = 24;
 
-// A match needs more than the executable: exe + class, or exe + title. A bare
-// exe-only guess would bind a saved mirror to whichever of the app's windows
-// happens to be frontmost.
+// A match needs more than the executable: exe + class, or exe + title.
 constexpr int kMinMatchScore = 3;
 
-// Window titles are chosen by other applications and land in a line-based
-// format, where an embedded newline would forge extra keys or whole sections.
+// Titles come from other apps; a newline in one would forge keys or sections.
 std::wstring SanitizeValue(std::wstring s) {
     s.erase(std::remove_if(s.begin(), s.end(),
                            [](wchar_t c) { return c < 0x20 || c == 0x7F; }),
@@ -49,8 +46,7 @@ int ReadExtent(const std::wstring& section, const std::wstring& key,
     return ClampI(ReadInt(section, key, 0, path), 0, kMaxExtent);
 }
 
-// String values are quoted: GetPrivateProfileString strips one pair of quotes,
-// but trims unquoted leading and trailing spaces, which would alter a title.
+// Quoted: GetPrivateProfileString trims spaces from unquoted values.
 void Line(std::wstring& out, const wchar_t* key, const std::wstring& value) {
     out += key;
     out += L"=\"";
@@ -127,8 +123,7 @@ std::wstring ExeNameForPid(DWORD pid) {
     return std::wstring(slash == std::wstring_view::npos ? full : full.substr(slash + 1));
 }
 
-// Titles carry volatile prefixes: a dirty marker ("*", "●") or an unread
-// count ("(3) "). They are ignored when titles are compared.
+// Without volatile prefixes: a dirty marker ("*", "●") or an unread count ("(3) ").
 std::wstring TitleCore(const std::wstring& title) {
     size_t i = 0;
     const auto skipSpace = [&] { while (i < title.size() && iswspace(title[i])) ++i; };
@@ -187,8 +182,7 @@ BOOL CALLBACK MatchProc(HWND hwnd, LPARAM lp) {
             score += 8;
             titled = true;
         } else {
-            // A long shared beginning still counts, but only a substantial
-            // one: a common app-name prefix alone is not evidence.
+            // A long shared beginning counts; an app-name prefix alone does not.
             const size_t shared = (std::min)(title.size(), wanted.size());
             size_t common = 0;
             while (common < shared && title[common] == wanted[common]) ++common;
@@ -232,8 +226,7 @@ void SetConfigDir(const std::wstring& dir) {
 std::wstring ConfigDir() {
     if (!g_configDirOverride.empty()) return g_configDirOverride;
     static const std::wstring dir = [] {
-        // The roaming AppData folder from the shell, not the environment,
-        // which can be missing or overridden.
+        // From the shell, not the environment, which can be missing or overridden.
         std::wstring d;
         PWSTR roaming = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_CREATE, nullptr,
@@ -288,9 +281,7 @@ HWND FindMatchingWindow(const MirrorState& state, const std::vector<HWND>& exclu
     ExeNameCache own;
     MatchState st{ &state, &exclude, exes ? exes : &own };
     EnumWindows(&MatchProc, reinterpret_cast<LPARAM>(&st));
-    // Executable and class alone are enough only when they point at a single
-    // window. With several candidates and no title to choose by, binding to
-    // any of them could mirror, and stream, the wrong window: wait instead.
+    // Without a title, several equal candidates could mean the wrong window: wait.
     if (st.best && !st.bestHasTitle && st.tiedWithoutTitle > 1) return nullptr;
     return st.best;
 }

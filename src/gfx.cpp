@@ -44,8 +44,7 @@ void Log(const wchar_t* fmt, ...) {
                                     GetCurrentThreadId());
     va_list args;
     va_start(args, fmt);
-    // Room is kept for the line ending: wcscat_s on a full buffer would
-    // invoke the invalid-parameter handler and end the process.
+    // Room for the line ending: wcscat_s on a full buffer ends the process.
     const size_t room = ARRAYSIZE(line) - static_cast<size_t>((std::max)(prefix, 0)) - 2;
     _vsnwprintf_s(line + (std::max)(prefix, 0), room, _TRUNCATE, fmt, args);
     va_end(args);
@@ -119,8 +118,6 @@ RECT WorkAreaFor(HWND hwnd) {
 }
 
 HICON LoadAppIcon(int size) {
-    // One icon per size for the life of the process: windows and the tray
-    // hold on to these handles, so they are never destroyed.
     static std::mutex lock;
     static std::vector<std::pair<int, HICON>> cache;
     std::lock_guard<std::mutex> guard(lock);
@@ -219,9 +216,8 @@ Gfx& Gfx::Get() {
 void Gfx::Init() {
     if (d3d) return;
 
-    // VIDEO_SUPPORT enables the video processor and DXVA that streaming uses.
-    // Some drivers (and remote sessions) refuse it; mirrors work without it,
-    // so a device without it beats none.
+    // Streaming needs VIDEO_SUPPORT, which some drivers and remote sessions
+    // refuse; mirrors work without it.
     constexpr UINT kBase = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     constexpr UINT kVideo = kBase | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     const D3D_FEATURE_LEVEL levels[] = {
@@ -304,8 +300,7 @@ bool CompSurface::Create(HWND hwnd, UINT width, UINT height) {
     return true;
 }
 
-// The shared device sends a release only with its next Commit; until then DWM
-// would keep this window's buffers.
+// DWM keeps the buffers until the shared device's next Commit.
 CompSurface::~CompSurface() {
     if (!target_) return;
     auto& g = Gfx::Get();

@@ -52,8 +52,7 @@ std::wstring Describe(HANDLE process, DWORD64 address) {
     return out;
 }
 
-// Runs on a thread of its own: the crashing thread's stack may be the very
-// thing that is broken.
+// On its own thread: the crashing thread's stack may be what is broken.
 DWORD WINAPI WriteReport(void* param) {
     const auto* job = static_cast<const CrashJob*>(param);
     const HANDLE process = GetCurrentProcess();
@@ -127,8 +126,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
     if (g_handling.exchange(true)) return EXCEPTION_CONTINUE_SEARCH;   // Once.
     CrashJob job{ info, GetCurrentThreadId() };
     if (HANDLE worker = CreateThread(nullptr, 1024 * 1024, &WriteReport, &job, 0, nullptr)) {
-        // Bounded: if the report itself hangs (say the crash left the log's
-        // lock held), the crash still goes on to Windows.
+        // Bounded, in case the report hangs (say on the log's lock).
         WaitForSingleObject(worker, 30000);
         CloseHandle(worker);
     }

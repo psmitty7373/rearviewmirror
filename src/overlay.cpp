@@ -66,8 +66,6 @@ bool D2DOverlay::CreateStyled(const wchar_t* className, const wchar_t* title, RE
     return true;
 }
 
-// Chips (hints, size read-outs, name tags) follow the window's DPI like
-// everything else drawn in it.
 bool D2DOverlay::UpdateChipScale() {
     chipScale_ = hwnd_ ? static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f : 1.0f;
     font_ = nullptr;
@@ -183,8 +181,6 @@ void D2DOverlay::Render() {
             break;
         }
     }
-    // Waits for the display once a frame is already queued: drawing faster
-    // than it refreshes would only be thrown away.
     comp_.Present(1);
 
     if ((frame_ & 63) == 0) {

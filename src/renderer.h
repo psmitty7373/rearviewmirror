@@ -3,8 +3,8 @@
 
 namespace rvm {
 
-// Draws a cropped sub-rectangle of a captured window. Frames are submitted from
-// the capture thread; the UI thread only changes parameters or asks for repaints.
+// Draws a cropped sub-rectangle of a captured window or the desktop. Frames
+// arrive on capture threads; the UI thread changes parameters and redraws.
 class MirrorRenderer {
 public:
     bool Init(HWND hwnd, UINT width, UINT height);
@@ -12,10 +12,9 @@ public:
 
     void Resize(UINT width, UINT height);
 
-    // Crop in capture-texture pixels, plus the capture size it was chosen against:
-    // proportional tracking needs the base to know how far the source has moved.
-    // Only the crop is kept of each frame, so both return true when the crop now
-    // reaches pixels that were never kept: a still source must send a new frame.
+    // Crop in capture pixels, and the capture size it was chosen against. Only
+    // the crop is kept of each frame, so both return true when the crop now
+    // reaches pixels never kept: the capture must restart to send them.
     bool SetCrop(const RECT& crop, const SIZE& baseSize);
     bool SetTracking(TrackMode mode);
 
@@ -29,37 +28,33 @@ public:
     void SetOpacity(float opacity);
     void SetBorder(float r, float g, float b, float a);
 
-    // Off while the window is hidden: frames are still cached and teed to
-    // the stream, but nothing is drawn or presented.
+    // Off while the window is hidden: frames are still cached and streamed,
+    // but nothing is drawn or presented.
     void SetPresenting(bool on) { presenting_.store(on); }
 
-    // On a capture thread, with a frame whose top-left `width` x `height` is
-    // the part at `at` of a source `full` in size: a window is all of its
-    // source, a monitor part of the desktop. Only what the crop shows is kept.
-    // False if nobody wanted it: not presenting, and not streamed.
+    // On a capture thread: a frame whose top-left `width` x `height` is the
+    // part at `at` of a source `full` in size (all of a window, or one monitor
+    // of the desktop). False if nobody wanted it: not presenting, not streamed.
     bool SubmitFrame(ID3D11Texture2D* source, UINT width, UINT height, POINT at, SIZE full);
 
     // After SubmitFrame, once the capture frame is released: draws and presents
     // whatever has arrived. Frames from other threads meanwhile join that draw.
     void PresentFrames();
 
-    // Frees the frame textures until the next frame. `blank` also presents an
-    // empty picture, so nothing old shows when the window next appears.
+    // Frees the frame textures; `blank` also presents an empty picture.
     void DropFrames(bool blank);
 
     // Re-present the last frame after a resize or a parameter change.
     void Redraw();
 
     // Tee for streaming. `wanted` is asked for every frame and must be cheap;
-    // when it says yes, `sink` is called with the cache texture and the
-    // effective crop, on the capture thread, under both the renderer and
-    // device locks. It must be quick; the crop copy is a single GPU blit.
+    // `sink` gets the cache texture and the effective crop, under the renderer
+    // and device locks.
     using FrameSink = std::function<void(ID3D11Texture2D* cache, const RECT& crop)>;
     void SetFrameSink(FrameSink sink, std::function<bool()> wanted);
 
-    // Offers the last frame to the sink again. Capture only delivers frames
-    // when the source changes, so a stream that starts while the source is
-    // still would otherwise never get a first frame.
+    // Offers the last frame to the sink again: capture sends frames only on
+    // change, so a new stream of a still source would get none.
     void RepushFrame();
 
 private:
@@ -71,8 +66,7 @@ private:
     void SyncCacheLocked();
 
     // Draws without presenting. Callers hold presentMutex_, mutex_ and
-    // Gfx::deviceMutex, then release the last two before presenting, so only
-    // presentMutex_ spans the vsync wait. Lock order is that order.
+    // Gfx::deviceMutex, in that order, and drop the last two before presenting.
     bool RenderLocked();
     void Present(UINT syncInterval);
     RECT ComputeCropLocked() const;

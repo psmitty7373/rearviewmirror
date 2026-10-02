@@ -3,14 +3,13 @@
 
 namespace rvm {
 
-// Size of a window's capture surface, without waiting for a frame. {0,0} if the
-// window cannot be captured.
+// A window's capture size without waiting for a frame; {0,0} if it can't be captured.
 SIZE CaptureItemSize(HWND hwnd);
 
 bool CaptureSupported();
 
-// Captures one window with Windows Graphics Capture. Frames arrive as GPU
-// textures on a pool thread and are never read back to the CPU.
+// Windows Graphics Capture of one window or monitor; frames arrive as GPU
+// textures on a pool thread.
 class WindowCapture {
 public:
     // The texture is only valid for the duration of the call.
@@ -33,9 +32,8 @@ private:
     bool StartItem(winrt::Windows::Graphics::Capture::GraphicsCaptureItem item, bool cursor,
                    FrameCallback onFrame, AfterFrame afterFrame, std::function<void()> onClosed);
 
-    // The event handlers hold this too, via a weak_ptr, and take its mutexes
-    // across the callbacks. Stop() takes the same mutexes, so it cannot return
-    // while a frame is still inside the owner's callbacks.
+    // Event handlers hold this weakly and lock across the callbacks, so Stop()
+    // cannot return while a frame is still inside them.
     struct Shared {
         std::mutex mutex;
         FrameCallback onFrame;
@@ -65,10 +63,8 @@ struct DesktopFrame {
     SIZE  desktop;              // ...which is this big.
 };
 
-// The whole desktop: every monitor, placed where it sits in the virtual
-// screen. Each monitor's frames arrive on their own, whenever it changes, for
-// the receiver to place. A change of monitors or resolutions needs a Stop and
-// Start (see WM_DISPLAYCHANGE).
+// The whole desktop: one capture per monitor, each delivering its own frames
+// for the receiver to place. A change of monitors needs a Stop and Start.
 class DesktopCapture {
 public:
     using FrameCallback = std::function<void(const DesktopFrame&)>;
@@ -80,7 +76,7 @@ public:
 
     SIZE ContentSize() const { return size_; }
 
-    // The virtual screen in screen pixels: what the desktop texture shows.
+    // The virtual screen, in screen pixels.
     static RECT Bounds();
 
 private:

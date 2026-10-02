@@ -3,8 +3,7 @@
 
 namespace rvm {
 
-// Process-wide graphics objects. One D3D11 device backs capture, every mirror
-// renderer and the Direct2D UI, so frames never leave the GPU.
+// Process-wide graphics: one D3D11 device for capture, mirrors and Direct2D.
 struct Gfx {
     static Gfx& Get();
     void Init();
@@ -18,23 +17,18 @@ struct Gfx {
     winrt::com_ptr<IDWriteFactory>      dwrite;
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrtDevice{ nullptr };
 
-    // Mirrors draw from capture threads, Direct2D from the UI thread, on one
-    // shared immediate context. ID3D11Multithread only makes individual calls
-    // atomic: a mirror frame landing inside a D2D BeginDraw/EndDraw pair still
-    // clobbers its state. Hold this across a whole draw, but never across Present.
+    // Capture threads and the UI share one immediate context, and
+    // ID3D11Multithread only makes single calls atomic. Hold this across a
+    // whole draw, but never across Present.
     std::mutex deviceMutex;
 
-    // A GPU reset, driver update or GPU switch removes the device, and every
-    // texture, swapchain, capture pool and codec made on it with it. Nothing
-    // is rebuilt piecemeal: pass any failing GPU result here, and on the first
-    // sign of removal the handler (set by the app) runs once, from whatever
-    // thread saw it. The apps save and relaunch themselves.
+    // Pass any failing GPU result. On the first sign of device removal the
+    // handler runs once, on the thread that saw it.
     void CheckDevice(HRESULT hr);
     void SetDeviceLostHandler(std::function<void()> handler);
 
-    // One DirectComposition device, so one DWM channel, for every window.
-    // Made on first use; hold compositionMutex while using it, since Commit
-    // sends every change pending on it.
+    // One DirectComposition device for every window, made on first use. Hold
+    // compositionMutex while using it: Commit sends every pending change.
     IDCompositionDevice* Composition();
     std::mutex compositionMutex;
 
@@ -45,8 +39,7 @@ private:
     std::atomic<bool> lost_{ false };
 };
 
-// A DirectComposition-backed presentation surface for a borderless window with
-// per-pixel alpha. Shared by the mirror windows and the overlays.
+// A DirectComposition swapchain for a window with per-pixel alpha.
 class CompSurface {
 public:
     CompSurface() = default;
