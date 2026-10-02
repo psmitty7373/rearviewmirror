@@ -3,12 +3,8 @@
 
 namespace rvm::login {
 
-// The stream key is all that guards the sign-in screen, which remote control
-// drives as SYSTEM. The app's generated keys are this long.
-constexpr size_t kMinLoginKeyChars = 20;
-
-// %ProgramData%\RearViewMirror: the service's settings (with the key), logs
-// and crash dumps. SYSTEM and Administrators only.
+// %ProgramData%\RearViewMirror: the service's logs and crash dumps. SYSTEM and
+// Administrators only.
 std::wstring MachineDir();
 
 // Elevated. Creates MachineDir() and (re)applies its access rules. Any user
@@ -21,10 +17,14 @@ bool SecureMachineDir(std::wstring& movedAside);
 // otherwise, not even a log.
 bool MachineDirTrusted();
 
-// The helper's streaming settings. The key is encrypted to this machine (DPAPI
-// local-machine scope); the folder's access rules are what keep it private.
-// A key shorter than kMinLoginKeyChars is refused.
-bool SaveLoginSettings(const StreamSettings& settings);
+// Elevated. Creates the shared settings key (kMachineSettingsKey) owned by
+// Administrators, readable and writable by SYSTEM, Administrators and the
+// account running this, and nobody else.
+bool CreateMachineSettings();
+void DeleteMachineSettings();
+
+// The shared settings, for the helper; false without a key of at least
+// kMinMachineKeyChars.
 bool LoadLoginSettings(StreamSettings& settings);
 
 }  // namespace rvm::login

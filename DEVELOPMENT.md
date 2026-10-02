@@ -506,26 +506,34 @@ runs, since it is stopped the moment the console shows a desktop. So the existin
 the app, with `MOUSEEVENTF_VIRTUALDESK` addressing the same whole-screen
 picture.
 
-**Settings and trust.** Nobody is signed in when the helper runs, so neither
-`%APPDATA%` nor a key encrypted to a user will do. `--install` (elevated) copies
-the current user's port, key, bitrate, frame rate and preset to
-`%ProgramData%\RearViewMirror\login.ini`, with the key encrypted to the machine
-(DPAPI local-machine scope). The key must be at least 20 characters, which
-*Generate* makes; an older install with a shorter key stops serving until
-`--install` is run again. The folder's protected DACL, owned by Administrators
-and granting only SYSTEM and Administrators, is what keeps it private, and it
-is re-applied on every install. A link at that path is removed (the link, not
-its target), and a folder anyone else could have made or changed is moved
-aside to `RearViewMirror.untrusted-*` and made afresh. The service and helper
-check the folder whenever they start and refuse one that isn't trusted; with nowhere
-safe to log, the service stops with `ERROR_ACCESS_DENIED`, which Windows
-records in the event log. The service binary is copied to
-`%ProgramFiles%\RearViewMirror` first: a SYSTEM service running from a folder
-its user can write would hand that user SYSTEM. Logs and crash dumps go to the
-same ProgramData folder. Windows Firewall would ask before letting the helper's
-port in, and nobody can answer at the sign-in screen, so `--install` adds a
-rule as narrow as it can be: that program, inbound UDP, that port, private and
-domain networks. `--uninstall` removes it.
+**Settings: one copy.** Nobody is signed in when the helper runs, so neither
+`%APPDATA%` nor a key encrypted to a user will do, and a second copy made at
+install goes stale the moment the key changes in the app. So `--install`
+(elevated) moves the installing account's settings to
+`HKLM\SOFTWARE\RearViewMirror\Streaming`, which the app then reads and writes
+in place of its `stream.ini` (`MachineSettingsInUse`), and the helper reads
+whenever it starts. The key's protected DACL, owned by Administrators, grants
+SYSTEM and Administrators everything and the installing account read and
+set-value only; other accounts keep their own `stream.ini`. The key is
+encrypted to the machine (DPAPI local-machine scope), which any local process
+could decrypt, so the DACL is what keeps it private. Only administrators can
+create keys under `HKLM\SOFTWARE`, so unlike a folder it can't be planted in
+advance. The key must be at least 20 characters, which *Generate* makes; the
+Streaming dialog enforces it while the store is in use. `--uninstall` moves the
+settings back to the account running it and deletes the key.
+
+**Trust.** The service binary is copied to `%ProgramFiles%\RearViewMirror`
+first: a SYSTEM service running from a folder its user can write would hand that
+user SYSTEM. Logs and crash dumps go to `%ProgramData%\RearViewMirror`, whose
+protected DACL (SYSTEM and Administrators only) is re-applied on every install.
+A link at that path is removed (the link, not its target), and a folder anyone
+else could have made is moved aside to `RearViewMirror.untrusted-*`. The service
+and helper refuse an untrusted folder; with nowhere safe to log, the service
+stops with `ERROR_ACCESS_DENIED`, which Windows records in the event log.
+Windows Firewall would ask before letting the helper in, and nobody can answer
+at the sign-in screen, so `--install` adds a rule: that program, inbound UDP,
+private and domain networks. It isn't pinned to a port, since the app's settings
+can change it. `--uninstall` removes it.
 
 **Not covered yet.**
 - An app from before the handoff, or one built without the option, keeps the

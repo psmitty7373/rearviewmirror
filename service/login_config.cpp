@@ -1,11 +1,8 @@
 #include "login_config.h"
-#include "net/crypto.h"
-#include "persist.h"
 
 #include <aclapi.h>
 #include <sddl.h>
 #include <shlobj.h>
-#include <wincrypt.h>
 
 namespace rvm::login {
 
@@ -15,44 +12,9 @@ namespace {
 // protected, so nothing from ProgramData's own (user-readable) rules leaks in.
 constexpr wchar_t kMachineDirSddl[] = L"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
-// Separates these blobs from anything else encrypted to the machine.
-constexpr char kEntropy[] = "RearViewMirror.LoginKey";
-
-std::wstring SettingsPath() {
-    return MachineDir() + L"\\login.ini";
-}
-
-bool ProtectForMachine(const std::wstring& secret, std::vector<uint8_t>& blob) {
-    DATA_BLOB in{ static_cast<DWORD>(secret.size() * sizeof(wchar_t)),
-                  reinterpret_cast<BYTE*>(const_cast<wchar_t*>(secret.data())) };
-    DATA_BLOB entropy{ sizeof(kEntropy) - 1, reinterpret_cast<BYTE*>(const_cast<char*>(kEntropy)) };
-    DATA_BLOB out{};
-    if (!CryptProtectData(&in, L"Rear View Mirror sign-in key", &entropy, nullptr, nullptr,
-                          CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN, &out)) {
-        return false;
-    }
-    blob.assign(out.pbData, out.pbData + out.cbData);
-    LocalFree(out.pbData);
-    return true;
-}
-
-bool UnprotectForMachine(const std::vector<uint8_t>& blob, std::wstring& secret) {
-    if (blob.empty()) return false;
-    DATA_BLOB in{ static_cast<DWORD>(blob.size()), const_cast<BYTE*>(blob.data()) };
-    DATA_BLOB entropy{ sizeof(kEntropy) - 1, reinterpret_cast<BYTE*>(const_cast<char*>(kEntropy)) };
-    DATA_BLOB out{};
-    if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
-        return false;
-    }
-    secret.assign(reinterpret_cast<const wchar_t*>(out.pbData), out.cbData / sizeof(wchar_t));
-    SecureZeroMemory(out.pbData, out.cbData);
-    LocalFree(out.pbData);
-    return true;
-}
-
-int ReadInt(const wchar_t* key, int fallback, const std::wstring& path) {
-    return static_cast<int>(GetPrivateProfileIntW(L"Login", key, fallback, path.c_str()));
-}
+// The same for the settings key, plus read and set-value (KEY_READ |
+// KEY_SET_VALUE, never WRITE_DAC) for the installing account, %s.
+constexpr wchar_t kMachineSettingsSddl[] = L"O:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;0x2001b;;;%s)";
 
 bool SystemOrAdmins(PSID sid) {
     return sid && (IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid));
@@ -166,32 +128,49 @@ bool MachineDirTrusted() {
     return ok;
 }
 
-bool SaveLoginSettings(const StreamSettings& s) {
-    std::vector<uint8_t> blob;
-    if (s.key.size() < kMinLoginKeyChars || !ProtectForMachine(s.key, blob)) return false;
-    std::wstring text = L"[Login]\r\n";
-    text += L"Port=" + std::to_wstring(s.port) + L"\r\n";
-    text += L"BitrateKbps=" + std::to_wstring(s.bitrateKbps) + L"\r\n";
-    text += L"Fps=" + std::to_wstring(s.fps) + L"\r\n";
-    text += L"Preset=" + std::to_wstring(static_cast<int>(s.preset)) + L"\r\n";
-    text += L"KeyBlob=" + net::ToHex(blob) + L"\r\n";
-    return WriteTextAtomically(SettingsPath(), text);
+bool CreateMachineSettings() {
+    // The account running this, elevated or not, is the one granted access.
+    HANDLE token = nullptr;
+    std::vector<uint8_t> user(SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER));
+    DWORD size = 0;
+    const bool haveUser = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+                          GetTokenInformation(token, TokenUser, user.data(), static_cast<DWORD>(user.size()), &size);
+    if (token) CloseHandle(token);
+    wchar_t* sid = nullptr;
+    if (!haveUser || !ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &sid)) {
+        return false;
+    }
+    wchar_t sddl[256]{};
+    swprintf_s(sddl, kMachineSettingsSddl, sid);
+    LocalFree(sid);
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+    // Only administrators can create keys under HKLM\SOFTWARE, so one found
+    // there was made by one; its rules are replaced all the same.
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), sd, FALSE };
+    HKEY key = nullptr;
+    bool ok = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, 0, nullptr, 0,
+                              KEY_ALL_ACCESS | KEY_WOW64_64KEY, &sa, &key, nullptr) == ERROR_SUCCESS &&
+              RegSetKeySecurity(key, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                                         PROTECTED_DACL_SECURITY_INFORMATION, sd) == ERROR_SUCCESS;
+    if (key) RegCloseKey(key);
+    LocalFree(sd);
+    return ok;
+}
+
+void DeleteMachineSettings() {
+    HKEY software = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE", 0, KEY_ALL_ACCESS | KEY_WOW64_64KEY, &software) ==
+        ERROR_SUCCESS) {
+        RegDeleteTreeW(software, L"RearViewMirror");
+        RegCloseKey(software);
+    }
 }
 
 bool LoadLoginSettings(StreamSettings& s) {
-    const std::wstring path = SettingsPath();
-    wchar_t hex[4096]{};
-    GetPrivateProfileStringW(L"Login", L"KeyBlob", L"", hex, ARRAYSIZE(hex), path.c_str());
-    std::wstring key;
-    if (!UnprotectForMachine(net::FromHex(hex), key) || key.size() < kMinLoginKeyChars) return false;
-    s = StreamSettings{};
-    s.enabled     = true;
-    s.key         = std::move(key);
-    s.port        = static_cast<uint16_t>(ClampI(ReadInt(L"Port", s.port, path), 1, 65535));
-    s.bitrateKbps = static_cast<UINT>(ClampI(ReadInt(L"BitrateKbps", 8000, path), 1000, 100000));
-    s.fps         = static_cast<UINT>(ClampI(ReadInt(L"Fps", 30, path), static_cast<int>(kMinStreamFps),
-                                             static_cast<int>(kMaxStreamFps)));
-    s.preset      = static_cast<EncoderPreset>(ClampI(ReadInt(L"Preset", 0, path), 0, 2));
+    if (!LoadMachineStreamSettings(s) || s.key.size() < kMinMachineKeyChars) return false;
+    s.enabled = true;
     return true;
 }
 

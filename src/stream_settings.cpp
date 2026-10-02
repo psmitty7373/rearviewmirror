@@ -4,12 +4,78 @@
 #include "persist.h"
 #include "resource.h"
 
+#if RVM_LOGIN_SERVICE
+#include <wincrypt.h>
+#endif
+
 namespace rvm {
 
 namespace {
 
 std::wstring SettingsPath() {
     return ConfigDir() + L"\\stream.ini";
+}
+
+#if RVM_LOGIN_SERVICE
+// Separates these blobs from anything else encrypted to the machine.
+constexpr char kMachineEntropy[] = "RearViewMirror.LoginKey";
+
+bool ProtectForMachine(const std::wstring& secret, std::vector<uint8_t>& blob) {
+    DATA_BLOB in{ static_cast<DWORD>(secret.size() * sizeof(wchar_t)),
+                  reinterpret_cast<BYTE*>(const_cast<wchar_t*>(secret.data())) };
+    DATA_BLOB entropy{ sizeof(kMachineEntropy) - 1,
+                       reinterpret_cast<BYTE*>(const_cast<char*>(kMachineEntropy)) };
+    DATA_BLOB out{};
+    if (!CryptProtectData(&in, L"Rear View Mirror stream key", &entropy, nullptr, nullptr,
+                          CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        return false;
+    }
+    blob.assign(out.pbData, out.pbData + out.cbData);
+    LocalFree(out.pbData);
+    return true;
+}
+
+bool UnprotectForMachine(const std::vector<uint8_t>& blob, std::wstring& secret) {
+    if (blob.empty()) return false;
+    DATA_BLOB in{ static_cast<DWORD>(blob.size()), const_cast<BYTE*>(blob.data()) };
+    DATA_BLOB entropy{ sizeof(kMachineEntropy) - 1,
+                       reinterpret_cast<BYTE*>(const_cast<char*>(kMachineEntropy)) };
+    DATA_BLOB out{};
+    if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        return false;
+    }
+    secret.assign(reinterpret_cast<const wchar_t*>(out.pbData), out.cbData / sizeof(wchar_t));
+    SecureZeroMemory(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return true;
+}
+
+HKEY OpenMachineSettings(REGSAM access) {
+    HKEY key = nullptr;
+    return RegOpenKeyExW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, 0, access | KEY_WOW64_64KEY, &key) ==
+                   ERROR_SUCCESS
+               ? key
+               : nullptr;
+}
+
+int ReadDword(HKEY key, const wchar_t* name, int fallback) {
+    DWORD value = 0, size = sizeof(value);
+    return RegGetValueW(key, nullptr, name, RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS
+               ? static_cast<int>(value)
+               : fallback;
+}
+
+bool WriteDword(HKEY key, const wchar_t* name, DWORD value) {
+    return RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value)) ==
+           ERROR_SUCCESS;
+}
+#endif
+
+size_t MinKeyChars() {
+#if RVM_LOGIN_SERVICE
+    if (MachineSettingsInUse()) return kMinMachineKeyChars;
+#endif
+    return 8;
 }
 
 std::wstring ReadStr(const wchar_t* key, const std::wstring& path) {
@@ -78,9 +144,13 @@ bool ReadFields(HWND dlg, const StreamSettings& base, bool needKey, StreamSettin
             SendDlgItemMessageW(dlg, IDC_STREAM_PRESET, CB_GETITEMDATA, static_cast<WPARAM>(pick), 0));
     }
     out.key = GetSecretText(dlg, IDC_STREAM_KEY);
-    if (needKey && out.key.size() < 8) {
-        MessageBoxW(dlg, L"The shared key needs at least 8 characters. Generate one, or type your own.",
-                    kAppName, MB_OK | MB_ICONWARNING);
+    const size_t minKey = MinKeyChars();
+    if ((needKey || !out.key.empty()) && out.key.size() < minKey) {
+        const std::wstring text =
+            minKey > 8 ? L"The sign-in screen service shares this key, so it needs at least " +
+                             std::to_wstring(minKey) + L" characters. Press Generate."
+                       : L"The shared key needs at least 8 characters. Generate one, or type your own.";
+        MessageBoxW(dlg, text.c_str(), kAppName, MB_OK | MB_ICONWARNING);
         return false;
     }
     return true;
@@ -130,8 +200,11 @@ INT_PTR CALLBACK StreamDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
                             : (L"Encoder: " + encoder.name).c_str());
         SetDlgItemTextW(dlg, IDC_STREAM_HELP,
                         s.key.empty() && !s.lockedKey.empty()
-                            ? L"The saved key could not be decrypted by this Windows account. "
-                              L"Enter it again, or generate a new one."
+                            ? L"The saved key could not be decrypted here. Enter it again, or generate a "
+                              L"new one."
+                        : MinKeyChars() > 8
+                            ? L"The sign-in screen service uses these same settings. Enter the same key in "
+                              L"the client."
                             : L"Forward the UDP port on your router to this PC and enter the same key "
                               L"in the client. Allow the app through Windows Firewall when asked.");
         RefreshStatus(dlg, *state);
@@ -210,7 +283,73 @@ INT_PTR CALLBACK StreamDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
+#if RVM_LOGIN_SERVICE
+bool MachineSettingsInUse() {
+    HKEY key = OpenMachineSettings(KEY_QUERY_VALUE | KEY_SET_VALUE);
+    if (key) RegCloseKey(key);
+    return key != nullptr;
+}
+
+bool LoadMachineStreamSettings(StreamSettings& s) {
+    HKEY key = OpenMachineSettings(KEY_QUERY_VALUE);
+    if (!key) return false;
+    s = StreamSettings{};
+    s.enabled     = ReadDword(key, L"Enabled", 0) != 0;
+    s.port        = static_cast<uint16_t>(ClampI(ReadDword(key, L"Port", net::kDefaultPort), 1, 65535));
+    s.bitrateKbps = static_cast<UINT>(ClampI(ReadDword(key, L"BitrateKbps", 8000), 1000, 100000));
+    s.fps         = static_cast<UINT>(ClampI(ReadDword(key, L"Fps", 60), static_cast<int>(kMinStreamFps),
+                                             static_cast<int>(kMaxStreamFps)));
+    s.preset      = static_cast<EncoderPreset>(ClampI(ReadDword(key, L"Preset", 0), 0, 2));
+
+    std::vector<uint8_t> blob;
+    DWORD size = 0;
+    if (RegGetValueW(key, nullptr, L"KeyBlob", RRF_RT_REG_BINARY, nullptr, nullptr, &size) == ERROR_SUCCESS &&
+        size > 0) {
+        blob.resize(size);
+        if (RegGetValueW(key, nullptr, L"KeyBlob", RRF_RT_REG_BINARY, nullptr, blob.data(), &size) !=
+            ERROR_SUCCESS) {
+            blob.clear();
+        }
+    }
+    RegCloseKey(key);
+    if (!UnprotectForMachine(blob, s.key) && !blob.empty()) {
+        s.lockedKey = std::move(blob);
+        Log(L"stream: the machine's saved key could not be decrypted");
+    }
+    return true;
+}
+
+bool SaveMachineStreamSettings(const StreamSettings& s) {
+    std::vector<uint8_t> blob = s.lockedKey;
+    if (!s.key.empty() && !ProtectForMachine(s.key, blob)) return false;
+    HKEY key = OpenMachineSettings(KEY_SET_VALUE);
+    if (!key) return false;
+    const bool ok = WriteDword(key, L"Enabled", s.enabled ? 1 : 0) && WriteDword(key, L"Port", s.port) &&
+                    WriteDword(key, L"BitrateKbps", s.bitrateKbps) && WriteDword(key, L"Fps", s.fps) &&
+                    WriteDword(key, L"Preset", static_cast<DWORD>(s.preset)) &&
+                    RegSetValueExW(key, L"KeyBlob", 0, REG_BINARY, blob.data(),
+                                   static_cast<DWORD>(blob.size())) == ERROR_SUCCESS;
+    RegCloseKey(key);
+    return ok;
+}
+#endif
+
 StreamSettings LoadStreamSettings() {
+#if RVM_LOGIN_SERVICE
+    StreamSettings machine;
+    if (MachineSettingsInUse() && LoadMachineStreamSettings(machine)) return machine;
+#endif
+    return LoadUserStreamSettings();
+}
+
+bool SaveStreamSettings(const StreamSettings& s) {
+#if RVM_LOGIN_SERVICE
+    if (MachineSettingsInUse()) return SaveMachineStreamSettings(s);
+#endif
+    return SaveUserStreamSettings(s);
+}
+
+StreamSettings LoadUserStreamSettings() {
     const std::wstring path = SettingsPath();
     StreamSettings s;
     s.enabled     = ReadInt(L"Enabled", 0, path) != 0;
@@ -231,7 +370,7 @@ StreamSettings LoadStreamSettings() {
     return s;
 }
 
-bool SaveStreamSettings(const StreamSettings& s) {
+bool SaveUserStreamSettings(const StreamSettings& s) {
     std::vector<uint8_t> blob = s.lockedKey;
     if (!s.key.empty() && !net::ProtectSecret(s.key, blob)) return false;
 

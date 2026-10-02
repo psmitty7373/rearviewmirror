@@ -25,10 +25,32 @@ struct StreamSettings {
 constexpr UINT kMinStreamFps = 1;
 constexpr UINT kMaxStreamFps = 240;
 
-// Kept in its own file beside mirrors.ini; the key is DPAPI-protected to the
-// current Windows user rather than stored in the clear.
+// The machine store when this account may use it (see below), otherwise this
+// user's stream.ini beside mirrors.ini, with the key DPAPI-protected to the user.
 StreamSettings LoadStreamSettings();
 bool SaveStreamSettings(const StreamSettings& settings);
+
+// This user's stream.ini only.
+StreamSettings LoadUserStreamSettings();
+bool SaveUserStreamSettings(const StreamSettings& settings);
+
+#if RVM_LOGIN_SERVICE
+// With the sign-in service installed, the app and the service share one set of
+// settings in HKLM\<kMachineSettingsKey>: readable and writable only by
+// SYSTEM, Administrators and the account that installed it. The key is
+// encrypted to the machine; the key's permissions are what keep it private.
+constexpr wchar_t kMachineSettingsKey[] = L"SOFTWARE\\RearViewMirror\\Streaming";
+
+// The key guards the sign-in screen, which remote control drives as SYSTEM.
+constexpr size_t kMinMachineKeyChars = 20;
+
+// Whether the store exists and this process may read and write it.
+bool MachineSettingsInUse();
+// False if the store is absent or unreadable. An undecryptable key comes back
+// empty, its blob in lockedKey.
+bool LoadMachineStreamSettings(StreamSettings& settings);
+bool SaveMachineStreamSettings(const StreamSettings& settings);
+#endif
 
 // What the dialog's Start/Stop button and live status line act on.
 struct StreamControl {

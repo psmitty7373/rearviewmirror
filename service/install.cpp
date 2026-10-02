@@ -20,8 +20,9 @@ struct Bstr {
 };
 
 // Nobody can answer the firewall's prompt at the sign-in screen, so the rule
-// is made here, as narrow as can be. Replaces any earlier one.
-bool SetFirewallRule(const std::wstring* program, uint16_t port) {
+// is made here: this program, inbound UDP, private and domain networks. Not
+// pinned to a port, which the app's settings can change. Replaces any earlier one.
+bool SetFirewallRule(const std::wstring* program) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     bool ok = false;
     {
@@ -38,7 +39,7 @@ bool SetFirewallRule(const std::wstring* program, uint16_t port) {
             ok = true;
             if (program) {
                 winrt::com_ptr<INetFwRule> rule;
-                const Bstr app(*program), ports(std::to_wstring(port)),
+                const Bstr app(*program),
                     description(L"Lets Rear View Mirror clients reach the sign-in screen while nobody is "
                                 L"signed in.");
                 ok = SUCCEEDED(CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER,
@@ -47,7 +48,6 @@ bool SetFirewallRule(const std::wstring* program, uint16_t port) {
                      SUCCEEDED(rule->put_Description(description.s)) &&
                      SUCCEEDED(rule->put_ApplicationName(app.s)) &&
                      SUCCEEDED(rule->put_Protocol(NET_FW_IP_PROTOCOL_UDP)) &&
-                     SUCCEEDED(rule->put_LocalPorts(ports.s)) &&
                      SUCCEEDED(rule->put_Direction(NET_FW_RULE_DIR_IN)) &&
                      SUCCEEDED(rule->put_Action(NET_FW_ACTION_ALLOW)) &&
                      SUCCEEDED(rule->put_Profiles(NET_FW_PROFILE2_PRIVATE | NET_FW_PROFILE2_DOMAIN)) &&
@@ -120,14 +120,14 @@ int RunInstall() {
         fwprintf(stderr, L"Run this from an administrator (elevated) prompt.\n");
         return 1;
     }
-    // The current user's streaming settings: the sign-in screen is served on
-    // the same port with the same key, so a client sees one server.
+    // This account's settings become the shared ones: the sign-in screen is
+    // served on the same port with the same key, so a client sees one server.
     const StreamSettings user = LoadStreamSettings();
-    if (user.key.size() < kMinLoginKeyChars) {
+    if (user.key.size() < kMinMachineKeyChars) {
         fwprintf(stderr, L"This account's streaming key is missing or shorter than %zu characters: too weak to "
                          L"guard the sign-in screen. Press Generate in Rear View Mirror's Streaming dialog, then "
                          L"run --install again.\n",
-                 kMinLoginKeyChars);
+                 kMinMachineKeyChars);
         return 1;
     }
 
@@ -157,8 +157,11 @@ int RunInstall() {
     if (!movedAside.empty()) {
         wprintf(L"A folder someone else made was in the way; it is now %s\n", movedAside.c_str());
     }
-    if (!SaveLoginSettings(user)) return Fail(L"Cannot save the sign-in settings.");
-    const bool firewall = SetFirewallRule(&exe, user.port);
+    if (!CreateMachineSettings() || !SaveMachineStreamSettings(user)) {
+        return Fail(L"Cannot save the shared streaming settings.");
+    }
+    DeleteFileOrLater(MachineDir() + L"\\login.ini");   // Where earlier versions kept their own copy.
+    const bool firewall = SetFirewallRule(&exe);
 
     const std::wstring command = L"\"" + exe + L"\" --service";
     if (service) {
@@ -187,18 +190,20 @@ int RunInstall() {
     CloseServiceHandle(scm);
 
     wprintf(L"Installed and running: %s\n\n", exe.c_str());
-    wprintf(L"While nobody is signed in, the sign-in screen streams on UDP port %u with this\n"
+    wprintf(L"While the PC shows a sign-in or lock screen, it streams on UDP port %u with this\n"
             L"account's key. A client sees the same server, listing \"Sign-in screen\".\n\n",
             user.port);
+    wprintf(L"- Rear View Mirror and the service now share one set of streaming settings\n"
+            L"  (HKLM\\%s). Change them in the Streaming dialog as usual.\n",
+            kMachineSettingsKey);
     if (firewall) {
-        wprintf(L"- Windows Firewall lets UDP %u in to it, on private and domain networks.\n", user.port);
+        wprintf(L"- Windows Firewall lets UDP in to it, on private and domain networks.\n");
     } else {
-        wprintf(L"- Could not add the Windows Firewall rule: clients will be blocked until UDP %u is\n"
-                L"  allowed in for %s.\n", user.port, exe.c_str());
+        wprintf(L"- Could not add the Windows Firewall rule: clients will be blocked until UDP is\n"
+                L"  allowed in for %s.\n", exe.c_str());
     }
     wprintf(L"- Rear View Mirror must start when you sign in (a shortcut in shell:startup)\n"
-            L"  to take over from there.\n"
-            L"- After changing the port or key in Rear View Mirror, run --install again.\n");
+            L"  to take over from there.\n");
 #if !RVM_REMOTE_CONTROL
     wprintf(L"- This build has no desktop control: the sign-in screen can be watched, not used.\n"
             L"  Build with --remote-control to sign in through it.\n");
@@ -222,7 +227,14 @@ int RunUninstall() {
         wprintf(L"The service was not installed.\n");
     }
     CloseServiceHandle(scm);
-    SetFirewallRule(nullptr, 0);
+    SetFirewallRule(nullptr);
+
+    // The shared settings go back to this account, which keeps streaming as before.
+    StreamSettings shared;
+    if (LoadMachineStreamSettings(shared) && !shared.key.empty() && SaveUserStreamSettings(shared)) {
+        wprintf(L"Streaming settings moved back to this account.\n");
+    }
+    DeleteMachineSettings();
 
     const std::wstring dir = InstallDir();
     if (!dir.empty()) {
@@ -246,7 +258,7 @@ int RunUninstall() {
         }
         RemoveDirectoryW(data.c_str());
     }
-    wprintf(L"Files, settings, logs and the firewall rule removed.\n");
+    wprintf(L"Files, shared settings, logs and the firewall rule removed.\n");
     return 0;
 }
 

@@ -148,12 +148,11 @@ in through it from the client. Once you're signed in, the app takes over.
    must be at least 20 characters, as *Generate* makes.
 2. From an administrator prompt, run
    `build\RearViewMirrorService.exe --install`. It copies itself to
-   `Program Files\RearViewMirror`, keeps this account's port and key for the
-   machine, lets that UDP port in through Windows Firewall (private and domain
-   networks only; nobody could answer a firewall prompt at the sign-in screen),
-   and starts the service. Run it again after changing the port or key. An
-   earlier install with a shorter key stops serving until you generate a
-   longer one and run it again.
+   `Program Files\RearViewMirror`, moves this account's streaming settings to
+   one place the app and the service share, lets the service through Windows
+   Firewall (UDP, private and domain networks only; nobody could answer a
+   firewall prompt at the sign-in screen), and starts the service. From then on
+   change the port or key in the Streaming dialog as usual; the service follows.
 3. Make Rear View Mirror start when you sign in, for example with a shortcut in
    `shell:startup`.
 
@@ -165,9 +164,9 @@ Remote Desktop connection all put the PC's screen on a sign-in or lock screen.
 Rear View Mirror then stops serving until its session is back on the screen,
 unlocked.
 
-`RearViewMirrorService.exe --uninstall` removes the service, its files, settings
-and logs. `--helper-test` streams your current session the same way without
-installing anything, to try it out.
+`RearViewMirrorService.exe --uninstall` removes the service, its files and logs,
+and moves the streaming settings back to your account. `--helper-test` streams
+your current session the same way without installing anything, to try it out.
 
 This runs as SYSTEM and answers on the network whenever nobody is signed in.
 Anyone with the streaming key sees the sign-in screen, and with desktop control
@@ -232,7 +231,8 @@ and add it again.
 | `stream.ini` | Streaming settings and key |
 | `client.ini` | Client servers, keys and layout |
 | `server.log`, `client.log` | Diagnostics |
-| `%ProgramData%\RearViewMirror\` | The sign-in service's settings and key (administrators only) and its `service.log` and `login.log` |
+| `HKLM\SOFTWARE\RearViewMirror\Streaming` | With the sign-in service installed: the streaming settings and key, shared by the app and the service (the installing account and administrators only) |
+| `%ProgramData%\RearViewMirror\` | The sign-in service's `service.log` and `login.log` (administrators only) |
 | `server-crash-*.dmp`, `client-crash-*.dmp` | Written if the app or client crashes |
 
 Internals, design notes and tests are in [DEVELOPMENT.md](DEVELOPMENT.md).

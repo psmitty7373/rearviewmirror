@@ -1321,6 +1321,13 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
                                scale < 1.0f ? D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR
                                             : D2D1_INTERPOLATION_MODE_LINEAR);
             }
+            // The last picture stays, dimmed, with why it is not live.
+            if (!sv || !sv->connected) {
+                brush_->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f));
+                dc->FillRectangle(picture, brush_.get());
+                DrawChip(dc, sv && !sv->status.empty() ? Ellipsize(sv->status, 72) : L"Reconnecting…",
+                         (cell.left + cell.right) / 2, (cell.top + cell.bottom) / 2, 1, 1);
+            }
         } else {
             const bool connected = sv && sv->connected;
             const wchar_t* stalled = view ? StreamStateText(view->state) : nullptr;
