@@ -4,17 +4,14 @@
 #if RVM_LOGIN_SERVICE
 #include <wtsapi32.h>
 
-// The app's side of the optional sign-in service (service/). The service
-// streams whatever sign-in or lock screen the console shows, on the app's
-// port, so a client sees one server whatever the console is showing. For that
-// the app must let go of the port whenever its own session is not the one on
-// the console, unlocked: locked, disconnected, remote, or switched away from.
+// The app's side of the optional sign-in service (service/), which streams the
+// console's sign-in or lock screen on the app's port. The app lets go of the
+// port whenever its session is not the console's, unlocked.
 namespace rvm {
 
 constexpr wchar_t kLoginServiceName[] = L"RearViewMirrorLogin";
 
-// Whether a session is locked. A locked console shows the lock screen, which
-// only the service can capture.
+// A locked console shows the lock screen, which only the service can capture.
 inline bool SessionLocked(DWORD session) {
     WTSINFOEXW* info = nullptr;
     DWORD bytes = 0;
@@ -34,8 +31,7 @@ void WatchSessionChanges(HWND window, bool on);
 // True when this session is not what the console shows, unlocked.
 bool AwayFromConsole();
 
-// The app hands off only while this is true as well. Without the service it
-// carries on as it always has.
+// The app hands off only while this is true as well.
 bool LoginServiceRunning();
 
 }  // namespace rvm

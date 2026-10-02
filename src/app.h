@@ -10,16 +10,13 @@ class App : public WindowHost {
 public:
     int Run(bool relaunched = false);
 
-    // Used by the manager window to drive the mirrors it lists.
     size_t  MirrorCount() const { return mirrors_.size(); }
     Mirror* MirrorAt(size_t index);
     Mirror* FindMirror(uint32_t id);
     void    CloseMirror(uint32_t id);
     void    RequestNewMirror();
 
-    // Streaming, for the manager's header button, which opens the settings
-    // dialog where it is started and stopped. A build without streaming has
-    // no button.
+    // For the manager's Streaming button.
     bool   StreamingAvailable() const { return Streaming::Available(); }
     bool   StreamingOn() const { return streaming_.Running(); }
     size_t StreamClients() const { return streaming_.Clients(); }
@@ -46,16 +43,13 @@ private:
     void OnDeviceLost();
     void RetireMirror(size_t index);
 
-    // Saves are coalesced: a hotkey that touches every mirror would otherwise
-    // rewrite the file once per mirror.
+    // Saves are coalesced on a short timer.
     void MarkDirty();
     void SaveNow();
 
-    // Starting or stopping a capture waits on a cross-process COM call, and
-    // this thread pumps messages meanwhile. Starting or stopping another from
-    // one of them deadlocked inside Windows Graphics Capture, so every start
-    // and stop runs inside a Transition, and messages that would start or
-    // stop one wait until the outermost ends, then are posted again.
+    // Capture starts and stops pump messages, and nesting them deadlocks WGC:
+    // each runs in a Transition, and messages that would start or stop one are
+    // re-posted when the outermost ends.
     struct Transition {
         explicit Transition(App& owner) : app(owner) { ++app.transitions_; }
         ~Transition();
@@ -70,8 +64,7 @@ private:
     void RestartDesktops();
 
 #if RVM_LOGIN_SERVICE
-    // Lets go of the streaming port while the sign-in service streams the
-    // console, and takes it back after (see login_handoff.h).
+    // Lends the streaming port to the sign-in service (see login_handoff.h).
     void UpdateHandoff();
     bool handedOff_ = false;
     int  resumeTries_ = 0;
@@ -91,32 +84,26 @@ private:
     uint32_t GroupForWindow(HWND target) const;
     uint32_t NewGroup() const;
 
-    // Declared before the mirrors, so it is destroyed after them: each mirror
-    // hands its frames to it.
+    // Before the mirrors, so destroyed after them: they feed it frames.
     Streaming streaming_;
 
     std::vector<std::unique_ptr<Mirror>> mirrors_;
 
-    // Torn-down mirrors awaiting deletion. A context menu or a region selection
-    // runs a nested message loop from inside a Mirror method, so the object has
-    // to outlive any such call; the outer loop frees these between messages.
+    // Torn-down mirrors awaiting deletion: a nested loop (context menu, region
+    // selection) may still be inside one. The outer loop frees them.
     std::vector<std::unique_ptr<Mirror>> retired_;
 
     ManagerWindow manager_;
 
-    // Saved mirrors whose source has not turned up yet. They stay on disk, so a
-    // mirror survives the app it watches not running. Live mirrors whose source
-    // has since closed wait the same way, as orphans, on the same timer. Each
-    // has the id its mirror will get.
+    // Saved mirrors whose source has not turned up yet, with the id each will
+    // get. Orphaned live mirrors wait on the same timer.
     struct Pending { uint32_t id; MirrorState state; };
     std::vector<Pending> pending_;
     UINT restorePeriodMs_ = 2000;
     bool restoreTimerActive_ = false;
     ULONGLONG lastRestorePassTick_ = 0;
 
-    // Reopening an app brings its window to the foreground, so that event is
-    // the cue to rebind right away instead of waiting for the next poll. Hooked
-    // only while something waits.
+    // A reopened app takes the foreground: the cue to rebind before the next poll.
     HWINEVENTHOOK foregroundHook_ = nullptr;
 
     uint32_t nextId_ = 1;

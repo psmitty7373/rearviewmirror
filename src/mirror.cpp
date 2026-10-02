@@ -82,8 +82,7 @@ void Mirror::ConstrainSizing(WPARAM edge, RECT* rect) {
         } else if (vertical) {
             w = static_cast<int>(std::lround(h * aspect));
         } else {
-            // Corner drag: project onto the aspect line so diagonal movement
-            // tracks and shrinking feels the same as growing.
+            // Corner drag: project onto the aspect line.
             const double projected =
                 (w + h / aspect) * (aspect * aspect) / (aspect * aspect + 1.0);
             w = static_cast<int>(std::lround(projected));
@@ -195,8 +194,8 @@ void Mirror::Sleep() {
     if (!hwnd_ || transitioning_ || sleeping_ || !state_.enabled || orphaned_ || !state_.hidden) return;
     sleeping_ = true;   // First: being shown while stopping must wake it after.
     StopCapture();
-    // A window keeps its last picture, as a minimized one sends none on waking.
-    // Monitors always do, so the desktop's memory can go.
+    // A minimized window sends no frame on waking, so it keeps its last one;
+    // monitors always send one.
     if (hwnd_ && IsDesktop()) renderer_.DropFrames(/*blank=*/true);
 }
 
@@ -226,10 +225,8 @@ bool Mirror::WholeDesktop() const {
            state_.crop.right >= state_.baseSize.cx && state_.crop.bottom >= state_.baseSize.cy;
 }
 
-// Monitors or resolutions changed, now or while the app was closed. The
-// entire desktop stays the entire desktop, and the window keeps its zoom so
-// it covers the same share of the screen. A region keeps its tracking mode,
-// as a window mirror does.
+// The window keeps its zoom, so it covers the same share of the screen. A
+// region is left to its tracking mode.
 void Mirror::FollowDesktopSize(SIZE now) {
     const SIZE was = state_.baseSize;
     if (now.cx <= 0 || now.cy <= 0 || (now.cx == was.cx && now.cy == was.cy) || !WholeDesktop()) return;
@@ -257,8 +254,7 @@ SIZE Mirror::ContentSize() const {
     return SIZE{ RectW(desk), RectH(desk) };
 }
 
-// Asleep, nothing reports the window closing, and its handle may since have
-// been reused by another window.
+// Asleep, nothing reports the window closing, and its handle may be reused.
 bool Mirror::SourceAlive() const {
     if (IsDesktop()) return true;
     DWORD process = 0;
@@ -293,8 +289,7 @@ bool Mirror::Create(const MirrorState& state, HWND target, HWND notify) {
                             nullptr, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) return false;
 
-    // A desktop mirror on screen would otherwise capture itself, and itself
-    // inside that, down a hall of mirrors.
+    // Else a desktop mirror on screen would capture itself.
     if (IsDesktop() && !SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE)) {
         Log(L"mirror: could not exclude the desktop mirror from capture (%lu)", GetLastError());
     }
@@ -354,8 +349,7 @@ bool Mirror::SetEnabled(bool enabled, const std::vector<HWND>& exclude, HWND pre
         return true;
     }
 
-    // The source may have closed or restarted while we were off. Another
-    // mirror of the same window already knows where it is now.
+    // The source may have gone while off; the group may know its new window.
     if (!SourceAlive()) {
         HWND found = (preferred && IsWindow(preferred)) ? preferred : FindMatchingWindow(state_, exclude);
         if (!found) return false;
@@ -459,8 +453,7 @@ bool Mirror::IsFullDesktop() const {
 }
 #endif
 
-// Detached before stopping, which pumps messages: nothing arriving meanwhile
-// may reach this mirror or start it again.
+// Detached first: stopping pumps messages, which must not reach this mirror.
 void Mirror::Destroy() {
     HWND h = std::exchange(hwnd_, nullptr);
     if (h) SetWindowLongPtrW(h, GWLP_USERDATA, 0);
@@ -490,16 +483,14 @@ void Mirror::ApplyClickThroughStyle() {
     const bool enabled = state_.clickThrough;
     LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     if (enabled) {
-        // WS_EX_TRANSPARENT only diverts the mouse once the window is layered
-        // too; on its own the hit test still lands on us.
+        // WS_EX_TRANSPARENT passes the mouse through only on a layered window.
         ex |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
     } else {
         ex &= ~(WS_EX_TRANSPARENT | WS_EX_LAYERED);
     }
     SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex);
 
-    // A layered window with no attributes set can stay blank. Full alpha
-    // here: the mirror's own opacity is applied by the shader.
+    // A layered window without attributes can stay blank.
     if (enabled) SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
 
     // Ex-style edits take effect when the frame is recalculated.
@@ -587,9 +578,7 @@ LRESULT Mirror::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_NCHITTEST: {
-        // Edges resize through DefWindowProc. The interior is client, so the
-        // ordinary mouse messages below are delivered; the drag is started by
-        // hand from WM_LBUTTONDOWN.
+        // Edges resize; the interior is client, and WM_LBUTTONDOWN drags.
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         RECT r{};
         GetWindowRect(hwnd_, &r);
@@ -680,8 +669,7 @@ LRESULT Mirror::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_RVM_TARGET_LOST:
-        // The source closed. The app orphans the mirror, when no other
-        // capture is starting or stopping.
+        // The app orphans the mirror, outside any other capture's transition.
         if (notify_) PostMessageW(notify_, WM_RVM_MIRROR_ORPHANED, id_, 0);
         return 0;
 

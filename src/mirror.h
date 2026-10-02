@@ -5,36 +5,26 @@
 
 namespace rvm {
 
-// Mirror to app, wParam the mirror's id.
-constexpr UINT WM_RVM_MIRROR_IDLE    = WM_APP + 30;   // Hidden, and a frame nobody wanted.
-constexpr UINT WM_RVM_MIRROR_RESTART = WM_APP + 31;   // Needs RestartCapture().
-
-// One floating always-on-top view of a rectangular slice of another window,
-// or of the whole desktop.
+// A floating always-on-top view of a slice of a window or of the desktop.
 class Mirror : public WindowHost {
 public:
     explicit Mirror(uint32_t id) : id_(id) {}
     ~Mirror();
 
-    // Stable identity for menus, messages and the manager: vector indices
-    // shift whenever a mirror is removed inside a nested message loop.
+    // Stable identity: list positions shift as mirrors are removed.
     uint32_t Id() const { return id_; }
 
-    // `notify` receives lifecycle messages. `target` may be null only for a
-    // mirror restored disabled, which has nothing to bind to yet.
+    // `notify` gets lifecycle messages. `target` may be null if disabled or desktop.
     bool Create(const MirrorState& state, HWND target, HWND notify);
     void Destroy();
 
-    // Off stops the capture entirely, so it costs nothing. False if it could not
-    // be turned back on because the source window is gone.
-    // `exclude`: windows other groups of mirrors are showing. `preferred`: the
-    // window this mirror's own group is showing, if any; used as is.
+    // False if it could not turn on: source gone. `exclude`: windows other
+    // groups show. `preferred`: the window this mirror's group shows, if any.
     bool SetEnabled(bool enabled, const std::vector<HWND>& exclude = {}, HWND preferred = nullptr);
     bool Enabled() const { return state_.enabled; }
 
-    // The source window went away. Capture stops and the window hides, but the
-    // mirror keeps its place and settings and waits for a matching window.
-    // The mirror reports the loss to `notify` and the app calls this.
+    // The source went away: capture stops and the window hides, but the mirror
+    // keeps its settings and waits. It reports the loss; the app calls this.
     void Orphan();
     bool Orphaned() const { return orphaned_; }
 
@@ -43,17 +33,15 @@ public:
     bool TryRebind(const std::vector<HWND>& exclude, HWND preferred = nullptr,
                    ExeNameCache* exes = nullptr);
 
-    // Hidden with nobody watching, a mirror sleeps: capture stops until it is
-    // shown or watched. It reports such a frame to `notify`; the app, which
-    // knows who watches, calls Sleep.
+    // Hidden and unwatched, a mirror stops capturing until shown or watched. It
+    // reports unwanted frames; the app, which knows who watches, calls Sleep.
     void Sleep();
     bool Sleeping() const { return sleeping_; }
     // Whether an unwanted frame was reported since last asked.
     bool TakeIdleReport() { return idleReported_.exchange(false); }
 
-    // Captures afresh: a sleeping mirror wakes, and a running one starts over
-    // so a still source sends a whole new frame. The mirror asks for this
-    // through `notify`, as starting a capture must wait for any other.
+    // Wakes a sleeping mirror, or restarts a running one so a still source
+    // sends a whole frame. Requested through `notify` (see App::Transition).
     void RestartCapture();
 
     std::wstring DisplayName() const;
@@ -64,9 +52,8 @@ public:
     void SetClickThrough(bool enabled);
     bool ClickThrough() const { return state_.clickThrough; }
 
-    // Hidden keeps streaming with no window on screen, capturing only while
-    // watched (see Sleep). Since a hidden mirror cannot be right-clicked, the
-    // manager and tray bring it back.
+    // No window on screen; still streams, capturing only while watched (see
+    // Sleep). Only the manager can show it again.
     void SetHidden(bool hidden);
     bool Hidden() const { return state_.hidden; }
 
@@ -84,9 +71,8 @@ public:
     bool IsFullDesktop() const;
 #endif
 
-    // Monitors were added, removed or changed resolution: a desktop mirror
-    // starts over on the new layout. False if that failed; it then waits and
-    // retries like an orphan.
+    // Monitors changed: a desktop mirror starts over on the new layout. False
+    // if that failed; it then waits like an orphan.
     bool RestartDesktop();
     SIZE NativeSize() const;
     float CurrentScale() const;
@@ -136,9 +122,7 @@ private:
     bool sleeping_ = false;
     std::atomic<bool> idleReported_{ false };
     RECT sizeMoveStart_{};
-    // Capture is starting or stopping, which pumps messages; nothing nested
-    // may start or stop it meanwhile.
-    bool transitioning_ = false;
+    bool transitioning_ = false;   // Capture starting or stopping, pumping messages.
 };
 
 }  // namespace rvm

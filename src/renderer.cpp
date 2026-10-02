@@ -261,8 +261,7 @@ bool MirrorRenderer::EnsureCache(UINT width, UINT height, bool clear) {
     desc.Format     = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc = { 1, 0 };
     desc.Usage      = D3D11_USAGE_DEFAULT;
-    // Render-target binding lets the stream server's video processor read
-    // this texture directly instead of copying it through a scratch surface.
+    // Render-target binding lets the stream's video processor read it directly.
     desc.BindFlags  = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
     auto& g = Gfx::Get();
@@ -307,7 +306,7 @@ bool MirrorRenderer::EnsureCrop(UINT width, UINT height) {
     HRESULT hr = g.d3d->CreateTexture2D(&desc, nullptr, cropTex_.put());
     if (SUCCEEDED(hr)) hr = g.d3d->CreateShaderResourceView(cropTex_.get(), nullptr, cropSrv_.put());
     g.CheckDevice(hr);
-    if (FAILED(hr)) {   // Half-made must not pass for made next time.
+    if (FAILED(hr)) {
         cropSrv_ = nullptr;
         cropTex_ = nullptr;
     }
@@ -337,9 +336,8 @@ void MirrorRenderer::SyncCacheLocked() {
 bool MirrorRenderer::SubmitFrame(ID3D11Texture2D* source, UINT width, UINT height, POINT at, SIZE full) {
     if (!source || width == 0 || height == 0 || full.cx <= 0 || full.cy <= 0) return true;
 
-    // While the source grows, the frame's surface is still the old pool size
-    // and only part of the new content fits. Recreating the pool delivers a
-    // full frame next; drawing this one would show uninitialised texture.
+    // A growing source's frame can outsize the old pool's surface; the
+    // recreated pool sends a whole one next.
     D3D11_TEXTURE2D_DESC sd{};
     source->GetDesc(&sd);
     if (width > sd.Width || height > sd.Height) return true;

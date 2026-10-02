@@ -126,10 +126,7 @@ bool WindowCapture::StartItem(wgc::GraphicsCaptureItem item, bool cursor, FrameC
         if (SessionHasProperty(L"IsBorderRequired")) {
             try { session.IsBorderRequired(false); } catch (...) {}
         }
-        // Windows throttles capture to one frame per 16 ms unless told
-        // otherwise, which holds every mirror and stream to about 60 fps
-        // however fast the source and the display are. Frames still only
-        // arrive when the window changes, so a still source costs nothing.
+        // Windows caps capture at one frame per 16 ms unless told otherwise.
         if (SessionHasProperty(L"MinUpdateInterval")) {
             try { session.MinUpdateInterval(std::chrono::milliseconds(1)); } catch (...) {}
         }
@@ -247,9 +244,6 @@ void WindowCapture::OnFrame(Shared& state, wgc::Direct3D11CaptureFramePool const
     std::lock_guard lock(state.afterMutex);
     if (state.afterFrame) state.afterFrame();
 }
-
-// ---------------------------------------------------------------------------
-// Desktop
 
 DesktopCapture::~DesktopCapture() {
     Stop();

@@ -3,9 +3,8 @@
 
 namespace rvm {
 
-// Lets the user drag a sub-rectangle over `target`. `captureSize` is the size
-// of the capture texture and `out` is written in those same pixels, so the
-// renderer can crop with it directly. `initial` may be empty. False if
+// Lets the user drag a sub-rectangle over `target`. `initial` (may be empty)
+// and `out` are in the pixels of a capture `captureSize` big. False if
 // cancelled, or if the target cannot be shown.
 bool SelectRegion(HWND target, SIZE captureSize, RECT initial, RECT& out);
 

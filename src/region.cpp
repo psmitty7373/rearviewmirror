@@ -69,8 +69,7 @@ public:
                 ReleaseCapture();
                 cursor = POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
                 const RECT r = NormalizeRect(anchor, cursor);
-                // A drag narrows the mirror to a region; a click, the same
-                // gesture that chose the window, takes all of it.
+                // A click takes all of it.
                 if (RectW(r) >= kMinSelection && RectH(r) >= kMinSelection) Accept(r);
                 else                                                       Accept(WholeWindow());
             }
@@ -118,7 +117,6 @@ protected:
             brush_->SetColor(D2D1::ColorF(kAccentR, kAccentG, kAccentB, 0.95f));
             dc->DrawRectangle(D2D1::RectF(l + 0.5f, t + 0.5f, r - 0.5f, b - 0.5f), brush_.get(), 1.5f);
 
-            // Corner ticks give the selection a tactile, resizable feel.
             const float tick = (std::min)(18.0f, (std::min)(r - l, b - t) * 0.3f);
             const float th = 3.0f;
             const D2D1_RECT_F ticks[] = {
@@ -132,8 +130,7 @@ protected:
             wchar_t label[40]{};
             _snwprintf_s(label, _TRUNCATE, L"%ld × %ld", std::lround(RectW(sel) * scaleX),
                          std::lround(RectH(sel) * scaleY));
-            // Above the frame, else below it, else inside its bottom-left
-            // corner when the frame fills the window.
+            // Above the frame, else below, else inside its bottom-left corner.
             if (t > 34.0f)          DrawChip(dc, label, l, t - 8.0f, 0, 2);
             else if (b + 34.0f < h) DrawChip(dc, label, l, b + 8.0f, 0, 0);
             else                    DrawChip(dc, label, l + 8.0f, b - 8.0f, 0, 2);
@@ -152,8 +149,7 @@ protected:
 bool RunSelection(RECT bounds, SIZE captureSize, RECT initial, const wchar_t* hint, RECT hintAt,
                   RECT& out);
 
-// A minimised window reports the off-screen -32000 rect, which would put the
-// overlay somewhere the user can never see. Restore it and wait for DWM.
+// A minimised window sits off-screen at -32000: restore it and wait for DWM.
 bool EnsureVisible(HWND target) {
     if (!IsIconic(target)) return true;
     ShowWindow(target, SW_RESTORE);
@@ -186,8 +182,7 @@ bool SelectScreenRegion(RECT bounds, SIZE captureSize, RECT initial, RECT& out) 
     if (RectW(bounds) <= 0 || RectH(bounds) <= 0 || captureSize.cx <= 0 || captureSize.cy <= 0) {
         return false;
     }
-    // Spanning several monitors, the instructions go where the eye is: the
-    // top of the primary monitor, not the middle of the combined width.
+    // The instructions go at the top of the primary monitor, not mid-span.
     MONITORINFO mi{ sizeof(mi) };
     RECT hintAt{};
     if (GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi)) {
@@ -211,9 +206,7 @@ bool RunSelection(RECT bounds, SIZE captureSize, RECT initial, const wchar_t* hi
     overlay.scaleX = static_cast<float>(captureSize.cx) / static_cast<float>(RectW(bounds));
     overlay.scaleY = static_cast<float>(captureSize.cy) / static_cast<float>(RectH(bounds));
 
-    // The frame starts on what a click would give: the previous region when
-    // reselecting, otherwise the whole window, carrying the picker's highlight
-    // straight over.
+    // The frame starts on the previous region when reselecting, else the whole window.
     overlay.hasSelection = true;
     if (RectW(initial) > 0 && RectH(initial) > 0) {
         overlay.selection = RECT{

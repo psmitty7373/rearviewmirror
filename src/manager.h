@@ -6,7 +6,6 @@ namespace rvm {
 class App;
 
 // Lists every mirror as a card with its own switch, sliders and buttons.
-// Custom-drawn in Direct2D to match the rest of the app.
 class ManagerWindow : public D2DOverlay {
 public:
     void Open(App* app);
@@ -26,17 +25,15 @@ private:
         NewMirror, Streaming,                                                 // In the header.
     };
 
-    // A control on a card. Cards are addressed by mirror id, never by position:
-    // a mirror can be removed between the press and the release.
+    // By mirror id, not position: a mirror can go between press and release.
     struct Hit {
         uint32_t id = 0;
         Part part = Part::None;
         bool operator==(const Hit& o) const { return id == o.id && part == o.part; }
     };
 
-    // Everything OnDraw needs, gathered by Snapshot outside the device lock
-    // so no syscall or mirror lock runs inside it. Only Refresh and clicks
-    // take a new one; a slider drag updates just its own card.
+    // What OnDraw shows of a mirror. Snapshot retakes them on Refresh and
+    // clicks; a slider drag updates only its own card.
     struct CardView {
         uint32_t     id = 0;
         std::wstring name;

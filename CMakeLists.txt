@@ -51,8 +51,8 @@ function(rvm_sign target)
     endif()
 endfunction()
 
-# Graphics core: the shared D3D11/D2D device and the composition-hosted window
-# base. Used by the app, the client and the tests.
+# Shared by every executable: the graphics device, the overlay window base,
+# logging, crash reports and settings files.
 add_library(rvmcore STATIC
     src/gfx.cpp
     src/crash.cpp
@@ -76,11 +76,8 @@ option(RVM_LOGIN_SERVICE "Build the service that streams the sign-in screen whil
 if(RVM_LOGIN_SERVICE AND NOT RVM_STREAMING)
     message(FATAL_ERROR "RVM_LOGIN_SERVICE requires RVM_STREAMING=ON")
 endif()
-# Like RVM_REMOTE_CONTROL: numeric, for #if, defined in every build. The app's
-# side of it is letting go of the port while the service streams the console.
+# Defined as 0 or 1 for every target, so public class layouts agree; test with #if.
 target_compile_definitions(rvm_options INTERFACE RVM_LOGIN_SERVICE=$<BOOL:${RVM_LOGIN_SERVICE}>)
-# A numeric definition, shared by every target so public class layouts agree.
-# Use #if RVM_REMOTE_CONTROL: the macro is defined as 0 in disabled builds.
 target_compile_definitions(rvm_options INTERFACE RVM_REMOTE_CONTROL=$<BOOL:${RVM_REMOTE_CONTROL}>)
 
 set(RVM_APP_SOURCES
@@ -163,9 +160,7 @@ if(RVM_STREAMING)
     target_link_libraries(rvmnet_test PRIVATE rvmserver rvmclientnet)
 endif()
 
-# The sign-in screen service, all of it in service/: a separate executable the
-# app knows nothing about. A console program, for --install and --uninstall;
-# the service starts its helper with no window.
+# The sign-in screen service: a console program, for --install and --uninstall.
 if(RVM_LOGIN_SERVICE)
     add_executable(rvmservice
         service/main.cpp

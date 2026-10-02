@@ -6,8 +6,7 @@
 
 namespace rvm {
 
-// A borderless, transparent, always-on-top window drawn with Direct2D onto a
-// DirectComposition swapchain.
+// A window drawn with Direct2D onto a DirectComposition swapchain.
 class D2DOverlay : public WindowHost {
 public:
     virtual ~D2DOverlay();
@@ -15,9 +14,8 @@ public:
     // `clickThrough` makes the overlay ignore hit-testing entirely.
     bool Create(const wchar_t* className, RECT bounds, bool clickThrough);
 
-    // The same surface, but as an ordinary framed window.
-    // `classStyle` adds to the window class, e.g. CS_DBLCLKS for windows that
-    // handle double-clicks (Windows only sends them to classes that ask).
+    // The same surface, but as an ordinary framed window. `classStyle` adds to
+    // the window class, e.g. CS_DBLCLKS.
     bool CreateStyled(const wchar_t* className, const wchar_t* title, RECT bounds,
                       DWORD style, DWORD exStyle, UINT classStyle = 0);
 
@@ -51,8 +49,7 @@ protected:
                          float x, float y, int alignX, int alignY,
                          float bgAlpha = 0.92f);
 
-    // Text clipped to `rect`, laid out once and reused while its text, font
-    // and box size stay the same.
+    // Text clipped to `rect`; layouts are cached.
     void DrawLabel(ID2D1DeviceContext* dc, std::wstring_view text, const D2D1_RECT_F& rect,
                    IDWriteTextFormat* format, const D2D1_COLOR_F& color,
                    DWRITE_TEXT_ALIGNMENT align);
@@ -66,8 +63,7 @@ protected:
     winrt::com_ptr<ID2D1DeviceContext> dc_;
     winrt::com_ptr<IDWriteTextFormat>  font_;
 
-    // Recoloured per use. Overlays redraw on every mouse move, and a brush per
-    // draw would be a COM allocation per frame.
+    // Recoloured per use rather than made per draw.
     winrt::com_ptr<ID2D1SolidColorBrush> brush_;
 
     CompSurface comp_;

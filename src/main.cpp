@@ -10,13 +10,10 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     const bool relaunched = rvm::WaitForPreviousInstance();
 
     // Only one instance: a second launch brings up the first one's manager.
-    // Mirrors are only ever made when asked for, from the manager, the tray
-    // or the hotkey.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\RearViewMirror.Instance");
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND existing = FindWindowW(rvm::kAppWindowClass, nullptr)) {
-            // This process was just launched, so it may take the foreground;
-            // pass that on, or the manager would open behind other windows.
+            // Pass on the right to take the foreground, or the manager opens behind.
             DWORD pid = 0;
             GetWindowThreadProcessId(existing, &pid);
             AllowSetForegroundWindow(pid);

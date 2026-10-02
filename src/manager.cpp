@@ -24,8 +24,7 @@ constexpr float kLabelW     = 52.0f;
 constexpr float kScaleMin = 0.25f;
 constexpr float kScaleMax = 3.0f;
 
-// Same palette family as the picker and region overlays.
-const D2D1_COLOR_F kBg      = { 0.067f, 0.075f, 0.094f, 1.0f };
+const D2D1_COLOR_F kBg     = { 0.067f, 0.075f, 0.094f, 1.0f };
 const D2D1_COLOR_F kCard    = { 0.102f, 0.114f, 0.141f, 1.0f };
 const D2D1_COLOR_F kCardHot = { 0.129f, 0.145f, 0.180f, 1.0f };
 const D2D1_COLOR_F kStroke  = { 1.0f, 1.0f, 1.0f, 0.07f };
@@ -319,7 +318,7 @@ void ManagerWindow::ApplySliderDrag(POINT pt) {
         card.opacity = m->Opacity();
     } else {
         float scale = TToScale(t);
-        if (std::fabs(scale - 1.0f) < 0.04f) scale = 1.0f;   // Same detent as edge resize.
+        if (std::fabs(scale - 1.0f) < 0.04f) scale = 1.0f;   // Detent at 100%.
         m->SetZoom(scale, /*persist=*/false);
         card.scale = m->CurrentScale();
     }
@@ -403,8 +402,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_CAPTURECHANGED:
-        // Alt+Tab, a dialog or another app took the mouse mid-drag: keep
-        // what the slider shows, as a release would.
+        // Something took the mouse mid-drag: keep the value, as a release would.
         if (dragging_ && reinterpret_cast<HWND>(lp) != Hwnd()) EndSliderDrag();
         return 0;
 

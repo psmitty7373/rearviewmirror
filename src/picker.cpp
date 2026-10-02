@@ -5,8 +5,7 @@ namespace rvm {
 
 namespace {
 
-// The shell's own surfaces: the wallpaper (with its icons) and the taskbars.
-// Pointing at them means "the desktop itself", not any one window.
+// The wallpaper and the taskbars, which stand for the whole desktop.
 bool IsDesktopSurface(HWND root) {
     if (!root) return false;
     const std::wstring cls = WindowClassName(root);
@@ -22,9 +21,8 @@ bool IsOwnWindow(HWND hwnd) {
     return pid == GetCurrentProcessId();
 }
 
-// Front-to-back walk for what WindowFromPoint cannot answer: it reports our
-// own highlight, which covers whatever is being pointed at. That highlight,
-// anything else of ours, and anything the mouse passes through are skipped.
+// Front-to-back walk for when WindowFromPoint finds one of ours; skips ours
+// and anything the mouse passes through.
 struct WalkState {
     POINT pt;
     PickResult hit;
@@ -70,14 +68,12 @@ PickResult SourceAtPoint(POINT pt) {
 
 void UpdateHover(POINT pt);
 
-// Draws the accent frame and labels over the hovered window, or over every
-// screen when the desktop itself is pointed at.
+// The accent frame and labels over the hovered window, or every screen.
 class Highlight : public D2DOverlay {
 public:
     std::wstring title;
     bool desktop = false;
-    // Where the labels go, in overlay pixels: the whole window, or for the
-    // desktop the monitor under the pointer, so they never straddle a seam.
+    // Overlay pixels; for the desktop, the pointer's monitor. Empty: all of it.
     RECT labelArea{};
 
     LRESULT OnMessage(UINT msg, WPARAM wp, LPARAM lp) override {
@@ -87,8 +83,7 @@ public:
             UpdateHover(pt);
             return 0;
         }
-        // Not even there for WindowFromPoint, which asks windows on its own
-        // thread (ours) rather than going by WS_EX_TRANSPARENT.
+        // On its own thread, WindowFromPoint ignores WS_EX_TRANSPARENT.
         if (msg == WM_NCHITTEST) return HTTRANSPARENT;
         return D2DOverlay::OnMessage(msg, wp, lp);
     }
@@ -138,9 +133,8 @@ struct PickSession {
 
 PickSession* g_session = nullptr;
 
-// Unhooks and clears the session pointer on every exit path, including an
-// exception thrown out of the nested loop: a hook left installed would keep
-// reading a dead stack frame and swallowing clicks.
+// Unhooks on every exit path, exceptions included: a hook left installed would
+// read a dead stack frame and swallow clicks.
 struct PickGuard {
     PickSession& session;
     ~PickGuard() {
@@ -177,9 +171,8 @@ void UpdateHover(POINT pt) {
         highlight.desktop = true;
         highlight.title = L"Entire desktop";
         highlight.labelArea = labels;
-        // Crossing to another monitor only moves the labels. Re-placing a
-        // topmost window over every screen, taskbars included, makes the
-        // shell re-lay out the taskbar.
+        // Placed once: re-placing a topmost window over the taskbars makes the
+        // shell re-lay them out.
         if (!alreadyShown) {
             highlight.SetBounds(bounds);
             highlight.Show();
@@ -206,17 +199,15 @@ void UpdateHover(POINT pt) {
     highlight.Render();
 }
 
-// The low-level hook serialises every mouse event on the desktop, so it must
-// return immediately. Resolving the window happens on our own turn, and a
-// burst of moves collapses into one lookup.
+// The low-level hook holds up every mouse event on the desktop, so the lookup
+// is posted, and a burst of moves collapses into one.
 void QueueHover() {
     if (!g_session || g_session->hoverQueued) return;
     g_session->hoverQueued = true;
     PostMessageW(g_session->highlight.Hwnd(), WM_RVM_HOVER, 0, 0);
 }
 
-// Only records the outcome: the window under a click is looked up once the
-// loop wakes, outside the hook.
+// Only records the outcome; the lookup happens outside the hook.
 void Finish(bool clicked, POINT pt = {}) {
     if (!g_session) return;
     g_session->clicked = clicked;

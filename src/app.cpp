@@ -8,23 +8,20 @@ namespace rvm {
 
 namespace {
 
-// Waiting mirrors are re-checked on a timer that backs off to a slow poll and
-// keeps going: a source app can be closed and reopened at any time, and a
-// Startup-folder launch can win the race against the programs it watches.
 constexpr UINT_PTR kTimerRestore = 1;
 constexpr UINT_PTR kTimerSave    = 2;
 constexpr UINT_PTR kTimerHandoff = 3;
 constexpr UINT_PTR kTimerIdle    = 4;
-// Hidden mirrors nobody watches sleep this long after saying so, so a viewer
-// who leaves and comes straight back does not cost a restart.
+// Grace before an unwatched hidden mirror sleeps, so a viewer who comes
+// straight back does not cost a restart.
 constexpr UINT kIdleGraceMs = 3000;
-// Away from the console, look again now and then: the console can be between
-// sessions at the moment of a notification, and the service can start or stop.
+// Away from the console, re-check: notifications can race session switches,
+// and the service can start or stop.
 constexpr UINT kHandoffRecheckMs = 5000;
-// Taking the port back: the service's helper lets go of it a moment after the
-// session returns, so try each second for half a minute before saying so.
+// The service's helper lets go of the port a moment after the session returns.
 constexpr UINT kResumeRetryMs = 1000;
 constexpr int  kResumeTries   = 30;
+// Waiting mirrors are polled for good, backing off: a source can reopen any time.
 constexpr UINT kRestoreMinPeriodMs = 2000;
 constexpr UINT kRestoreMaxPeriodMs = 8000;
 constexpr ULONGLONG kRestorePassMinGapMs = 500;   // Alt-tab spam must not become enumeration spam.
@@ -48,7 +45,6 @@ enum TrayMenuId : UINT {
     kTrayManager,
 };
 
-// Messages whose handling can start or stop a capture (see App::Transition).
 bool StartsOrStopsCapture(UINT msg, WPARAM wp) {
     switch (msg) {
     case WM_DISPLAYCHANGE:
@@ -84,9 +80,8 @@ bool App::CreateOwnerWindow() {
     wc.hIconSm       = iconSmall_;
     RegisterClassExW(&wc);
 
-    // An ordinary hidden top-level window rather than a message-only one:
-    // a popup menu's owner has to be able to take the foreground for the menu
-    // to dismiss on an outside click, and message-only windows cannot.
+    // Not message-only: a popup menu dismisses on an outside click only if its
+    // owner can take the foreground.
     hwnd_ = CreateWindowExW(0, kAppWindowClass, kAppName, WS_POPUP, 0, 0, 0, 0,
                             nullptr, nullptr, GetModuleHandleW(nullptr), this);
     g_appWindow = hwnd_;
@@ -132,8 +127,6 @@ void App::ShowBalloon(const std::wstring& text) {
 }
 
 void App::ShowTrayMenu() {
-    // Mirrors and streaming are managed from the manager window; the menu is
-    // just the way in, plus the actions that must work without it.
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kTrayManager, L"Manage mirrors…");
     SetMenuDefaultItem(menu, kTrayManager, FALSE);   // Matches the double-click.
@@ -163,9 +156,7 @@ void App::ShowTrayMenu() {
 }
 
 void App::NewMirror() {
-    // Picking and selecting run nested loops; a second request arriving
-    // meanwhile (hotkey, second launch, manager button) must not start a
-    // second, overlapping selection.
+    // Picking runs a nested loop; a second request meanwhile must not overlap it.
     if (selecting_) return;
     selecting_ = true;
     struct Reset { bool& flag; ~Reset() { flag = false; } } reset{ selecting_ };
@@ -214,11 +205,8 @@ void App::NewMirror() {
     manager_.Refresh();
 }
 
-// The whole desktop, or a region of it. Where it can be streamed, it is made
-// without a window on screen: it is almost always there to be streamed, and a
-// full-screen always-on-top copy of the screen would be in the way. The
-// manager can show it. A build without streaming shows it, or it would be
-// for nothing.
+// Made hidden where it can be streamed: a full-screen topmost copy of the
+// screen would be in the way.
 void App::NewDesktopMirror() {
     const RECT bounds = DesktopCapture::Bounds();
     const SIZE size{ RectW(bounds), RectH(bounds) };
@@ -284,9 +272,8 @@ bool App::CreateMirror(Mirror& mirror, const MirrorState& state, HWND target) {
     return mirror.Create(state, target, hwnd_);
 }
 
-// Tears the mirror down immediately so it disappears at once, but defers
-// deleting the object until the outer message loop turns. It leaves the list
-// first, so nothing handled while it stops can find it.
+// Tears the mirror down now and deletes it later (see retired_). It leaves the
+// list first, so nothing handled while it stops can find it.
 void App::RetireMirror(size_t index) {
     if (index >= mirrors_.size()) return;
     Mirror* mirror = mirrors_[index].get();
@@ -311,10 +298,8 @@ void App::CloseMirror(uint32_t id) {
     }
 }
 
-// The graphics device is gone, and every capture, swapchain and encoder with
-// it. Save, and let a fresh process pick up from the saved state on a new
-// device. A device that fails again straight after a relaunch is reported
-// rather than relaunched, so a broken GPU cannot cause a restart loop.
+// Saves and relaunches onto a new device. A loss soon after a relaunch is
+// reported instead, so a broken GPU cannot cause a restart loop.
 void App::OnDeviceLost() {
     if (deviceLostHandled_) return;
     deviceLostHandled_ = true;
@@ -330,8 +315,7 @@ void App::OnDeviceLost() {
     PostMessageW(hwnd_, WM_CLOSE, 0, 0);
 }
 
-// Everything, including mirrors still waiting for their apps, is forgotten for
-// good, and the hotkey is system-wide: confirm first.
+// Forgets waiting mirrors too, and the hotkey is system-wide: confirm first.
 void App::ConfirmCloseAll() {
     const int count = static_cast<int>(mirrors_.size() + pending_.size());
     if (count == 0) return;
@@ -389,8 +373,7 @@ HWND App::TargetOfGroup(uint32_t group, const Mirror* except) const {
     return nullptr;
 }
 
-// A second mirror of a window another mirror already shows joins its group;
-// otherwise a fresh, unused group number.
+// The group of a mirror already showing the window, else a new one.
 uint32_t App::GroupForWindow(HWND target) const {
     for (const auto& m : mirrors_) {
         if (target && m->Target() == target && m->Group() != 0) return m->Group();
@@ -473,14 +456,10 @@ void App::UpdateForegroundHook() {
     }
 }
 
-// Monitors came, went or changed resolution: desktop mirrors start over on the
-// new layout. Moving a session between Remote Desktop and the console sends
-// these in a burst; one arriving mid-restart waits for it (see Transition).
 void App::RestartDesktops() {
     bool any = false;
     {
         Transition transition(*this);
-        // By id: a nested message can retire a mirror meanwhile.
         std::vector<uint32_t> ids;
         for (const auto& m : mirrors_) {
             if (m->IsDesktop()) ids.push_back(m->Id());
@@ -523,8 +502,7 @@ void App::UpdateHandoff() {
 }
 #endif
 
-// One attempt to bind everything that is waiting. The mirror reappearing is
-// its own feedback, so no balloon here; only the launch-time restore announces.
+// No balloon: the mirror reappearing says enough.
 int App::RunRestorePass() {
     const ULONGLONG now = GetTickCount64();
     if (now - lastRestorePassTick_ < kRestorePassMinGapMs) return 0;
@@ -555,14 +533,12 @@ int App::TryRestorePending(ExeNameCache& exes) {
         if (it == pending_.end()) continue;
         HWND target = nullptr;
         if (it->state.enabled && it->state.source == SourceKind::Window) {
-            // A group member already showing the window takes it straight
-            // away; otherwise search, never among other groups' windows.
+            // The group's window if shown, else a search outside other groups'.
             target = TargetOfGroup(it->state.group, nullptr);
             if (!target) target = FindMatchingWindow(it->state, TargetsOfOtherGroups(it->state.group), &exes);
             if (!target) continue;   // Kept for the next attempt.
         }
-        // A mirror saved disabled needs no source yet: it takes its place in
-        // the listing and binds when it is switched on.
+        // Saved disabled: listed now, bound when switched on.
         auto mirror = std::make_unique<Mirror>(id);
         const MirrorState state = it->state;
         if (!mirror->Create(state, target, hwnd_)) continue;
@@ -584,9 +560,7 @@ void App::RestoreSaved() {
         pending_.push_back(Pending{ nextId_++, std::move(state) });
     }
     if (pending_.empty()) {
-        // Nothing to bring back: show the manager, where a mirror is a click
-        // away, but never start one unasked. Not after a device-loss restart,
-        // which only puts back what was there.
+        // Nothing to bring back: show the manager, unless relaunched.
         if (!relaunched_) manager_.Open(this);
         return;
     }
@@ -600,8 +574,7 @@ void App::RestoreSaved() {
 }
 
 LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
-    // Explorer restarting takes every notification icon with it; it
-    // broadcasts this once it is back, and the icon has to be added again.
+    // Explorer restarted, dropping every tray icon.
     static const UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     if (msg == taskbarCreated && taskbarCreated != 0) {
         trayAdded_ = false;
@@ -738,8 +711,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         WatchSessionChanges(hwnd_, false);
 #endif
         manager_.Destroy();
-        // Retire rather than delete: this can run inside a nested loop that is
-        // still executing a Mirror method further up the stack.
+        // Retired, not deleted: a nested loop may still be inside a Mirror.
         while (!mirrors_.empty()) RetireMirror(mirrors_.size() - 1);
         RemoveTrayIcon();
         PostQuitMessage(0);
@@ -790,9 +762,8 @@ int App::Run(bool relaunched) {
     hooks.changed = [this] { manager_.Refresh(); };
     hooks.notify  = [this](const std::wstring& text) { ShowBalloon(text); };
 #if RVM_LOGIN_SERVICE
-    // Not served at once: right after signing in, the service's helper can
-    // still hold the port for a moment, and this session may not even be the
-    // console's. UpdateHandoff serves when it can, retrying until it does.
+    // Paused at first: the service's helper may still hold the port, or this
+    // session may not be the console's. UpdateHandoff serves when it can.
     streaming_.SetPaused(true);
     streaming_.Start(std::move(hooks));
     WatchSessionChanges(hwnd_, true);

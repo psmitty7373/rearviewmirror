@@ -53,24 +53,22 @@ constexpr UINT WM_RVM_FOREGROUND_CHANGED = WM_APP + 9;
 constexpr UINT WM_RVM_STREAM_WANT_FRAME = WM_APP + 10;   // wParam: mirror id
 constexpr UINT WM_RVM_DEVICE_LOST = WM_APP + 11;
 constexpr UINT WM_RVM_SHOW_MANAGER = WM_APP + 12;   // A second launch asks the first for its window.
+constexpr UINT WM_RVM_MIRROR_IDLE    = WM_APP + 30;   // wParam: mirror id. Hidden, and a frame nobody wanted.
+constexpr UINT WM_RVM_MIRROR_RESTART = WM_APP + 31;   // wParam: mirror id. Needs RestartCapture().
 
-// Relaunching after a lost graphics device: the new process is started with
-// this argument and the old one's process id, and waits for it to exit.
+// Passed, with the old process id, to a relaunch after a lost graphics device.
 constexpr wchar_t kRestartArg[] = L"--after-device-loss";
 
 // Starts a fresh copy of this executable that waits for this one to exit.
-// False if it could not be started.
 bool RelaunchSelf();
 
-// In a process started by RelaunchSelf: waits (bounded) for the previous one
-// to exit. True if this process is such a relaunch.
+// True in a RelaunchSelf child, after waiting (bounded) for the old process.
 bool WaitForPreviousInstance();
 
 constexpr wchar_t kAppName[]      = L"Rear View Mirror";
 constexpr wchar_t kAppWindowClass[] = L"RvmAppWindow";
 
-// D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION: the largest swapchain or texture
-// extent the device will create. Everything that sizes a window is capped here.
+// D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION; every window size is capped here.
 constexpr int kMaxExtent = 16384;
 
 // How the crop follows the source window when that window gets resized.
@@ -94,8 +92,7 @@ inline RECT NormalizeRect(POINT a, POINT b) {
                  (std::max)(a.x, b.x), (std::max)(a.y, b.y) };
 }
 
-// The DWM-rendered bounds: what Windows Graphics Capture actually hands back,
-// excluding the invisible resize border. Basis for screen-to-texture mapping.
+// The DWM bounds, without the invisible resize border: what capture shows.
 RECT ExtendedFrameBounds(HWND hwnd);
 
 // True for top-level windows a user would plausibly want to mirror.
@@ -112,8 +109,7 @@ RECT WorkAreaFor(HWND hwnd);
 // Shared, cached per size; never destroy the result.
 HICON LoadAppIcon(int size);
 
-// The effective DPI scale (1.0 = 96 DPI) of a monitor, for sizing a window
-// before it exists there.
+// A monitor's effective DPI scale (1.0 = 96 DPI).
 float DpiScaleFor(HMONITOR monitor);
 
 // Reads a dialog field holding a secret; the stack copy is wiped.
@@ -122,16 +118,14 @@ std::wstring GetSecretText(HWND dlg, int id);
 // Shows or masks a password edit control's text (a "Show" checkbox).
 void RevealEditText(HWND edit, bool reveal);
 
-// Gives a framed window a dark or light title bar to match the Windows app
-// theme. Call after creation and again on WM_SETTINGCHANGE.
+// Matches the title bar to the Windows app theme; call again on WM_SETTINGCHANGE.
 void ApplyTitleBarTheme(HWND hwnd);
 
-// Diagnostic log at %APPDATA%\RearViewMirror\<name>.log, truncated on open.
-// Lines carry a millisecond tick and thread id. No-op until LogOpen is called.
+// Diagnostic log at ConfigDir()\<name>.log, truncated on open. Lines carry a
+// millisecond tick and thread id. No-op until LogOpen is called.
 void LogOpen(const wchar_t* name);
 void Log(const wchar_t* fmt, ...);
-// Lines reach the file at once, but the system's cache only reaches the disk
-// in its own time; a crash report forces it there.
+// Forces logged lines out of the system's cache onto the disk.
 void LogFlush();
 
 // Per-call-site sampling for per-frame events: the first few, then one in N.
@@ -142,15 +136,12 @@ void LogFlush();
         if (rvmLogK_ < 5 || rvmLogK_ % (n) == 0) ::rvm::Log(__VA_ARGS__); \
     } while (0)
 
-// Pumps one message for a nested loop. Returns false when the loop must end:
-// GetMessage returns 0 on WM_QUIT, which is re-posted so the outer loop still
-// sees it rather than the app becoming a windowless zombie.
+// Pumps one message for a nested loop. False when the loop must end; a
+// WM_QUIT is re-posted so the outer loop still sees it.
 bool PumpNestedMessage();
 
-// Base for anything with a window procedure. The thunk stores the object in
-// GWLP_USERDATA at WM_NCCREATE and dispatches to it, and it stops exceptions
-// here: a C++ exception cannot unwind through the kernel callback that invokes
-// a window procedure, and would terminate the process.
+// Base for anything with a window procedure. The thunk keeps the object in
+// GWLP_USERDATA and stops exceptions, which cannot unwind through the kernel.
 class WindowHost {
 public:
     HWND Hwnd() const { return hwnd_; }
