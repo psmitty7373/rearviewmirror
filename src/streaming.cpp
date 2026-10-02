@@ -128,6 +128,16 @@ size_t Streaming::Clients() const {
     return impl_->server.ClientCount();
 }
 
+bool Streaming::On() const {
+    return impl_->settings.enabled && !impl_->settings.key.empty();
+}
+
+Streaming::State Streaming::CurrentState() const {
+    if (impl_->server.Running()) return State::Serving;
+    if (impl_->paused) return State::HandedOff;
+    return On() ? State::Blocked : State::Off;
+}
+
 void Streaming::ShowSettings() {
     Impl& s = *impl_;
     StreamControl control;
@@ -148,12 +158,25 @@ void Streaming::ShowSettings() {
         SaveStreamSettings(s.settings);
         s.Apply();
     };
-    control.running = [&s] { return s.server.Running(); };
-    control.status = [&s] {
-        if (!s.server.Running()) return std::wstring(L"Stopped");
-        return L"Running on UDP port " + std::to_wstring(s.settings.port) + L"  ·  " +
-               Plural(static_cast<int>(s.server.ClientCount()), L"client", L"clients") +
-               L" connected";
+    // Handed off, it is still on: OK must not turn it off.
+    control.running = [this] {
+        const State state = CurrentState();
+        return state == State::Serving || (state == State::HandedOff && On());
+    };
+    control.status = [this, &s] {
+        switch (CurrentState()) {
+        case State::Serving:
+            return L"Running on UDP port " + std::to_wstring(s.settings.port) + L"  ·  " +
+                   Plural(static_cast<int>(s.server.ClientCount()), L"client", L"clients") + L" connected";
+        case State::HandedOff:
+            return std::wstring(L"This session isn't on the PC's screen, so the sign-in service "
+                                L"is streaming it.");
+        case State::Blocked:
+            return L"On, but waiting for UDP port " + std::to_wstring(s.settings.port) +
+                   L" to be free.";
+        default:
+            return std::wstring(L"Stopped");
+        }
     };
 
     StreamSettings edited = s.settings;

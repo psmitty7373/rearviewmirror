@@ -77,7 +77,8 @@ private:
 
     std::vector<CardView> cards_;
     std::wstring heading_;
-    std::wstring streamingLabel_;
+    std::wstring streamingStatus_;   // Under the heading; empty while off.
+    size_t shownClients_ = 0;
     bool   streamingAvailable_ = false;
     bool   streamingOn_ = false;
 

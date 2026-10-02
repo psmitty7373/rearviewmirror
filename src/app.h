@@ -18,7 +18,8 @@ public:
 
     // For the manager's Streaming button.
     bool   StreamingAvailable() const { return Streaming::Available(); }
-    bool   StreamingOn() const { return streaming_.Running(); }
+    Streaming::State StreamingState() const { return streaming_.CurrentState(); }
+    bool   StreamingOn() const { return streaming_.On(); }
     size_t StreamClients() const { return streaming_.Clients(); }
     void   ShowStreamSettings() { streaming_.ShowSettings(); }
 

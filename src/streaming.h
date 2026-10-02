@@ -54,6 +54,13 @@ public:
     bool   Running() const;
     size_t Clients() const;
 
+    // Switched on here: serving, or would be if not handed off or blocked.
+    bool On() const;
+    // HandedOff: paused while the sign-in service streams this PC, which it
+    // does whether or not this is on. Blocked: on, but the port is taken.
+    enum class State { Off, Serving, HandedOff, Blocked };
+    State CurrentState() const;
+
     // The settings dialog, where serving is started and stopped.
     void ShowSettings();
 

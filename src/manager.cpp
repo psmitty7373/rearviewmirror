@@ -6,6 +6,7 @@ namespace rvm {
 namespace {
 
 constexpr wchar_t kManagerClass[] = L"RvmManagerWindow";
+constexpr UINT_PTR kClientsTimer = 1;   // Nothing reports clients coming and going.
 
 // Layout metrics in unscaled pixels; S() applies DPI.
 constexpr float kPad        = 14.0f;
@@ -135,10 +136,24 @@ void ManagerWindow::Snapshot() {
     if (!app_) return;
 
     streamingAvailable_ = app_->StreamingAvailable();
-    streamingOn_ = app_->StreamingOn();
-    streamingLabel_ = L"Streaming";
-    if (const size_t clients = app_->StreamClients(); streamingOn_ && clients > 0) {
-        streamingLabel_ += L" (" + std::to_wstring(clients) + L")";
+    switch (app_->StreamingState()) {
+    case Streaming::State::Serving:
+        streamingOn_ = true;
+        shownClients_ = app_->StreamClients();
+        streamingStatus_ = L"Streaming to " + Plural(static_cast<int>(shownClients_), L"client", L"clients");
+        break;
+    case Streaming::State::HandedOff:
+        streamingOn_ = app_->StreamingOn();
+        streamingStatus_ = L"The sign-in service is streaming";
+        break;
+    case Streaming::State::Blocked:
+        streamingOn_ = false;
+        streamingStatus_ = L"Streaming is waiting for its port";
+        break;
+    default:
+        streamingOn_ = false;
+        streamingStatus_.clear();
+        break;
     }
     for (size_t i = 0; i < app_->MirrorCount(); ++i) {
         const Mirror* m = app_->MirrorAt(i);
@@ -475,6 +490,18 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE) ShowWindow(Hwnd(), SW_HIDE);
         return 0;
 
+    case WM_SHOWWINDOW:
+        if (wp) SetTimer(Hwnd(), kClientsTimer, 1000, nullptr);
+        else    KillTimer(Hwnd(), kClientsTimer);
+        break;
+
+    case WM_TIMER:
+        if (wp == kClientsTimer && app_->StreamingState() == Streaming::State::Serving &&
+            app_->StreamClients() != shownClients_) {
+            Refresh();
+        }
+        return 0;
+
     case WM_CLOSE:
         ShowWindow(Hwnd(), SW_HIDE);   // A control panel; closing it never exits.
         return 0;
@@ -618,13 +645,20 @@ void ManagerWindow::OnDraw(ID2D1DeviceContext* dc) {
     brush_->SetColor(kStroke);
     dc->FillRectangle(D2D1::RectF(0, S(kHeaderH) - S(1.0f), w, S(kHeaderH)), brush_.get());
 
-    const float headingRight = (streamingAvailable_ ? StreamingButton() : NewMirrorButton()).left;
-    const D2D1_RECT_F heading = D2D1::RectF(S(kPad), 0, headingRight - S(10.0f), S(kHeaderH));
-    DrawLabel(dc, heading_, heading, titleFont_.get(), kText, DWRITE_TEXT_ALIGNMENT_LEADING);
+    const float headingRight = (streamingAvailable_ ? StreamingButton() : NewMirrorButton()).left - S(10.0f);
+    if (streamingStatus_.empty()) {
+        DrawLabel(dc, heading_, D2D1::RectF(S(kPad), 0, headingRight, S(kHeaderH)), titleFont_.get(), kText,
+                  DWRITE_TEXT_ALIGNMENT_LEADING);
+    } else {
+        const float mid = S(kHeaderH) * 0.5f;
+        DrawLabel(dc, heading_, D2D1::RectF(S(kPad), mid - S(19.0f), headingRight, mid + S(1.0f)),
+                  titleFont_.get(), kText, DWRITE_TEXT_ALIGNMENT_LEADING);
+        DrawLabel(dc, streamingStatus_, D2D1::RectF(S(kPad), mid + S(1.0f), headingRight, mid + S(17.0f)),
+                  smallFont_.get(), kDim, DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
 
     if (streamingAvailable_) {   // No button in a build without streaming.
-        DrawButton(dc, StreamingButton(), streamingLabel_, hot_.part == Part::Streaming, false,
-                   streamingOn_);
+        DrawButton(dc, StreamingButton(), L"Streaming", hot_.part == Part::Streaming, false, streamingOn_);
     }
     DrawButton(dc, NewMirrorButton(), L"New mirror", hot_.part == Part::NewMirror, false);
 

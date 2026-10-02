@@ -38,6 +38,14 @@ size_t Streaming::Clients() const {
     return 0;
 }
 
+bool Streaming::On() const {
+    return false;
+}
+
+Streaming::State Streaming::CurrentState() const {
+    return State::Off;
+}
+
 void Streaming::ShowSettings() {}
 
 }  // namespace rvm
