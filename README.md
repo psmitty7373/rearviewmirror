@@ -44,8 +44,10 @@ side panels; *Scale with the window* suits videos and charts that reflow.
 **Click-through** lets clicks pass straight through a mirror. It is set for each
 mirror on its own; undo it from that mirror's manager card.
 
-**Hide** removes the window but keeps capturing, for mirrors that are only
-streamed. **Off** (the manager card's switch) stops capturing entirely.
+**Hide** removes the window, for mirrors that are only streamed. A hidden
+mirror nobody is watching pauses capture after a few seconds, and resumes when
+a viewer picks it or you show it again. **Off** (the manager card's switch)
+stops capturing entirely.
 
 ## Hotkeys
 
@@ -65,6 +67,7 @@ streamed. **Off** (the manager card's switch) stops capturing entirely.
 If a mirror's source window closes, the mirror waits and comes back when the
 window reopens. Only *Close*, *Remove* and `Ctrl+Alt+X` discard a mirror.
 Several mirrors made from one window come back on the same window together.
+The app keeps up to 32 mirrors, counting those waiting for their windows.
 
 If the graphics driver resets, the app and the client restart themselves and
 pick up where they left off.
@@ -141,13 +144,16 @@ After a restart nobody is signed in, so the app isn't running. Build with
 sign-in screen in the meantime. With desktop control also built, you can sign
 in through it from the client. Once you're signed in, the app takes over.
 
-1. In Rear View Mirror, set up streaming (port and key) as usual.
+1. In Rear View Mirror, set up streaming (port and key) as usual. The key
+   must be at least 20 characters, as *Generate* makes.
 2. From an administrator prompt, run
    `build\RearViewMirrorService.exe --install`. It copies itself to
    `Program Files\RearViewMirror`, keeps this account's port and key for the
    machine, lets that UDP port in through Windows Firewall (private and domain
    networks only; nobody could answer a firewall prompt at the sign-in screen),
-   and starts the service. Run it again after changing the port or key.
+   and starts the service. Run it again after changing the port or key. An
+   earlier install with a shorter key stops serving until you generate a
+   longer one and run it again.
 3. Make Rear View Mirror start when you sign in, for example with a shortcut in
    `shell:startup`.
 

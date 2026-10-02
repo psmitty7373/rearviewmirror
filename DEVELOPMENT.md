@@ -39,10 +39,15 @@ The picture never leaves the GPU:
    hands over each new frame of the source window as a D3D11 texture. Capture's
    default 16 ms minimum update interval (about 60 fps) is lowered to 1 ms, so
    fast sources run at the display's refresh rate.
-2. The frame is copied once into a cache texture, so a repaint after a resize or
-   opacity change doesn't wait for the source to change again.
+2. Only the effective crop, plus a one-pixel margin that filtering at its edges
+   reads, is copied into a cache texture, so a repaint after a resize or opacity
+   change doesn't wait for the source to change again. A crop that grows into
+   pixels never kept restarts capture, which sends a whole frame.
 3. The crop is applied on the GPU: a UV rectangle when scaling up, a mipped blit
-   when scaling down, which stops heavy minification from shimmering.
+   when scaling down, which stops heavy minification from shimmering. A
+   minified mirror that isn't streamed copies frames straight into the top mip
+   of its crop texture instead; the cache catches up only when something needs
+   it.
 4. A pixel shader applies opacity and an antialiased rounded-rect mask and
    presents to a **DirectComposition** swapchain on a
    `WS_EX_NOREDIRECTIONBITMAP` window, so corners blend with what is behind.
@@ -51,14 +56,22 @@ There is no render loop. Capture delivers a frame only when the source changes,
 so a static mirror costs nothing. The process is per-monitor-DPI-aware v2, so
 capture textures, window rects and overlays all use physical pixels.
 
+**Sleeping.** A hidden mirror whose frames nobody wants (no viewer watching)
+stops capturing after a 3 s grace. A viewer subscribing, or showing the mirror
+again, restarts capture. A desktop mirror frees its textures while asleep; a
+window mirror keeps its last picture, since a minimized window sends none on
+waking. Nothing reports a sleeping source closing, and its handle may be
+reused, so the source's thread and process are checked again on waking.
+
 **Desktop mirrors** use the same pipeline with a different source.
 `DesktopCapture` captures every monitor separately, pointer included. Each
-monitor's frame is copied into one texture the size of the virtual screen, at
-that monitor's place in it, and the whole texture is passed on. Monitors take
-turns under one lock, so each picture passed on includes every copy before it.
-Gaps between monitors of different sizes stay black. WGC can't follow a change
-of monitors, so `WM_DISPLAYCHANGE` restarts desktop capture. If a restart fails
-mid-change, the mirror waits and retries like a mirror whose window has gone.
+monitor's frame is copied straight into the renderer's cache at that monitor's
+offset in the virtual screen; there is no composite texture. Monitors take
+turns under the renderer's lock, so each draw or streamed frame includes every
+copy before it. Gaps between monitors of different sizes stay black. WGC
+can't follow a change of monitors, so `WM_DISPLAYCHANGE` restarts desktop
+capture. If a restart fails mid-change, the mirror waits and retries like a
+mirror whose window has gone.
 The mirror's own window is excluded from capture with
 `WDA_EXCLUDEFROMCAPTURE`, or showing it would capture itself over and over.
 The source kind is saved as `Source=desktop`. A desktop mirror needs no window
@@ -86,21 +99,36 @@ draw.
 Lock order is **capture state → renderer present → renderer → device**, never
 reversed.
 
-- `WindowCapture` runs the frame callback under its state lock, and `Stop()`
-  takes the same lock, so a capture owner can't be destroyed mid-callback.
+- `WindowCapture` copies each frame under its state lock, then draws and
+  presents in an after-frame callback under a separate mutex, once the WGC
+  frame is released, so a vsync wait never holds up the next copy. `Stop()`
+  takes both, so a capture owner can't be destroyed mid-callback.
 - The renderer's present lock covers one whole draw-and-present, or a resize.
   Otherwise a UI redraw could present between a capture thread's draw and its
   present, which would then show a back buffer nobody drew. The renderer and
   device locks are released before presenting, so a vsync wait holds up only
-  that one mirror's other presents.
-- Direct2D windows draw only a snapshot taken in `PrepareDraw`, before the
-  device lock. Nothing in `OnDraw` calls into a mirror, which keeps the order
-  impossible to invert by accident.
+  that one mirror's other presents. Presents coalesce: a thread that finds
+  another already waiting to draw leaves its frame to that draw.
+- Direct2D windows draw only a snapshot taken outside the device lock, in
+  `PrepareDraw` (the manager takes its own on `Refresh` and clicks). Nothing in
+  `OnDraw` calls into a mirror, which keeps the order impossible to invert by
+  accident. They present with sync interval 1, and input and frames redraw
+  through `Invalidate`, which coalesces into one `WM_PAINT`. One
+  DirectComposition device serves every surface.
+
+**Starting and stopping capture.** Both are cross-process COM calls, during
+which the UI thread pumps messages, and starting or stopping another capture
+from one of those messages deadlocked inside WGC. So every start and stop runs
+inside an `App::Transition`; a message that would start or stop a capture
+while one is in progress is deferred, and posted again when the outermost
+transition ends. `WindowCapture::Stop()` takes its members out before closing
+them, so a nested call finds nothing half-done.
 
 Mirrors are addressed by a stable id, never by position, and destroyed lazily.
 Context menus, the region selector and message boxes run nested message loops
-inside `Mirror` methods, during which the mirror can be removed. Removal tears
-the object down at once but frees it only when the outer loop next turns.
+inside `Mirror` methods, during which the mirror can be removed. Removal takes
+the mirror out of the list first, so nothing handled while it stops can find
+it, tears it down at once, and frees it only when the outer loop next turns.
 Nested loops re-post `WM_QUIT` rather than swallowing it.
 
 Exceptions never cross a window procedure: `WndProcThunk` catches them, because
@@ -113,7 +141,8 @@ files beside the executables and no change to the generated code. On a crash,
 function names and lines when the .pdb is present, and writes a small minidump
 to `%APPDATA%\RearViewMirror`. It works on a fresh thread, since the crashing
 thread's stack may be what is broken, and then lets Windows report the crash as
-before. Copy the .pdb along with the .exe to other machines.
+before. Log lines are not flushed one by one; the crash handler flushes the
+log before the dump. Copy the .pdb along with the .exe to other machines.
 
 **Device loss.** Every swapchain, capture pool, texture and encoder belongs to
 the one device, so a removed or reset device can't be patched up in place.
@@ -127,11 +156,14 @@ it: mirrors still work, streaming does not.
 
 ## Persistence
 
-Mirrors are saved to `mirrors.ini` on every change, coalesced so one hotkey that
-touches every mirror writes once. Each write goes to a temp file that replaces
-the old one, so a crash mid-save leaves the previous file intact. Files are
-UTF-16 with a BOM so titles in any script survive, and every size read back is
-clamped to what the device can create.
+Mirrors are saved to `mirrors.ini` after every change, coalesced so one hotkey
+that touches every mirror saves once, and the file is written only when its
+content changed. Each write goes to a temp file that replaces the old one, so a
+crash mid-save leaves the previous file intact. Files are UTF-16 with a BOM so
+titles in any script survive, and every size read back is clamped to what the
+device can create. The file holds at most 32 mirrors, waiting ones included, so
+the app refuses to make a 33rd, with a message, rather than lose one on the
+next save.
 
 Window handles don't survive a restart, so each mirror records the source's
 executable, class and title. At launch it binds to the best live match: the
@@ -148,7 +180,8 @@ from before groups get one derived from each mirror's recorded identity.
 
 Unmatched mirrors wait. The app re-checks at 2 s, 4 s, then every 8 s, and also
 the moment any window comes to the foreground, which is what reopening an app
-does. A mirror whose source closes while running becomes an orphan and rebinds
+does. That foreground hook wakes the app on every switch system-wide, so it
+exists only while something waits. A mirror whose source closes while running becomes an orphan and rebinds
 the same way.
 
 ## Streaming
@@ -157,11 +190,12 @@ The app is the server; `RearViewMirrorClient.exe` is the client. One UDP port
 carries everything.
 
 **One seam.** The app reaches streaming only through the `Streaming` class. It
-is told when a mirror is created (to attach the mirror's frame hook) and when
-mirrors change (to republish the list). It posts requests for a picture back
-to the app window, and it runs the settings dialog. Mirrors and the renderer
-know nothing of streaming: a mirror offers a generic frame hook and a way to
-resend its last frame. `-DRVM_STREAMING=OFF` compiles `streaming_off.cpp`, which
+is told when a mirror is created, to attach a frame sink and a cheap "wanted"
+probe that the renderer asks on every frame, and when mirrors change, to
+republish the list, which goes out only if it changed. It posts requests for a
+picture back to the app window, and it runs the settings dialog. Mirrors and
+the renderer know nothing of streaming: a mirror offers a generic frame sink
+and a way to resend its last frame. `-DRVM_STREAMING=OFF` compiles `streaming_off.cpp`, which
 does nothing and reports streaming unavailable, and leaves out the libraries,
 the client and the tests. The streaming seam needs no conditional compilation
 at its call sites.
@@ -186,6 +220,14 @@ at its call sites.
   that queues them and wakes the encode thread. Nothing polls, so a frame costs
   only the encoder's own time (about 1 ms), independent of the system timer's
   15.6 ms tick.
+- **Asleep when idle.** The encode thread sleeps until a frame, an encoder
+  event or a viewer leaving wakes it, or until its earliest real deadline; the
+  network thread until a datagram, a wake from another thread, or its earliest
+  deadline. An idle server wakes zero times. The client's network thread waits
+  the same way (`UdpSocket::Wait`/`Wake`).
+- **Packetised once.** Each encoded frame is split into packets once, in one
+  shared buffer, then sealed and sent outside the stream's lock. NACKs are
+  answered from that same frame, without copies.
 - **Latest frame wins.** Frames pass through five texture slots between capture
   and encoder. Each frame goes in as a tracked sample, so the encoder's own
   release of the sample says when its slot is free again. If the encoder is
@@ -197,12 +239,18 @@ at its call sites.
 - **UDP with targeted recovery.** Frames are split into ≤1200-byte datagrams so
   nothing fragments. The client NACKs exactly the missing pieces, and asks for a
   keyframe only when a frame is hopeless, so one loss never stalls the stream.
+  A frame lost whole leaves only a gap, so its first packet is NACKed, which
+  says how many more there are. An incomplete frame is dropped 80 ms after its
+  last packet. A Subscribe counts as a keyframe request, and unanswered
+  requests back off from 200 ms to 1.6 s.
 - **Still sources.** Capture sends nothing while a window is still, so the
   server asks the mirror to repush its last frame when a client subscribes or
   needs a keyframe.
 - **Decode on the GPU.** The client decodes with DXVA into textures and draws
   them with Direct2D; the canvas is composited, never copied. A new frame
-  redraws the canvas only if one of that server's boxes is on it.
+  redraws the canvas only if its stream has a box there, and a pop-out only
+  for its own stream. Each frame is staged into the decoder outside the device
+  lock; only the decode itself takes it. Sidebar text layouts are cached.
 - **True proportions.** A very thin strip can't be scaled to fit both the
   256 px floor and the 4096 px ceiling in proportion, and 16-pixel padding
   stretches a frame slightly. `net::EncodeSize` is shared by both ends: when
@@ -303,15 +351,18 @@ protocol is the same, so clients cannot tell.
   processor; the tests check the values exactly.
 - **Readback off the capture thread.** The encode thread maps the staging slot
   with `D3D11_MAP_FLAG_DO_NOT_WAIT`, taking the device lock only for each
-  attempt, so waiting for the GPU's copy never holds up other draws. The slot is
-  handed back as soon as the frame is copied out, before it is encoded.
+  attempt. While the GPU is still busy, `IDXGIDevice2::EnqueueSetEvent` arms an
+  event for when its queued work has run, and the thread waits on that outside
+  the lock rather than on the timer tick. The copy out also runs outside the
+  lock, into a reused input buffer, and the slot is handed back before the
+  frame is encoded.
 - **Synchronous.** The CPU encoder always takes input, and `Encode` returns
   with whatever the frame produced: no events, no relay, no nudging. It gets
   the same constant bitrate, no B-frames, longest keyframe interval and
   low-latency mode, and it honours forced keyframes.
-- **Cost.** Measured on a development VM with no GPU: 15 ms a frame at
-  640x360, and 47 ms at 1080p on detailed content that changes every frame,
-  about 21 fps at most. The presets made no measurable difference there. One
+- **Cost.** Measured on a development VM with no GPU: about 2.3 ms a frame at
+  640x360, and 13 to 15 ms at 1080p on detailed content that changes every
+  frame. The presets made no measurable difference there. One
   encode thread serves every stream, so a busy CPU stream also delays the
   others; latest-frame-wins drops what the CPU cannot keep up with.
 - The viewing client still decodes on the GPU. Windows' decoder buffers
@@ -332,8 +383,8 @@ isn't the answer to its own HELLO. A HELLO only earns a pending handshake; a
 client takes a slot only after its first message under the session key. A
 HELLO seen in the last two minutes is refused outright, and an older one
 replayed still can't produce a message under the new session key, so a
-captured HELLO gets nowhere. A datagram too short to hold a tag and a body is dropped before
-decryption. Even a client holding the key is bounded:
+captured HELLO gets nowhere. A datagram too short to hold a tag and a body is
+dropped before decryption. Even a peer holding the key is bounded:
 
 | Limit | Value |
 | --- | --- |
@@ -342,6 +393,8 @@ decryption. Even a client holding the key is bounded:
 | Subscriptions | Listed mirrors only, 64 per client |
 | Keyframes and frame requests | 4 a second per mirror |
 | Retransmits | 2000 a second per client, each packet once per NACK |
+| Frame size | 8192 packets (about 9.5 MB) |
+| Client reassembly | Two frames' worth of packets pending per stream; 64 unwanted mirror ids tracked |
 | Log file | 16 MB |
 
 Send and receive use separate cipher objects, since they run on different
@@ -417,14 +470,18 @@ console connect) wake it, and it checks every 5 s regardless. Signing in counts
 from the moment Windows records a user name, which is before the desktop
 appears. A helper that exits is started again, with a
 backoff from 1 s to a minute if it keeps exiting quickly. It is stopped through
-a named event, and ended after 5 s if it does not stop.
+an unnamed event, and ended after 5 s if it does not stop: the service passes
+its process id and the event's handle on the command line, and the helper
+duplicates the handle. The helper also exits if the service process ends.
 
 **What the helper does.** Windows Graphics Capture is not built for secure
-desktops, so `DuplicationCapture` uses DXGI Desktop Duplication instead. It
-copies each monitor of the device's adapter to its place in one virtual-screen
-texture, draws the pointer, which duplication reports separately, on top with
-Direct2D, and tees the result into a `StreamServer` as mirror `0x7F000001`,
-"Sign-in screen". It serves on the app's port with the app's key, so a client
+desktops, so `DuplicationCapture` uses DXGI Desktop Duplication instead. Each
+monitor of the device's adapter has a thread of its own, which copies only
+what changed (duplication's move and dirty rectangles) to the monitor's place
+in one virtual-screen texture. Only while a client watches, and at most at the
+stream's frame rate, the picture is composed with the pointer, which
+duplication reports separately, drawn on top with Direct2D, and teed into a
+`StreamServer` as mirror `0x7F000001`, "Sign-in screen". It serves on the app's port with the app's key, so a client
 sees one server throughout: the sign-in screen, a brief reconnect, then the
 app's mirrors. Duplication ends at every desktop switch or mode change; the
 capture thread then moves itself to the new input desktop with
@@ -439,8 +496,8 @@ only while the service is running, so without the service a locked app streams
 as it always did. Back on the console and unlocked, it unpauses, trying each
 second for half a minute while the helper lets go of the port; the app also
 starts that way, since right after signing in the helper may still hold it.
-While handed off it looks again every 5 s, in case a notification came while
-the console was between sessions, or the service stopped.
+While its session is away from the console it rechecks every 5 s, in case a
+notification came between sessions or the service started or stopped.
 
 **Remote input needs nothing new.** Every thread of the helper starts on the
 Winlogon desktop, and that stays the input desktop for as long as the helper
@@ -453,10 +510,16 @@ picture.
 `%APPDATA%` nor a key encrypted to a user will do. `--install` (elevated) copies
 the current user's port, key, bitrate, frame rate and preset to
 `%ProgramData%\RearViewMirror\login.ini`, with the key encrypted to the machine
-(DPAPI local-machine scope). The folder's protected DACL, owned by
-Administrators and granting only SYSTEM and Administrators, is what keeps it
-private, and it is re-applied on every install, so a folder planted in advance
-is taken over rather than trusted. The service binary is copied to
+(DPAPI local-machine scope). The key must be at least 20 characters, which
+*Generate* makes; an older install with a shorter key stops serving until
+`--install` is run again. The folder's protected DACL, owned by Administrators
+and granting only SYSTEM and Administrators, is what keeps it private, and it
+is re-applied on every install. A link at that path is removed (the link, not
+its target), and a folder anyone else could have made or changed is moved
+aside to `RearViewMirror.untrusted-*` and made afresh. The service and helper
+check the folder whenever they start and refuse one that isn't trusted; with nowhere
+safe to log, the service stops with `ERROR_ACCESS_DENIED`, which Windows
+records in the event log. The service binary is copied to
 `%ProgramFiles%\RearViewMirror` first: a SYSTEM service running from a folder
 its user can write would hand that user SYSTEM. Logs and crash dumps go to the
 same ProgramData folder. Windows Firewall would ask before letting the helper's
@@ -472,7 +535,7 @@ domain networks. `--uninstall` removes it.
   sees the console's sign-in screen rather than the Remote Desktop session.
 - Ctrl+Alt+Delete is not sent (`SendSAS`). Windows 11 does not ask for it at
   sign-in unless a policy requires it.
-- Monitors on a second adapter are not duplicated; they stay black.
+- Monitors on a second adapter, and rotated monitors, stay black.
 - Inverting pointer pixels (the text I-beam) are drawn black.
 - Secure desktops cannot be tested headlessly. `--helper-test` runs the
   capture and stream in the current session, by hand.
@@ -513,17 +576,20 @@ with a warning. Nothing is stored in the repository.
 ## Tests
 
 `build\rvmnet_test.exe` runs headlessly: crypto, replay protection,
-packetisation with loss, GPU encode/decode round trips, encoder size limits
-(including whole-desktop sizes), desktop capture (frames counted, never read
-back), a full server-to-client loopback, reconnects, hostile-client limits, the
-frame-rate cap, rate control and keyframe policy, and a 120 fps end-to-end
-stream. The CPU path is checked on any machine: the shader packer's exact
-BT.709 values, a CPU encode/decode round trip with forced keyframes and 1080p
-timings, and a server forced onto the CPU streaming to a raw peer. Tests that
-need a hardware encoder, a video processor or screen capture skip without
-one. It logs to `test.log` beside the
-app's logs. Timing checks leave room for a busy machine; servers bind port 0
-so a running copy of the app doesn't get in the way.
+packetisation with loss, the assembler's limits and keyframe back-off, GPU
+encode/decode round trips, encoder size limits (including whole-desktop
+sizes), desktop capture (frames counted, never read back), a full
+server-to-client loopback, reconnects, hostile-client limits, the frame-rate
+cap, rate control and keyframe policy, and a 120 fps end-to-end stream. Any
+machine runs the CPU path (the frame packer's exact BT.709 values, the CPU
+codec with forced keyframes and 1080p timings, a CPU stream to a raw peer) and
+the wake-up checks: the client's network thread wakes for what the UI asks,
+the encode thread only when it has a reason, and an idle server's network
+thread not at all. Tests that need a hardware encoder, a video processor or
+screen capture skip without one; on the GPU-less development VM that leaves
+109 checks with remote control built, 107 without. It logs to `test.log` beside the app's logs. Timing
+checks leave room for a busy machine; servers bind port 0 so a running copy of
+the app doesn't get in the way.
 
 | Mode | Purpose |
 | --- | --- |
