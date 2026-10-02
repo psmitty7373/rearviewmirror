@@ -4,6 +4,8 @@
 #include "service.h"
 
 #include <cstdio>
+#include <map>
+#include <userenv.h>
 #include <wtsapi32.h>
 
 namespace rvm::login {
@@ -17,12 +19,31 @@ constexpr DWORD kRecheckMs = 5000;
 // A helper that keeps exiting soon after starting is restarted ever less often.
 constexpr ULONGLONG kQuickExitMs = 30000;
 constexpr DWORD kMinBackoffMs = 1000, kMaxBackoffMs = 60000;
+// How long after a session event the app must be running: a fresh sign-in
+// gets time for its own startup items to start it first.
+constexpr ULONGLONG kAppCheckAfterSignInMs = 20000, kAppCheckAfterReturnMs = 3000;
 
 SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
 HANDLE g_stop = nullptr;   // The service is to stop.
 HANDLE g_wake = nullptr;   // A session changed: look again.
 
 bool g_trustedDir = false;
+
+// Sessions to start the app in, if it is not running there by then: session to when.
+std::mutex g_appChecksMutex;
+std::map<DWORD, ULONGLONG> g_appChecks;
+
+void ScheduleAppCheck(DWORD session, DWORD type) {
+    if (type != WTS_SESSION_LOGON && type != WTS_SESSION_UNLOCK && type != WTS_CONSOLE_CONNECT &&
+        type != WTS_REMOTE_CONNECT) {
+        return;
+    }
+    const ULONGLONG due = GetTickCount64() + (type == WTS_SESSION_LOGON ? kAppCheckAfterSignInMs
+                                                                       : kAppCheckAfterReturnMs);
+    std::lock_guard lock(g_appChecksMutex);
+    ULONGLONG& at = g_appChecks[session];
+    at = (std::max)(at, due);
+}
 
 void Report(DWORD state, DWORD waitHintMs = 0, DWORD exitCode = NO_ERROR) {
     static DWORD checkpoint = 1;
@@ -61,6 +82,7 @@ DWORD WINAPI Control(DWORD control, DWORD type, LPVOID data, LPVOID) {
     case SERVICE_CONTROL_SESSIONCHANGE: {
         const auto* note = static_cast<const WTSSESSION_NOTIFICATION*>(data);
         Log(L"service: session %lu: %s", note ? note->dwSessionId : kNoSession, SessionEventName(type));
+        if (note) ScheduleAppCheck(note->dwSessionId, type);
         SetEvent(g_wake);
         return NO_ERROR;
     }
@@ -122,6 +144,76 @@ void StopHelper(HANDLE process, HANDLE stopEvent, const wchar_t* why) {
         WaitForSingleObject(process, kHelperStopWaitMs);
     }
     CloseHandle(process);
+}
+
+bool AppRunningIn(DWORD session, const std::wstring& exeName) {
+    WTS_PROCESS_INFOW* processes = nullptr;
+    DWORD count = 0;
+    if (!WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &processes, &count)) return true;   // Unknown: leave it.
+    bool running = false;
+    for (DWORD i = 0; i < count && !running; ++i) {
+        running = processes[i].SessionId == session && processes[i].pProcessName &&
+                  _wcsicmp(processes[i].pProcessName, exeName.c_str()) == 0;
+    }
+    WTSFreeMemory(processes);
+    return running;
+}
+
+// A reconnected session runs no startup items, and an app that was closed or
+// crashed leaves nothing to take over from the helper. Only in the installing
+// account's sessions, as that account, never elevated: the path is its to set.
+void StartAppIfMissing(DWORD session) {
+    const std::wstring path = RecordedAppPath();
+    std::vector<uint8_t> owner;
+    if (path.empty() || !AppOwnerSid(owner)) return;
+    const std::wstring exeName = path.substr(path.find_last_of(L'\\') + 1);
+    if (AppRunningIn(session, exeName)) return;
+
+    HANDLE token = nullptr;
+    if (!WTSQueryUserToken(session, &token)) return;   // Nobody signed in there (any more).
+    std::vector<uint8_t> user(SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER));
+    DWORD size = 0;
+    const bool mine = GetTokenInformation(token, TokenUser, user.data(), static_cast<DWORD>(user.size()), &size) &&
+                      EqualSid(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, owner.data());
+    void* environment = nullptr;
+    if (mine && CreateEnvironmentBlock(&environment, token, FALSE)) {
+        STARTUPINFOW si{ sizeof(si) };
+        si.lpDesktop = const_cast<wchar_t*>(L"winsta0\\default");
+        std::wstring command = L"\"" + path + L"\" --autostart";
+        const std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessAsUserW(token, path.c_str(), command.data(), nullptr, nullptr, FALSE,
+                                 CREATE_UNICODE_ENVIRONMENT, environment, dir.c_str(), &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            Log(L"service: Rear View Mirror was not running in session %lu; started it", session);
+        } else {
+            Log(L"service: could not start Rear View Mirror in session %lu (%lu)", session, GetLastError());
+        }
+        DestroyEnvironmentBlock(environment);
+    }
+    CloseHandle(token);
+}
+
+// Runs the checks that are due; returns how long until the next one.
+DWORD RunDueAppChecks() {
+    const ULONGLONG now = GetTickCount64();
+    std::vector<DWORD> due;
+    ULONGLONG next = UINT64_MAX;
+    {
+        std::lock_guard lock(g_appChecksMutex);
+        for (auto it = g_appChecks.begin(); it != g_appChecks.end();) {
+            if (it->second <= now) {
+                due.push_back(it->first);
+                it = g_appChecks.erase(it);
+            } else {
+                next = (std::min)(next, it->second);
+                ++it;
+            }
+        }
+    }
+    for (DWORD session : due) StartAppIfMissing(session);
+    return next == UINT64_MAX ? INFINITE : static_cast<DWORD>(next - now);
 }
 
 // What the console shows: the app's desktop only when signed in and unlocked.
@@ -193,7 +285,7 @@ DWORD Supervise() {
             }
         }
 
-        DWORD timeout = kRecheckMs;
+        DWORD timeout = (std::min)(kRecheckMs, RunDueAppChecks());
         if (wanted && !helper) {
             const ULONGLONG untilLaunch = nextLaunch > now ? nextLaunch - now : 0;
             timeout = static_cast<DWORD>((std::min)(static_cast<ULONGLONG>(timeout), untilLaunch));

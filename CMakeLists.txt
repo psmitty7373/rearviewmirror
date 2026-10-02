@@ -173,7 +173,7 @@ if(RVM_LOGIN_SERVICE)
         src/app.manifest
     )
     target_include_directories(rvmservice PRIVATE service)
-    target_link_libraries(rvmservice PRIVATE rvmserver wtsapi32 advapi32)
+    target_link_libraries(rvmservice PRIVATE rvmserver wtsapi32 advapi32 userenv)
     set_target_properties(rvmservice PROPERTIES OUTPUT_NAME "RearViewMirrorService")
     rvm_sign(rvmservice)
 endif()

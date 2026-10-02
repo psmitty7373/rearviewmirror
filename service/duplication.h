@@ -10,7 +10,8 @@ namespace rvm::login {
 // The whole virtual screen through DXGI Desktop Duplication, the one capture
 // API that works on the secure desktops (as SYSTEM). One thread per monitor of
 // the device's adapter; the pointer is drawn on top. Follows the input
-// desktop across switches.
+// desktop across switches. Where duplication sends nothing, as on some
+// virtual display drivers, GDI copies stand in.
 class DuplicationCapture {
 public:
     // `onFrame`: the composed picture, under Gfx::deviceMutex, on a capture
@@ -44,6 +45,9 @@ private:
     void RunOutput(size_t index);
     static bool ReadChanges(Output& out, UINT bytes);
     UINT ComposeIfDue();
+    // The first monitor's thread: GDI copies while duplication sends nothing.
+    UINT PollScreen();
+    void FreeGdi();
 
     // Under Gfx::deviceMutex.
     bool EnsureTextures(UINT width, UINT height);
@@ -69,6 +73,16 @@ private:
     HDESK desktop_ = nullptr;
     std::wstring desktopName_;
     SIZE size_{};
+    bool seedTried_ = false;   // This attach; the first monitor's thread only.
+
+    // The first monitor's thread only.
+    HDC       gdiDc_ = nullptr;
+    HBITMAP   gdiDib_ = nullptr;
+    HGDIOBJ   gdiOld_ = nullptr;
+    uint32_t* gdiBits_ = nullptr;
+    std::vector<uint32_t> gdiLast_;   // The last copy uploaded; empty: upload all of the next.
+    std::chrono::steady_clock::time_point gdiNext_{};
+    std::atomic<bool> gdiOn_{ false };   // Cleared by the first duplicated frame.
 
     // Under Gfx::deviceMutex.
     winrt::com_ptr<ID3D11Texture2D>    composite_;   // The screen as duplicated.

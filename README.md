@@ -36,7 +36,7 @@ monitors, the stream is scaled to at most 4096 pixels wide.
 | Drag an edge or corner | Scale (proportions locked, sticks at 100%) |
 | `Ctrl` while resizing | Skip the 100% stop |
 | Double-click | Back to 100% |
-| Right-click | Region, zoom, opacity, resize behaviour, aspect lock, click-through, hide, close |
+| Right-click | Region, zoom, opacity, resize behaviour, click-through, hide, close |
 
 **When source resizes** (right-click): *Stay at fixed offset* suits toolbars and
 side panels; *Scale with the window* suits videos and charts that reflow.
@@ -129,8 +129,8 @@ vertical/horizontal scrolling, and keyboard shortcuts go to that PC.
 Press **Ctrl+Alt+F12** to release control and move or resize tiles again. Clicking
 outside the desktop picture or switching away from the client also releases it.
 Only one viewer controls a server at a time. Control is released on disconnect
-and must be selected again after reconnecting. Pop-out windows are view-only;
-return one to the canvas to control it.
+and must be selected again after reconnecting. A popped-out desktop is controlled
+the same way, from its own right-click menu; switching away from it releases control.
 
 Input uses the server's keyboard layout and Windows input permissions. Secure
 desktops (including UAC prompts), Ctrl+Alt+Delete, and applications running at a
@@ -153,8 +153,10 @@ in through it from the client. Once you're signed in, the app takes over.
    Firewall (UDP, private and domain networks only; nobody could answer a
    firewall prompt at the sign-in screen), and starts the service. From then on
    change the port or key in the Streaming dialog as usual; the service follows.
-3. Make Rear View Mirror start when you sign in, for example with a shortcut in
-   `shell:startup`.
+3. Nothing else: whenever you sign in, reconnect to a session or unlock one and
+   Rear View Mirror isn't running in it, the service starts it, as you, from
+   where it last ran. Closing it from the tray keeps it closed until then. Only
+   the account that installed the service gets this.
 
 In the client nothing changes: the same server lists **Sign-in screen** while
 the PC's screen shows a sign-in or lock screen, and your own mirrors otherwise.
@@ -162,7 +164,8 @@ Between the two it disconnects for a moment and reconnects by itself. That
 covers more than restarts: locking the PC, signing out, and leaving it after a
 Remote Desktop connection all put the PC's screen on a sign-in or lock screen.
 Rear View Mirror then stops serving until its session is back on the screen,
-unlocked.
+unlocked. Meanwhile, in a Remote Desktop session for example, its manager shows
+*The sign-in service is streaming* under the heading.
 
 `RearViewMirrorService.exe --uninstall` removes the service, its files and logs,
 and moves the streaming settings back to your account. `--helper-test` streams

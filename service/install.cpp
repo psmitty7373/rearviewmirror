@@ -161,6 +161,12 @@ int RunInstall() {
         return Fail(L"Cannot save the shared streaming settings.");
     }
     DeleteFileOrLater(MachineDir() + L"\\login.ini");   // Where earlier versions kept their own copy.
+    // Until the app first runs and records itself, the one built beside this.
+    const std::wstring app = SelfDir() + L"\\RearViewMirror.exe";
+    if (RecordedAppPath().empty() && GetFileAttributesW(app.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        RegSetKeyValueW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, kAppPathValue, REG_SZ, app.c_str(),
+                        static_cast<DWORD>((app.size() + 1) * sizeof(wchar_t)));
+    }
     const bool firewall = SetFirewallRule(&exe);
 
     const std::wstring command = L"\"" + exe + L"\" --service";
@@ -202,8 +208,8 @@ int RunInstall() {
         wprintf(L"- Could not add the Windows Firewall rule: clients will be blocked until UDP is\n"
                 L"  allowed in for %s.\n", exe.c_str());
     }
-    wprintf(L"- Rear View Mirror must start when you sign in (a shortcut in shell:startup)\n"
-            L"  to take over from there.\n");
+    wprintf(L"- Whenever you sign in, reconnect or unlock and Rear View Mirror is not running in\n"
+            L"  that session, the service starts it (as you, from where it last ran).\n");
 #if !RVM_REMOTE_CONTROL
     wprintf(L"- This build has no desktop control: the sign-in screen can be watched, not used.\n"
             L"  Build with --remote-control to sign in through it.\n");

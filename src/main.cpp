@@ -1,6 +1,6 @@
 #include "app.h"
 
-int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
+int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR commandLine, int) {
     // Physical pixels everywhere, so textures, window rects and overlays agree.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -9,10 +9,12 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     // A relaunch after a lost graphics device waits for the old process to go.
     const bool relaunched = rvm::WaitForPreviousInstance();
 
-    // Only one instance: a second launch brings up the first one's manager.
+    // Only one instance: a second launch brings up the first one's manager,
+    // unless the sign-in service started it (--autostart), which wants it running.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\RearViewMirror.Instance");
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND existing = FindWindowW(rvm::kAppWindowClass, nullptr)) {
+        const bool autostart = commandLine && wcsstr(commandLine, L"--autostart");
+        if (HWND existing = autostart ? nullptr : FindWindowW(rvm::kAppWindowClass, nullptr)) {
             // Pass on the right to take the foreground, or the manager opens behind.
             DWORD pid = 0;
             GetWindowThreadProcessId(existing, &pid);

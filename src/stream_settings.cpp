@@ -332,6 +332,17 @@ bool SaveMachineStreamSettings(const StreamSettings& s) {
     RegCloseKey(key);
     return ok;
 }
+
+void RecordAppPath() {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+    if (length == 0 || length == ARRAYSIZE(exe)) return;
+    if (HKEY key = OpenMachineSettings(KEY_SET_VALUE)) {   // Absent for any other account.
+        RegSetValueExW(key, kAppPathValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(exe),
+                       (length + 1) * sizeof(wchar_t));
+        RegCloseKey(key);
+    }
+}
 #endif
 
 StreamSettings LoadStreamSettings() {

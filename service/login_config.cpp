@@ -174,4 +174,45 @@ bool LoadLoginSettings(StreamSettings& s) {
     return true;
 }
 
+bool AppOwnerSid(std::vector<uint8_t>& sid) {
+    sid.clear();
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, 0, READ_CONTROL | KEY_WOW64_64KEY, &key) !=
+        ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD size = 0;
+    std::vector<uint8_t> sd;
+    if (RegGetKeySecurity(key, DACL_SECURITY_INFORMATION, nullptr, &size) == ERROR_INSUFFICIENT_BUFFER) {
+        sd.resize(size);
+        if (RegGetKeySecurity(key, DACL_SECURITY_INFORMATION, sd.data(), &size) != ERROR_SUCCESS) sd.clear();
+    }
+    RegCloseKey(key);
+    BOOL present = FALSE, defaulted = FALSE;
+    PACL dacl = nullptr;
+    if (sd.empty() || !GetSecurityDescriptorDacl(sd.data(), &present, &dacl, &defaulted) || !dacl) return false;
+    for (WORD i = 0; i < dacl->AceCount; ++i) {
+        void* ace = nullptr;
+        if (!GetAce(dacl, i, &ace) || static_cast<const ACE_HEADER*>(ace)->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            continue;
+        }
+        const PSID owner = &static_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart;
+        if (SystemOrAdmins(owner)) continue;
+        const auto* bytes = static_cast<const uint8_t*>(owner);
+        sid.assign(bytes, bytes + GetLengthSid(owner));
+        return true;
+    }
+    return false;
+}
+
+std::wstring RecordedAppPath() {
+    wchar_t path[MAX_PATH]{};
+    DWORD size = sizeof(path);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, kAppPathValue, RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                     nullptr, path, &size) != ERROR_SUCCESS) {
+        return {};
+    }
+    return path;
+}
+
 }  // namespace rvm::login

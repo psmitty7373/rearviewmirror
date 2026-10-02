@@ -27,4 +27,10 @@ void DeleteMachineSettings();
 // kMinMachineKeyChars.
 bool LoadLoginSettings(StreamSettings& settings);
 
+// The account the settings key grants access to: the one that installed it,
+// read from the key's rules, which that account cannot change.
+bool AppOwnerSid(std::vector<uint8_t>& sid);
+// What RecordAppPath last wrote; empty if never.
+std::wstring RecordedAppPath();
+
 }  // namespace rvm::login

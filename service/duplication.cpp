@@ -1,5 +1,7 @@
 #include "duplication.h"
 
+#include <cstring>
+
 namespace rvm::login {
 
 namespace {
@@ -73,6 +75,7 @@ bool DuplicationCapture::Start(FrameCallback onFrame, SizeCallback onSize, Wante
 void DuplicationCapture::Stop() {
     if (!running_.exchange(false)) return;
     if (thread_.joinable()) thread_.join();
+    FreeGdi();
     // The thread no longer uses its desktop, so the handle can go.
     if (desktop_) {
         CloseDesktop(desktop_);
@@ -304,9 +307,79 @@ void DuplicationCapture::CopyChanges(Output& out, ID3D11Texture2D* texture, bool
         for (const RECT& dirty : out.dirty) copy(dirty);
     }
     out.whole = false;
+    if (gdiOn_.exchange(false)) Log(L"login: duplication sends frames after all; GDI copies stop");
     havePicture_ = true;
 }
 
+// Some virtual display drivers never send a duplicated frame, and a still
+// sign-in screen sends none anywhere: GDI copies stand in until one comes.
+// Only the rows that changed are uploaded.
+UINT DuplicationCapture::PollScreen() {
+    constexpr auto kGdiInterval = std::chrono::milliseconds(66);
+    if (!gdiOn_) return kIdleWaitMs;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < gdiNext_) return static_cast<UINT>(std::chrono::ceil<std::chrono::milliseconds>(gdiNext_ - now).count());
+    gdiNext_ = now + kGdiInterval;
+    if (!(wanted_ && wanted_()) && !gdiLast_.empty()) return static_cast<UINT>(kGdiInterval.count());
+
+    const int w = bounds_.right, h = bounds_.bottom;
+    const size_t count = static_cast<size_t>(w) * h;
+    HDC screen = GetDC(nullptr);
+    if (!gdiDc_) {
+        BITMAPINFO bi{};
+        bi.bmiHeader = { sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB };
+        void* bits = nullptr;
+        gdiDc_ = CreateCompatibleDC(screen);
+        gdiDib_ = gdiDc_ ? CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+        gdiBits_ = static_cast<uint32_t*>(bits);
+        if (gdiDib_) gdiOld_ = SelectObject(gdiDc_, gdiDib_);
+        gdiLast_.clear();
+    }
+    const bool copied = gdiBits_ && BitBlt(gdiDc_, 0, 0, w, h, screen, GetSystemMetrics(SM_XVIRTUALSCREEN),
+                                           GetSystemMetrics(SM_YVIRTUALSCREEN), SRCCOPY | CAPTUREBLT);
+    ReleaseDC(nullptr, screen);
+    if (!copied) {
+        RVM_LOG_SAMPLED(50, L"login: GDI cannot copy the screen either (%lu)", GetLastError());
+        return static_cast<UINT>(kGdiInterval.count());
+    }
+    GdiFlush();
+    for (size_t i = 0; i < count; ++i) gdiBits_[i] |= 0xFF000000u;   // GDI leaves alpha 0.
+
+    int top = 0, bottom = h;
+    if (gdiLast_.size() == count) {
+        const auto same = [&](int y) {
+            return std::memcmp(gdiBits_ + static_cast<size_t>(y) * w, gdiLast_.data() + static_cast<size_t>(y) * w,
+                               static_cast<size_t>(w) * 4) == 0;
+        };
+        while (top < h && same(top)) ++top;
+        if (top == h) return static_cast<UINT>(kGdiInterval.count());
+        while (same(bottom - 1)) --bottom;
+    } else {
+        gdiLast_.resize(count);
+    }
+    std::memcpy(gdiLast_.data() + static_cast<size_t>(top) * w, gdiBits_ + static_cast<size_t>(top) * w,
+                static_cast<size_t>(bottom - top) * w * 4);
+
+    std::lock_guard lock(Gfx::Get().deviceMutex);
+    if (!composite_ || !gdiOn_) return kIdleWaitMs;
+    const D3D11_BOX box{ 0, static_cast<UINT>(top), 0, static_cast<UINT>(w), static_cast<UINT>(bottom), 1 };
+    Gfx::Get().ctx->UpdateSubresource(composite_.get(), 0, &box, gdiBits_ + static_cast<size_t>(top) * w,
+                                      static_cast<UINT>(w) * 4, 0);
+    havePicture_ = true;
+    Damage(RECT{ 0, top, w, bottom });
+    return static_cast<UINT>(kGdiInterval.count());
+}
+
+void DuplicationCapture::FreeGdi() {
+    if (gdiDc_ && gdiOld_) SelectObject(gdiDc_, gdiOld_);
+    if (gdiDib_) DeleteObject(gdiDib_);
+    if (gdiDc_) DeleteDC(gdiDc_);
+    gdiDc_ = nullptr;
+    gdiDib_ = nullptr;
+    gdiOld_ = nullptr;
+    gdiBits_ = nullptr;
+    gdiLast_.clear();
+}
 void DuplicationCapture::Damage(const RECT& r) {
     stale_ = true;
     if (damageAll_) return;
@@ -407,7 +480,16 @@ void DuplicationCapture::RunOutput(size_t index) {
         winrt::com_ptr<IDXGIResource> resource;
         const HRESULT hr = out.dup->AcquireNextFrame(waitMs, &info, resource.put());
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            waitMs = ComposeIfDue();
+            if (index == 0 && !seedTried_) {
+                seedTried_ = true;
+                std::lock_guard lock(g.deviceMutex);
+                if (!havePicture_) {
+                    gdiOn_ = true;
+                    Log(L"login: no picture from duplication yet; copying the screen with GDI until one comes");
+                }
+            }
+            waitMs = index == 0 ? PollScreen() : kIdleWaitMs;
+            waitMs = (std::min)(waitMs, ComposeIfDue());
             continue;
         }
         if (FAILED(hr)) {
@@ -443,7 +525,8 @@ void DuplicationCapture::RunOutput(size_t index) {
             }
         }
         out.dup->ReleaseFrame();
-        waitMs = ComposeIfDue();
+        waitMs = index == 0 ? PollScreen() : kIdleWaitMs;   // Pointer-only updates must not starve it.
+        waitMs = (std::min)(waitMs, ComposeIfDue());
     }
 }
 
@@ -455,6 +538,9 @@ void DuplicationCapture::Loop() {
         }
         // The first monitor on this thread: one monitor needs no other.
         lost_ = false;
+        seedTried_ = false;
+        gdiOn_ = false;
+        FreeGdi();   // The size may have changed, and the composite with it.
         std::vector<std::thread> others;
         for (size_t i = 1; i < outputs_.size(); ++i) others.emplace_back([this, i] { RunOutput(i); });
         RunOutput(0);

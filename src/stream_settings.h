@@ -50,6 +50,11 @@ bool MachineSettingsInUse();
 // empty, its blob in lockedKey.
 bool LoadMachineStreamSettings(StreamSettings& settings);
 bool SaveMachineStreamSettings(const StreamSettings& settings);
+
+// Where the app runs from, which the service starts in its owner's sessions.
+// Written by the app at each start; only the installing account can.
+constexpr wchar_t kAppPathValue[] = L"AppPath";
+void RecordAppPath();
 #endif
 
 // What the dialog's Start/Stop button and live status line act on.
