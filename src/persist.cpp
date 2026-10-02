@@ -108,15 +108,23 @@ std::wstring ExeNameForPid(DWORD pid) {
     if (!process) return {};
 
     // Long-path installs exceed MAX_PATH; the NT limit is 32767 characters.
-    std::wstring path(32768, L'\0');
-    DWORD length = static_cast<DWORD>(path.size());
-    const bool ok = QueryFullProcessImageNameW(process, 0, path.data(), &length) != FALSE;
+    wchar_t buffer[MAX_PATH];
+    std::wstring big;
+    wchar_t* path = buffer;
+    DWORD length = ARRAYSIZE(buffer);
+    bool ok = QueryFullProcessImageNameW(process, 0, path, &length) != FALSE;
+    if (!ok && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+        big.resize(32768);
+        path = big.data();
+        length = static_cast<DWORD>(big.size());
+        ok = QueryFullProcessImageNameW(process, 0, path, &length) != FALSE;
+    }
     CloseHandle(process);
     if (!ok) return {};
 
-    path.resize(length);
-    const size_t slash = path.find_last_of(L'\\');
-    return (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    const std::wstring_view full(path, length);
+    const size_t slash = full.find_last_of(L'\\');
+    return std::wstring(slash == std::wstring_view::npos ? full : full.substr(slash + 1));
 }
 
 // Titles carry volatile prefixes: a dirty marker ("*", "●") or an unread
@@ -143,7 +151,7 @@ std::wstring TitleCore(const std::wstring& title) {
 struct MatchState {
     const MirrorState* want;
     const std::vector<HWND>* exclude;
-    std::vector<std::pair<DWORD, std::wstring>> exeByPid;   // One lookup per process.
+    ExeNameCache* exes;   // One lookup per process.
     HWND best  = nullptr;
     int  score = 0;
     bool bestHasTitle = false;
@@ -152,11 +160,11 @@ struct MatchState {
     const std::wstring& ExeFor(HWND hwnd) {
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
-        for (const auto& [p, exe] : exeByPid) {
+        for (const auto& [p, exe] : *exes) {
             if (p == pid) return exe;
         }
-        exeByPid.emplace_back(pid, ExeNameForPid(pid));
-        return exeByPid.back().second;
+        exes->emplace_back(pid, ExeNameForPid(pid));
+        return exes->back().second;
     }
 };
 
@@ -274,9 +282,11 @@ void FillIdentity(HWND hwnd, MirrorState& state) {
     state.title     = WindowTitle(hwnd);
 }
 
-HWND FindMatchingWindow(const MirrorState& state, const std::vector<HWND>& exclude) {
+HWND FindMatchingWindow(const MirrorState& state, const std::vector<HWND>& exclude,
+                        ExeNameCache* exes) {
     if (state.exeName.empty() && state.className.empty() && state.title.empty()) return nullptr;
-    MatchState st{ &state, &exclude };
+    ExeNameCache own;
+    MatchState st{ &state, &exclude, exes ? exes : &own };
     EnumWindows(&MatchProc, reinterpret_cast<LPARAM>(&st));
     // Executable and class alone are enough only when they point at a single
     // window. With several candidates and no title to choose by, binding to
@@ -380,7 +390,12 @@ bool SaveMirrorStates(const std::vector<MirrorState>& states) {
         Line(text, L"Group", std::to_wstring(s.group));
     }
 
-    return WriteTextAtomically(ConfigPath(), text);
+    // Most changes that ask for a save, like a click on a mirror, change nothing.
+    static std::wstring saved;
+    if (text == saved) return true;
+    if (!WriteTextAtomically(ConfigPath(), text)) return false;
+    saved = std::move(text);
+    return true;
 }
 
 }  // namespace rvm
