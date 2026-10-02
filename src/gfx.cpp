@@ -285,17 +285,41 @@ bool CompSurface::Create(HWND hwnd, UINT width, UINT height) {
     desc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     desc.AlphaMode   = DXGI_ALPHA_MODE_PREMULTIPLIED;
 
-    if (FAILED(g.factory->CreateSwapChainForComposition(g.d3d.get(), &desc, nullptr, swap_.put())) ||
-        FAILED(DCompositionCreateDevice(g.dxgi.get(), __uuidof(IDCompositionDevice), dcomp_.put_void())) ||
-        FAILED(dcomp_->CreateTargetForHwnd(hwnd, TRUE, target_.put())) ||
-        FAILED(dcomp_->CreateVisual(visual_.put())) ||
+    if (FAILED(g.factory->CreateSwapChainForComposition(g.d3d.get(), &desc, nullptr, swap_.put()))) {
+        return false;
+    }
+    std::lock_guard lock(g.compositionMutex);
+    IDCompositionDevice* dcomp = g.Composition();
+    if (!dcomp ||
+        FAILED(dcomp->CreateTargetForHwnd(hwnd, TRUE, target_.put())) ||
+        FAILED(dcomp->CreateVisual(visual_.put())) ||
         FAILED(visual_->SetContent(swap_.get())) ||
         FAILED(target_->SetRoot(visual_.get())) ||
-        FAILED(dcomp_->Commit())) {
+        FAILED(dcomp->Commit())) {
+        target_ = nullptr;
+        visual_ = nullptr;
         swap_ = nullptr;
         return false;
     }
     return true;
+}
+
+// The shared device sends a release only with its next Commit; until then DWM
+// would keep this window's buffers.
+CompSurface::~CompSurface() {
+    if (!target_) return;
+    auto& g = Gfx::Get();
+    std::lock_guard lock(g.compositionMutex);
+    target_ = nullptr;
+    visual_ = nullptr;
+    if (IDCompositionDevice* dcomp = g.Composition()) dcomp->Commit();
+}
+
+IDCompositionDevice* Gfx::Composition() {
+    if (!dcomp_ && dxgi) {
+        DCompositionCreateDevice(dxgi.get(), __uuidof(IDCompositionDevice), dcomp_.put_void());
+    }
+    return dcomp_.get();
 }
 
 bool CompSurface::Resize(UINT width, UINT height) {

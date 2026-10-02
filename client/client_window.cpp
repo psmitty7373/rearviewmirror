@@ -515,7 +515,7 @@ bool ClientWindow::FeedStreams(Server& server, std::vector<StreamView>& views) {
         t.popout->SetFrame(v->texture, w, h, v->frames);
         const wchar_t* stalled = StreamStateText(v->state);
         t.popout->SetWaitingText(stalled ? stalled : L"Waiting for the first frame…");
-        t.popout->Render();
+        t.popout->Invalidate();
     }
     return canvas;
 }
@@ -738,9 +738,9 @@ void ClientWindow::BuildRows() {
         rows_.push_back({ Part::RemoveServer, v.tag, 0,
                           D2D1::RectF(right - S(26.0f), y + S(2.0f), right - S(2.0f), y + S(26.0f)) });
         y += S(kServerH) + S(kRowGap);
-        for (const auto& m : v.mirrors) {
-            rows_.push_back({ Part::MirrorItem, v.tag, m.id,
-                              D2D1::RectF(left + S(10.0f), y, right, y + S(kItemH)) });
+        for (size_t i = 0; i < v.mirrors.size(); ++i) {
+            rows_.push_back({ Part::MirrorItem, v.tag, v.mirrors[i].id,
+                              D2D1::RectF(left + S(10.0f), y, right, y + S(kItemH)), i });
             y += S(kItemH) + S(kRowGap);
         }
         y += S(kPad);
@@ -854,7 +854,7 @@ void ClientWindow::UpdateDrag(POINT pt) {
         t->h = b - tp;
         drag_.moved = true;
     }
-    Render();   // Guides may have changed even if the box did not.
+    Repaint();   // Guides may have changed even if the box did not.
 }
 
 void ClientWindow::EndDrag(bool commit) {
@@ -896,8 +896,20 @@ void ClientWindow::ScheduleChipTimer() {
         const uint64_t age = drawNowMs_ - t.chipSince;
         wait = (std::min)(wait, age < kChipHoldMs ? kChipHoldMs - age : 16ull);
     }
-    if (wait == UINT64_MAX) KillTimer(Hwnd(), kChipTimer);
-    else                    SetTimer(Hwnd(), kChipTimer, static_cast<UINT>((std::max)(wait, 10ull)), nullptr);
+    if (wait == UINT64_MAX) {
+        if (chipTimerAt_) KillTimer(Hwnd(), kChipTimer);
+        chipTimerAt_ = 0;
+        return;
+    }
+    wait = (std::max)(wait, 10ull);
+    if (chipTimerAt_ && chipTimerAt_ <= drawNowMs_ + wait) return;   // Due soon enough.
+    SetTimer(Hwnd(), kChipTimer, static_cast<UINT>(wait), nullptr);
+    chipTimerAt_ = drawNowMs_ + wait;
+}
+
+void ClientWindow::Repaint() {
+    keepSnapshot_ = true;
+    Invalidate();
 }
 
 // ---------------------------------------------------------------------------
@@ -923,24 +935,31 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 #if RVM_REMOTE_CONTROL
         if (controlKey_.server == server->tag) PollControl();
 #endif
-        if (event != ClientEvent::FrameReady) Render();
         // Only what changed is drawn again: a pop-out when its own stream has
         // a new frame or state, the canvas when one of its boxes has. Frames
         // change only pictures, so the rest of the snapshot stands.
         std::vector<StreamView> views;
-        if (FeedStreams(*server, views) && !IsIconic(Hwnd())) {
-            if (event == ClientEvent::FrameReady) {
-                for (auto& v : views_) {
-                    if (v.tag != server->tag) continue;
-                    v.views = std::move(views);
-                    snapshotFresh_ = true;
-                }
-            }
+        const bool canvas = FeedStreams(*server, views);
+        if (event != ClientEvent::FrameReady) {
             Render();
-            snapshotFresh_ = false;
+        } else if (canvas && !IsIconic(Hwnd())) {
+            const auto v = std::find_if(views_.begin(), views_.end(),
+                                        [&](const ServerView& sv) { return sv.tag == server->tag; });
+            if (v == views_.end()) {
+                Render();
+            } else {
+                v->views = std::move(views);
+                Repaint();
+            }
         }
         return 0;
     }
+
+    case WM_PAINT:
+        snapshotFresh_ = keepSnapshot_;
+        D2DOverlay::OnMessage(msg, wp, lp);
+        snapshotFresh_ = false;
+        return 0;
 
     case WM_RVM_DEVICE_LOST:
         OnDeviceLost();
@@ -1038,7 +1057,7 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const Hit hit = HitTest(pt);
         if (!(hit == hot_)) {
             SetHot(hit);
-            Render();
+            Repaint();
         }
         return 0;
     }
@@ -1050,20 +1069,21 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 #endif
         if (wp == kChipTimer) {
             KillTimer(Hwnd(), kChipTimer);
-            Render();   // Re-arms itself while a chip is still fading.
+            chipTimerAt_ = 0;
+            Repaint();   // Re-arms itself while a chip is still fading.
         }
         return 0;
 
     case WM_MOUSELEAVE:
         mouseTracked_ = false;
         SetHot(Hit{});
-        Render();
+        Repaint();
         return 0;
 
     case WM_CAPTURECHANGED:
         if (drag_.active && reinterpret_cast<HWND>(lp) != Hwnd()) {
             EndDrag(true);
-            Render();
+            Repaint();
         }
         return 0;
 
@@ -1072,9 +1092,9 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         ScreenToClient(Hwnd(), &pt);
         if (!sidebarHidden_ && Contains(SidebarRect(), pt)) {
             scroll_ -= GET_WHEEL_DELTA_WPARAM(wp) / static_cast<float>(WHEEL_DELTA) * S(60.0f);
-            ClampScroll();
+            BuildRows();
             SetHot(Hit{});
-            Render();
+            Repaint();
         }
         return 0;
     }
@@ -1098,7 +1118,7 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             const Box seen = Shown(*t);
             drag_.x0 = seen.x; drag_.y0 = seen.y; drag_.w0 = seen.w; drag_.h0 = seen.h;
             SetCapture(Hwnd());
-            Render();
+            Repaint();
         }
         return 0;
     }
@@ -1219,17 +1239,29 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 void ClientWindow::PrepareDraw() {
     drawNowMs_ = GetTickCount64();
     ScheduleChipTimer();
+    keepSnapshot_ = false;
     if (!snapshotFresh_) {
         views_.clear();
         for (const auto& s : servers_) {
             ServerView v;
             v.tag       = s->tag;
             v.label     = s->label;
-            v.status    = s->client->Status();
+            v.title     = Ellipsize(s->label, 26);
             v.connected = s->client->Connected();
-            v.rttUs     = s->client->RttUs();
             v.mirrors   = s->client->Mirrors();
             v.views     = s->client->Views();
+            if (v.connected) {
+                v.status = L"Connected";
+                if (const int64_t rtt = s->client->RttUs(); rtt >= 0) v.status += L"   ·   " + FormatRtt(rtt);
+                if (v.mirrors.empty()) v.status += L"   ·   no mirrors";
+            } else {
+                v.status = s->client->Status();
+            }
+            v.status = Ellipsize(std::move(v.status), 40);
+            for (const auto& m : v.mirrors) {
+                v.items.push_back({ Ellipsize(m.name, 26),
+                                    std::to_wstring(m.width) + L" × " + std::to_wstring(m.height) });
+            }
             views_.push_back(std::move(v));
         }
         BuildRows();
@@ -1262,18 +1294,8 @@ ID2D1Bitmap1* ClientWindow::BitmapFor(ID2D1DeviceContext* dc, ID3D11Texture2D* t
     return bitmap.get();
 }
 
-void ClientWindow::DrawLabel(ID2D1DeviceContext* dc, const std::wstring& text,
-                             const D2D1_RECT_F& rect, IDWriteTextFormat* font,
-                             const D2D1_COLOR_F& color, DWRITE_TEXT_ALIGNMENT align) {
-    if (text.empty() || !font) return;
-    font->SetTextAlignment(align);
-    brush_->SetColor(color);
-    dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), font, rect, brush_.get(),
-                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
-}
-
 void ClientWindow::DrawButton(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect,
-                              const std::wstring& text, bool hot) {
+                              std::wstring_view text, bool hot) {
     brush_->SetColor(hot ? D2D1::ColorF(kAccentR, kAccentG, kAccentB, 0.20f)
                          : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.05f));
     dc->FillRoundedRectangle(D2D1::RoundedRect(rect, S(6.0f), S(6.0f)), brush_.get());
@@ -1288,9 +1310,6 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
     const StreamView* view = ViewFor(tile.key);
     const RemoteMirror* mirror = MirrorFor(tile.key);
     const ServerView* sv = FindView(tile.key.server);
-
-    std::wstring name = mirror ? mirror->name : L"";
-    if (servers_.size() > 1 && sv) name = sv->label + L"  ·  " + name;
 
     if (tile.popout) {
         brush_->SetColor(hot ? kItemHot : kItem);
@@ -1325,7 +1344,12 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
     if (DrawControlTile(dc, tile, cell)) return;
 #endif
     const float chipAlpha = ChipAlpha(tile);
-    if (!name.empty() && chipAlpha > 0.0f) {
+    std::wstring name;
+    if (chipAlpha > 0.0f) {
+        if (mirror) name = mirror->name;
+        if (servers_.size() > 1 && sv) name = sv->label + L"  ·  " + name;
+    }
+    if (!name.empty()) {
         const bool fading = chipAlpha < 1.0f;
         if (fading) {
             dc->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(), nullptr,
@@ -1333,7 +1357,8 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
                                                  D2D1::IdentityMatrix(), chipAlpha),
                           nullptr);
         }
-        DrawChip(dc, Ellipsize(name, 48), cell.left + S(10.0f), cell.top + S(10.0f), 0, 0, 0.75f);
+        DrawChip(dc, Ellipsize(std::move(name), 48), cell.left + S(10.0f), cell.top + S(10.0f),
+                 0, 0, 0.75f);
         if (fading) dc->PopLayer();
     }
 
@@ -1355,14 +1380,11 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
 }
 
 void ClientWindow::OnDraw(ID2D1DeviceContext* dc) {
+    dc->Clear(kBg);
     if (!titleFont_) EnsureFonts();
     if (!titleFont_ || !bodyFont_ || !smallFont_) return;
 
-    const float w = static_cast<float>(Width());
     const float h = static_cast<float>(Height());
-
-    brush_->SetColor(kBg);
-    dc->FillRectangle(D2D1::RectF(0, 0, w, h), brush_.get());
 
     // Sidebar, or the handle it collapses to.
     brush_->SetColor(kPanel);
@@ -1404,16 +1426,8 @@ void ClientWindow::OnDraw(ID2D1DeviceContext* dc) {
 
                 const D2D1_RECT_F title = D2D1::RectF(r.left + S(18.0f), r.top, r.right - S(30.0f),
                                                       r.top + S(26.0f));
-                DrawLabel(dc, Ellipsize(sv->label, 26), title, titleFont_.get(), kText,
-                          DWRITE_TEXT_ALIGNMENT_LEADING);
-
-                std::wstring status = sv->status;
-                if (sv->connected) {
-                    status = L"Connected";
-                    if (sv->rttUs >= 0) status += L"   ·   " + FormatRtt(sv->rttUs);
-                    if (sv->mirrors.empty()) status += L"   ·   no mirrors";
-                }
-                DrawLabel(dc, Ellipsize(status, 40),
+                DrawLabel(dc, sv->title, title, titleFont_.get(), kText, DWRITE_TEXT_ALIGNMENT_LEADING);
+                DrawLabel(dc, sv->status,
                           D2D1::RectF(r.left + S(18.0f), r.top + S(24.0f), r.right, r.bottom),
                           smallFont_.get(), kDim, DWRITE_TEXT_ALIGNMENT_LEADING);
                 break;
@@ -1429,11 +1443,8 @@ void ClientWindow::OnDraw(ID2D1DeviceContext* dc) {
                 break;
             }
             case Part::MirrorItem: {
-                const RemoteMirror* m = nullptr;
-                for (const auto& cand : sv->mirrors) {
-                    if (cand.id == row.id) { m = &cand; break; }
-                }
-                if (!m) break;
+                if (row.item >= sv->items.size()) break;
+                const ServerView::ItemText& item = sv->items[row.item];
                 const D2D1_RECT_F r = row.rect;
                 const TileKey key{ row.server, row.id };
                 const bool on = std::any_of(tiles_.begin(), tiles_.end(),
@@ -1453,12 +1464,11 @@ void ClientWindow::OnDraw(ID2D1DeviceContext* dc) {
 
                 const D2D1_RECT_F text = D2D1::RectF(r.left + S(28.0f), r.top + S(5.0f),
                                                      r.right - S(8.0f), r.top + S(24.0f));
-                DrawLabel(dc, Ellipsize(m->name, 26), text, bodyFont_.get(), on ? kText : kDim,
+                DrawLabel(dc, item.name, text, bodyFont_.get(), on ? kText : kDim,
                           DWRITE_TEXT_ALIGNMENT_LEADING);
                 const D2D1_RECT_F sub = D2D1::RectF(text.left, r.top + S(22.0f), text.right,
                                                     r.bottom - S(4.0f));
-                DrawLabel(dc, std::to_wstring(m->width) + L" × " + std::to_wstring(m->height), sub,
-                          smallFont_.get(), kDim, DWRITE_TEXT_ALIGNMENT_LEADING);
+                DrawLabel(dc, item.size, sub, smallFont_.get(), kDim, DWRITE_TEXT_ALIGNMENT_LEADING);
                 break;
             }
             default:
@@ -1471,7 +1481,7 @@ void ClientWindow::OnDraw(ID2D1DeviceContext* dc) {
     // Canvas.
     const D2D1_RECT_F canvas = CanvasRect();
     if (tiles_.empty()) {
-        std::wstring hint;
+        std::wstring_view hint;
         if (servers_.empty())    hint = L"Add a server to begin.";
         else if (sidebarHidden_) hint = L"Open the sidebar (Tab) to choose mirrors.";
         DrawLabel(dc, hint, canvas, bodyFont_.get(), kDim, DWRITE_TEXT_ALIGNMENT_CENTER);

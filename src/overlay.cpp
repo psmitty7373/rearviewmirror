@@ -15,7 +15,6 @@ D2DOverlay::~D2DOverlay() {
 LRESULT D2DOverlay::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_PAINT:
-        ValidateRect(hwnd_, nullptr);
         Render();
         return 0;
     case WM_ERASEBKGND:
@@ -146,9 +145,21 @@ bool D2DOverlay::EnsureTarget() {
     return true;
 }
 
-void D2DOverlay::Render() {
-    if (!hwnd_ || !dc_ || !comp_.Valid()) return;
+void D2DOverlay::Invalidate() {
+    if (!hwnd_ || invalidated_) return;
+    invalidated_ = true;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
 
+void D2DOverlay::Render() {
+    if (!hwnd_) return;
+    // Any paint pending, ours or the system's, is answered by this one.
+    ValidateRect(hwnd_, nullptr);
+    invalidated_ = false;
+    // Nothing shows while minimized; restoring sends WM_SIZE, which draws.
+    if (!dc_ || !comp_.Valid() || IsIconic(hwnd_)) return;
+
+    ++frame_;
     PrepareDraw();
     {
         // No mirror frame may land between BeginDraw and EndDraw.
@@ -159,7 +170,6 @@ void D2DOverlay::Render() {
             if (!EnsureTarget()) return;
 
             dc_->BeginDraw();
-            dc_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
             OnDraw(dc_.get());
             const HRESULT hr = dc_->EndDraw();
 
@@ -173,26 +183,69 @@ void D2DOverlay::Render() {
             break;
         }
     }
-    comp_.Present(0);
-}
+    // Waits for the display once a frame is already queued: drawing faster
+    // than it refreshes would only be thrown away.
+    comp_.Present(1);
 
-D2D1_SIZE_F D2DOverlay::MeasureText(const std::wstring& text) {
-    if (text.empty() || !font_) return { 0.0f, 0.0f };
-    winrt::com_ptr<IDWriteTextLayout> layout;
-    if (FAILED(Gfx::Get().dwrite->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
-                                                   font_.get(), 4096.0f, 200.0f, layout.put()))) {
-        return { 0.0f, 0.0f };
+    if ((frame_ & 63) == 0) {
+        std::erase_if(texts_, [&](const auto& t) { return frame_ - t.second.usedFrame > 64; });
     }
-    DWRITE_TEXT_METRICS m{};
-    layout->GetMetrics(&m);
-    return { m.widthIncludingTrailingWhitespace, m.height };
 }
 
-D2D1_SIZE_F D2DOverlay::DrawChip(ID2D1DeviceContext* dc, const std::wstring& text,
-                                 float x, float y, int alignX, int alignY, float bgAlpha) {
-    if (text.empty() || !brush_) return { 0.0f, 0.0f };
+const D2DOverlay::CachedText* D2DOverlay::Layout(std::wstring_view text, IDWriteTextFormat* format,
+                                                 float width, float height,
+                                                 DWRITE_TEXT_ALIGNMENT align) {
+    if (text.empty() || !format || width <= 0.0f || height <= 0.0f) return nullptr;
+    const int w = static_cast<int>(std::lround(width * 16.0f));
+    const int h = static_cast<int>(std::lround(height * 16.0f));
+    const int a = static_cast<int>(align);
 
-    const D2D1_SIZE_F ts = MeasureText(text);
+    size_t key = std::hash<std::wstring_view>{}(text);
+    for (const size_t part : { reinterpret_cast<size_t>(format), static_cast<size_t>(w),
+                               static_cast<size_t>(h), static_cast<size_t>(a) }) {
+        key ^= part + 0x9E3779B97F4A7C15ull + (key << 6) + (key >> 2);
+    }
+
+    CachedText& t = texts_[key];
+    if (!t.layout || t.text != text || t.format.get() != format || t.w != w || t.h != h ||
+        t.align != a) {
+        winrt::com_ptr<IDWriteTextLayout> layout;
+        if (FAILED(Gfx::Get().dwrite->CreateTextLayout(text.data(), static_cast<UINT32>(text.size()),
+                                                       format, width, height, layout.put()))) {
+            texts_.erase(key);
+            return nullptr;
+        }
+        layout->SetTextAlignment(align);
+        DWRITE_TEXT_METRICS m{};
+        layout->GetMetrics(&m);
+        t.text.assign(text);
+        t.format.copy_from(format);
+        t.w = w;
+        t.h = h;
+        t.align = a;
+        t.layout = std::move(layout);
+        t.size = { m.widthIncludingTrailingWhitespace, m.height };
+    }
+    t.usedFrame = frame_;
+    return &t;
+}
+
+void D2DOverlay::DrawLabel(ID2D1DeviceContext* dc, std::wstring_view text, const D2D1_RECT_F& rect,
+                           IDWriteTextFormat* format, const D2D1_COLOR_F& color,
+                           DWRITE_TEXT_ALIGNMENT align) {
+    const CachedText* t = Layout(text, format, rect.right - rect.left, rect.bottom - rect.top, align);
+    if (!t || !brush_) return;
+    brush_->SetColor(color);
+    dc->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), t->layout.get(), brush_.get(),
+                       D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
+D2D1_SIZE_F D2DOverlay::DrawChip(ID2D1DeviceContext* dc, std::wstring_view text,
+                                 float x, float y, int alignX, int alignY, float bgAlpha) {
+    const CachedText* t = Layout(text, font_.get(), 4096.0f, 200.0f, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (!t || !brush_) return { 0.0f, 0.0f };
+
+    const D2D1_SIZE_F ts = t->size;
     const float padX = kChipPadX * chipScale_, padY = kChipPadY * chipScale_;
     const float w = ts.width + padX * 2.0f;
     const float h = ts.height + padY * 2.0f;
@@ -211,9 +264,7 @@ D2D1_SIZE_F D2DOverlay::DrawChip(ID2D1DeviceContext* dc, const std::wstring& tex
     dc->DrawRoundedRectangle(rr, brush_.get(), chipScale_);
 
     brush_->SetColor(D2D1::ColorF(0.94f, 0.95f, 0.97f, 1.0f));
-    const D2D1_RECT_F textRect{ x + padX, y + padY, x + w, y + h };
-    dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), font_.get(), textRect,
-                  brush_.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    dc->DrawTextLayout(D2D1::Point2F(x + padX, y + padY), t->layout.get(), brush_.get());
 
     return { w, h };
 }

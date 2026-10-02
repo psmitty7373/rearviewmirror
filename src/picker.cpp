@@ -97,6 +97,7 @@ protected:
     void OnDraw(ID2D1DeviceContext* dc) override {
         const float w = static_cast<float>(Width());
         const float h = static_cast<float>(Height());
+        dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
         if (w < 2.0f || h < 2.0f) return;
 
         brush_->SetColor(D2D1::ColorF(kAccentR, kAccentG, kAccentB, 0.12f));
@@ -112,7 +113,7 @@ protected:
         const float t = area ? static_cast<float>(labelArea.top) : 0.0f;
         const float r = area ? static_cast<float>(labelArea.right) : w;
         const float b = area ? static_cast<float>(labelArea.bottom) : h;
-        DrawChip(dc, Ellipsize(title, 64), l + 14.0f, t + 14.0f, 0, 0);
+        DrawChip(dc, title, l + 14.0f, t + 14.0f, 0, 0);
         DrawChip(dc, desktop
                      ? L"Click to mirror the whole desktop   ·   Esc to cancel"
                      : L"Click to mirror this window   ·   D for the whole desktop   ·   Esc to cancel",
@@ -198,7 +199,7 @@ void UpdateHover(POINT pt) {
         return;
     }
     highlight.desktop = false;
-    highlight.title = WindowTitle(target);
+    highlight.title = Ellipsize(WindowTitle(target), 64);
     highlight.labelArea = RECT{};
     highlight.SetBounds(ExtendedFrameBounds(target));
     highlight.Show();
