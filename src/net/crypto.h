@@ -5,22 +5,18 @@
 
 namespace rvm::net {
 
-// Cryptographic randomness. The system generator does not fail in practice;
-// if it ever does, the process stops rather than carry on with weak values.
+// Cryptographic randomness. On failure the process stops rather than carry
+// on with weak values.
 void RandomBytes(void* out, size_t len);
 
-// The shared secret both ends type, stretched with PBKDF2-SHA256. A captured
-// handshake lets an observer test guesses offline, so the work factor is high
-// and the app generates long random keys; a short typed passphrase would be
-// the weak point. Any failure yields an unguessable random key, never a
-// known one, so a broken crypto provider fails closed.
+// The shared passphrase through PBKDF2-SHA256; high work factor, since a
+// captured handshake allows offline guessing. Fails closed: any error yields
+// an unguessable random key.
 constexpr unsigned kPbkdf2Iterations = 600000;
 Key DeriveMasterKey(const std::wstring& passphrase);
 
-// Per-session, per-direction key from the two handshake randoms, so a
-// counter is never reused under one key and a datagram can never be
-// reflected back to its sender. `direction` is kClientToServer or
-// kServerToClient.
+// Per session and direction, from the handshake randoms: a counter is never
+// reused under one key and a datagram cannot be reflected to its sender.
 enum class Direction { kClientToServer, kServerToClient };
 Key DeriveSessionKey(const Key& master, const uint8_t clientRandom[kRandomBytes],
                      const uint8_t serverRandom[kRandomBytes], Direction direction);

@@ -19,10 +19,8 @@ struct Bstr {
     ~Bstr() { SysFreeString(s); }
 };
 
-// Windows Firewall would ask before letting the app's port in, but nobody can
-// answer at the sign-in screen: it would simply drop every client. So the
-// rule is made here, as narrow as it can be: this program, inbound UDP, this
-// port, private and domain networks only. Replaces any earlier one.
+// Nobody can answer the firewall's prompt at the sign-in screen, so the rule
+// is made here, as narrow as can be. Replaces any earlier one.
 bool SetFirewallRule(const std::wstring* program, uint16_t port) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     bool ok = false;

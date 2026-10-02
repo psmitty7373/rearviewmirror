@@ -3,9 +3,7 @@
 
 namespace rvm {
 
-// How much work the encoder puts into each frame. NVIDIA's encoder has three
-// distinct steps; measured at 4096x1152 on text, Fastest took half the time of
-// Balanced per frame at no loss, and Quality took a third longer.
+// How much work the encoder puts into each frame.
 enum class EncoderPreset : int {
     Balanced = 0,   // The encoder's own default.
     Fastest  = 1,
@@ -42,10 +40,8 @@ struct StreamControl {
     std::function<std::wstring()> status;   // One line: state, port, clients.
 };
 
-// Modal editor. Start and Stop act at once; OK keeps the edited fields (and
-// restarts a running server if they changed), Cancel discards the edits.
-// Returns true on OK with `settings` updated. If the dialog is already open
-// it is brought to the front instead.
+// Modal editor. Start and Stop act at once; true on OK with `settings`
+// updated. An open dialog is brought to the front instead.
 bool ShowStreamSettingsDialog(HWND owner, StreamSettings& settings, const StreamControl& control);
 
 }  // namespace rvm

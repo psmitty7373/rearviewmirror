@@ -7,17 +7,13 @@ namespace rvm::login {
 // drives as SYSTEM. The app's generated keys are this long.
 constexpr size_t kMinLoginKeyChars = 20;
 
-// %ProgramData%\RearViewMirror: the service's settings, logs and crash dumps.
-// Readable and writable only by SYSTEM and Administrators, since it holds the
-// streaming key. Nobody is signed in when the helper runs, so neither a
-// user's AppData nor a key encrypted to a user could be used.
+// %ProgramData%\RearViewMirror: the service's settings (with the key), logs
+// and crash dumps. SYSTEM and Administrators only.
 std::wstring MachineDir();
 
-// Creates MachineDir() if need be and (re)applies its access rules: owned by
-// Administrators, SYSTEM and Administrators only, nothing inherited. Any user
-// may create folders in ProgramData, so one found there that is not already
-// like that, or is a link, is never taken over: a link is removed, a folder
-// moved aside (`movedAside` names where), and a new one made. Elevated only.
+// Elevated. Creates MachineDir() and (re)applies its access rules. Any user
+// may create folders in ProgramData, so an untrusted one is never taken over:
+// a link is removed, a folder moved aside (to `movedAside`).
 bool SecureMachineDir(std::wstring& movedAside);
 
 // Whether MachineDir() is a real folder, owned by SYSTEM or Administrators,

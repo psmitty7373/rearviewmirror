@@ -41,10 +41,8 @@ INPUT InputFor(const RemoteInput& e) {
         i.ki.wVk = e.code;
         if (e.value && e.code != VK_PAUSE) {
             const WORD scan = e.value & 0xff;
-            // A low-level hook reports right Shift as an extended key, a
-            // long-standing Windows quirk. Injected that way it reads as E0 36,
-            // the "fake shift" keyboards send around the navigation keys,
-            // which Windows discards: Shift would never be held.
+            // The hook reports right Shift as extended; injected so, Windows
+            // discards it as the "fake shift" E0 36.
             const bool shift = scan == 0x2A || scan == 0x36;
             i.ki.wVk = 0;
             i.ki.wScan = scan;
@@ -252,9 +250,6 @@ void ControlClient::Reply(Reader& r, uint64_t now) {
 }
 ControlState ControlClient::State() const {
     std::lock_guard lock(impl_->mutex); return impl_->state;
-}
-uint32_t ControlClient::Mirror() const {
-    std::lock_guard lock(impl_->mutex); return impl_->mirror;
 }
 
 struct ControlKeyboard::Impl {

@@ -58,20 +58,17 @@ class FrameSender {
 public:
     explicit FrameSender(uint32_t mirrorId) : mirrorId_(mirrorId) {}
 
-    // The packets for `data`, retained for retransmission. A frame of more
-    // than kMaxFramePackets is dropped, and the result is empty.
-    const PacketizedFrame& Packetize(uint32_t frameSeq, bool keyframe, const uint8_t* data,
-                                     size_t len);
-
-    // The same, shared: the caller can seal and send the packets, or answer a
-    // NACK from them later, without holding whatever guards this sender. Null
-    // for a dropped frame.
+    // The packets for `data`, retained for retransmission and shared, so they
+    // can be sent without holding whatever guards this sender. Null for a
+    // frame of more than kMaxFramePackets, which is dropped.
     std::shared_ptr<const PacketizedFrame> Add(uint32_t frameSeq, bool keyframe,
                                                const uint8_t* data, size_t len);
     // A retained frame, or null once it has aged out.
     std::shared_ptr<const PacketizedFrame> Find(uint32_t frameSeq) const;
 
-    // Every packet of a retained frame, or nullptr if it has aged out.
+    // For tests: the same by reference or pointer; empty or null as above.
+    const PacketizedFrame& Packetize(uint32_t frameSeq, bool keyframe, const uint8_t* data,
+                                     size_t len);
     const PacketizedFrame* Packets(uint32_t frameSeq) const;
     PacketizedFrame::Packet Lookup(uint32_t frameSeq, uint16_t pktIdx) const;
 

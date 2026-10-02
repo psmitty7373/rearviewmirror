@@ -7,23 +7,15 @@
 
 namespace rvm::login {
 
-// The whole virtual screen through DXGI Desktop Duplication: the one capture
-// API that works on the secure desktops (sign-in, Ctrl+Alt+Del, UAC), for a
-// process running as SYSTEM on them. What changes on each monitor of the
-// device's adapter is copied to its place in one texture, each monitor
-// waited on by a thread of its own; the pointer, which duplication reports
-// separately, is drawn on top.
-//
-// Duplication ends whenever the input desktop switches or the display mode
-// changes. The thread then moves itself to the new input desktop and starts
-// over, so it follows the screen wherever it goes.
+// The whole virtual screen through DXGI Desktop Duplication, the one capture
+// API that works on the secure desktops (as SYSTEM). One thread per monitor of
+// the device's adapter; the pointer is drawn on top. Follows the input
+// desktop across switches.
 class DuplicationCapture {
 public:
-    // `onFrame` gets the composed picture under Gfx::deviceMutex, as the
-    // renderer's frame tee would, on a capture thread or Repush's. `onSize`
-    // gets the picture's size when it changes, with no lock held. A picture
-    // is composed only while `wanted` says someone would take it, at most
-    // `fps` times a second.
+    // `onFrame`: the composed picture, under Gfx::deviceMutex, on a capture
+    // thread or Repush's. `onSize`: on a size change, no lock held. Composed
+    // only while `wanted`, at most `fps` times a second.
     using FrameCallback  = std::function<void(ID3D11Texture2D* frame)>;
     using SizeCallback   = std::function<void(SIZE size)>;
     using WantedCallback = std::function<bool()>;
@@ -33,8 +25,7 @@ public:
     bool Start(FrameCallback onFrame, SizeCallback onSize, WantedCallback wanted, UINT fps);
     void Stop();
 
-    // Offers the latest picture again, composing it if need be, from any
-    // thread: duplication reports nothing while the screen is still.
+    // Any thread: offers the latest picture again (a still screen reports nothing).
     void Repush();
 
 private:
@@ -90,8 +81,7 @@ private:
     size_t pointerOwner_ = SIZE_MAX;   // The output that last reported it visible.
     bool  pointerVisible_ = false;
     bool  havePicture_ = false;
-    // What frame_ lacks: the areas of composite_ changed since it was
-    // composed (or all of it), and the pointer's move.
+    // What frame_ lacks from composite_ and the pointer since it was composed.
     bool  stale_ = false;
     bool  damageAll_ = true;
     std::vector<RECT> damage_;

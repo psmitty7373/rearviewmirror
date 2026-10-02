@@ -5,10 +5,8 @@ namespace rvm {
 
 class Mirror;
 
-// Everything the app does for streaming, behind one seam. streaming.cpp is the
-// real thing; streaming_off.cpp, compiled instead when the build leaves
-// streaming out (RVM_STREAMING=OFF), does nothing and reports it unavailable.
-// Nothing else in the app needs to know which one it got.
+// The app's streaming seam: streaming.cpp, or streaming_off.cpp in a build
+// without streaming (RVM_STREAMING=OFF).
 class Streaming {
 public:
     // What streaming needs from the app.
@@ -16,8 +14,7 @@ public:
         // The app window. A mirror's picture is requested by posting
         // WM_RVM_STREAM_WANT_FRAME here with its id.
         HWND window = nullptr;
-        // Every mirror, for the list clients see. Owned by the app, which
-        // outlives this.
+        // Every mirror, for the list clients see; outlives this.
         const std::vector<std::unique_ptr<Mirror>>* mirrors = nullptr;
         // Running state or client count changed: redraw what shows them.
         std::function<void()> changed;
@@ -49,11 +46,9 @@ public:
     // Whether any client watches the mirror; any thread, cheap.
     bool Watched(uint32_t mirrorId) const;
 
-    // Paused, nothing is served and the port is free for someone else: the
-    // sign-in service, while this session is not the one on the console. The
-    // settings are untouched. Unpausing serves again if they say so; false if
-    // that should happen but could not, most likely because the port has not
-    // been let go yet, for the caller to try again.
+    // Paused, nothing is served and the port is free (for the sign-in
+    // service); settings are untouched. False if unpausing should serve but
+    // could not, for the caller to retry.
     bool SetPaused(bool paused);
 
     bool   Running() const;

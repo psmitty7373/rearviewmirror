@@ -196,9 +196,8 @@ UdpSocket::WaitResult UdpSocket::Wait(DWORD timeoutMs) {
         if (posted <= 0) return posted == 0 ? WaitResult::Timeout : WaitResult::Error;
     }
 
-    // The plain timeout rounds up to the system tick, 15.6 ms by default;
-    // a high-resolution timer keeps short waits short without raising the
-    // tick rate for the whole machine.
+    // The plain timeout rounds up to the system tick; a high-resolution timer
+    // keeps short waits short without raising the tick rate.
     HANDLE handles[3] = { recv_.hEvent, wake_, timer_ };
     DWORD count = 2, wait = timeoutMs;
     if (timer_ && timeoutMs != INFINITE && timeoutMs > 0) {

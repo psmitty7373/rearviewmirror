@@ -1,7 +1,6 @@
 #include "streaming.h"
 
-// Built instead of streaming.cpp when streaming is left out
-// (RVM_STREAMING=OFF): mirrors only, nothing on the network.
+// Built instead of streaming.cpp when RVM_STREAMING=OFF.
 
 namespace rvm {
 

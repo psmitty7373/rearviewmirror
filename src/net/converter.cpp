@@ -383,8 +383,7 @@ bool Nv12Packer::Pack(ID3D11Texture2D* src, const RECT& srcRect, ID3D11Texture2D
     memcpy(mapped.pData, &constants, sizeof(constants));
     g.ctx->Unmap(pipeline.constants.get(), 0);
 
-    // Every piece of state the draws depend on is set here, as the renderer
-    // does: whatever drew last on the shared context left its own behind.
+    // All the state the draws use: the shared context keeps whatever drew last.
     ID3D11RenderTargetView* targets[]{ rtv_.get() };
     g.ctx->OMSetRenderTargets(1, targets, nullptr);
     g.ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);

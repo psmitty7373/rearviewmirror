@@ -22,15 +22,9 @@ struct MirrorInfo {
     bool         controllable = false;
 };
 
-// Serves mirrors to clients over one UDP port. Each subscribed mirror gets a
-// hardware encoder fed by a GPU crop of the frames the mirror already has; the
-// only CPU work per frame is packetising and sealing the bitstream. Where no
-// hardware encoder will do, the crop is read back and encoded on the CPU.
-//
-// Everything a peer can make the server do is bounded: sessions, pending
-// handshakes, subscriptions, streams, keyframes, frame requests and
-// retransmits all have caps or rates, so neither a stranger nor a client
-// holding the key can grow memory or flood the app.
+// Serves mirrors over one UDP port: one encoder per watched mirror (hardware,
+// else the CPU), shared by its subscribers. Everything a peer can make it do
+// is capped or rate-limited.
 class StreamServer {
 public:
     StreamServer();
@@ -45,28 +39,23 @@ public:
     size_t ClientCount() const;
     size_t StreamCount() const;   // Encoders and buffers currently allocated.
 
-    // The frame tee. Called on a capture thread under the renderer and device
-    // locks with the mirror's cache texture and effective crop. While no
-    // client watches any mirror it costs an atomic load; while others are
-    // watched, an unwatched mirror's frame costs a map lookup under a short
-    // lock.
+    // The frame tee: a capture thread, under the device lock, with the
+    // mirror's cache texture and effective crop.
     void SubmitFrame(uint32_t mirrorId, ID3D11Texture2D* cache, const RECT& crop);
 
-    // UI thread. What clients see when they ask for the list, and the only
-    // mirrors they may subscribe to.
+    // UI thread. The mirrors clients may list and subscribe to.
     void SetMirrorList(std::vector<MirrorInfo> list);
 
-    // Invoked (on the network thread) when a stream needs a frame it may not
-    // otherwise get: a client just subscribed, or asked for a keyframe. The
-    // handler should get the mirror to RepushFrame(). Rate-limited per mirror.
+    // Called on the network or encode thread when a stream needs a picture a
+    // still source will not send (a keyframe, a retry, a skipped frame): the
+    // handler should get the mirror to RepushFrame().
     using FrameRequester = std::function<void(uint32_t mirrorId)>;
     void SetFrameRequester(FrameRequester requester);
 
-    // Whether any client watches the mirror; any thread.
+    // Any thread; an atomic load while nobody watches anything.
     bool Watched(uint32_t mirrorId) const;
 
-    // For tests: encode on the CPU even where a hardware encoder exists.
-    // Takes effect at the next Start().
+    // For tests: encode on the CPU from the next Start().
     void ForceSoftwareEncoding(bool on) { forceSoftware_ = on; }
     // For tests: how often the network thread has woken.
     uint64_t NetWakeups() const { return netWakeups_.load(); }
@@ -75,9 +64,8 @@ private:
     struct Client;
     struct Stream;
 
-    // A HELLO that was answered, waiting for the first datagram under the
-    // session key. Only that datagram proves the peer holds the key: a HELLO
-    // can be replayed by anyone who captured one.
+    // An answered HELLO, awaiting the first datagram under the session key:
+    // only that proves the peer holds the key, since a HELLO can be replayed.
     struct Pending {
         std::shared_ptr<Client> client;
         uint32_t clientSession = 0;
@@ -86,8 +74,7 @@ private:
         uint64_t createdMs = 0;
     };
 
-    // HELLOs answered recently, by client session and random. A second copy
-    // is a replay and is dropped before it can cost the admission budget.
+    // HELLOs answered recently, by client session and random: a second copy is a replay.
     using HelloId = std::array<uint8_t, 4 + net::kRandomBytes>;
     struct HelloSeen { HelloId id; uint64_t ms; };
     static constexpr size_t   kMaxRecentHellos = 1024;
@@ -126,8 +113,8 @@ private:
     void DropSubscription(const std::shared_ptr<Client>& client, uint32_t mirrorId);
     void DropUnlistedSubscriptions();
     void RemoveClient(const std::shared_ptr<Client>& client);
-    // Drops silent clients and stale handshakes; returns when the next would
-    // expire. Old HELLOs go too, but never need a wake of their own.
+    // Drops silent clients, stale handshakes and old HELLOs; returns when the
+    // next client or handshake would expire.
     uint64_t Expire(uint64_t nowMs);
 
     std::shared_ptr<Client> FindClient(const net::Endpoint& endpoint);
@@ -136,10 +123,7 @@ private:
 
     StreamSettings settings_;
     std::atomic<UINT> fps_{ 60 };   // Read on capture threads; set at Start.
-    // Set at Start: no hardware encoder can be fed here, so every stream
-    // starts on the CPU. Otherwise a stream moves there only if no hardware
-    // encoder will take it.
-    bool software_ = false;
+    bool software_ = false;   // Set at Start: no hardware encoder; streams start on the CPU.
     bool forceSoftware_ = false;
     net::Key masterKey_{};
     net::SecureChannel master_;   // Net thread: opens HELLOs, seals WELCOMEs.
@@ -148,9 +132,7 @@ private:
     std::thread netThread_;
     std::thread encodeThread_;
     HANDLE frameEvent_ = nullptr;
-    // Encode thread: an encoder was shut down this pass, so a stream waiting
-    // for a free encoder session may now get one.
-    bool sessionFreed_ = false;
+    bool sessionFreed_ = false;   // Encode thread: an encoder closed this pass.
 
     mutable std::mutex clientsMutex_;
     std::vector<std::shared_ptr<Client>> clients_;
@@ -161,8 +143,7 @@ private:
     double   admitTokens_ = 0.0;     // Net thread only.
     uint64_t admitRefillMs_ = 0;
 
-    // Net thread: when it next has work of its own, UINT64_MAX for none. The
-    // expiry deadline may be early (clients refresh it), never late.
+    // Net thread deadlines, UINT64_MAX for none. Expiry may be early, never late.
     uint64_t expireDueMs_ = UINT64_MAX;
     uint64_t keyframeDueMs_ = UINT64_MAX;
 #if RVM_REMOTE_CONTROL

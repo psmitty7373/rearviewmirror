@@ -24,18 +24,15 @@ public:
     bool Open(uint16_t bindPort);   // 0 for an ephemeral port.
     uint16_t LocalPort() const;     // The port actually bound, or 0.
     void Close();
-    bool Valid() const { return sock_ != INVALID_SOCKET; }
 
     bool SendTo(const Endpoint& to, const void* data, size_t len);
 
     // Bytes received, 0 on timeout, -1 on error.
     int Receive(void* buf, size_t cap, Endpoint& from, int timeoutMs);
 
-    // Event-driven receiving, for a loop that sleeps until it has work. Wait
-    // returns when a datagram is waiting (take it, and any more, with
-    // Receive(..., 0)), when Wake() is called from any thread, or after
-    // `timeoutMs` (INFINITE for never), timed to the millisecond. A wake
-    // given while nobody waits is kept for the next Wait.
+    // Returns when a datagram is waiting (take it, and any more, with
+    // Receive(..., 0)), on Wake() from any thread, or after `timeoutMs`, to
+    // the millisecond. A wake given while nobody waits is kept.
     enum class WaitResult { Readable, Woken, Timeout, Error };
     WaitResult Wait(DWORD timeoutMs);
     void Wake();

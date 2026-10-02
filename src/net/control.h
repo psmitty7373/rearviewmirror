@@ -59,7 +59,6 @@ public:
     std::vector<uint8_t> Poll(uint64_t now);
     void Reply(Reader& r, uint64_t now);
     ControlState State() const;
-    uint32_t Mirror() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
