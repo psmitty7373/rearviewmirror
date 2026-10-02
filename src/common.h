@@ -106,6 +106,14 @@ std::wstring Plural(int n, const wchar_t* singular, const wchar_t* plural);
 RECT WorkAreaFor(HMONITOR monitor);
 RECT WorkAreaFor(HWND hwnd);
 
+// Frameless resizable windows (mirrors, pop-outs). The scaled edges resize;
+// the rest is client area, where a press starts a caption drag.
+LRESULT ResizeBorderHitTest(HWND hwnd, LPARAM lp);
+void BeginWindowDrag(HWND hwnd, LPARAM lp);
+// Fits a WM_SIZING rect to native's aspect when locked, sticks it at native
+// size unless Ctrl is down, and clamps it. True when it lands on native size.
+bool ConstrainToNative(WPARAM edge, RECT* rect, SIZE native, bool aspectLocked, SIZE minimum);
+
 // Shared, cached per size; never destroy the result.
 HICON LoadAppIcon(int size);
 

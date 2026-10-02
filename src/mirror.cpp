@@ -6,11 +6,9 @@ namespace rvm {
 namespace {
 
 constexpr wchar_t kMirrorClass[] = L"RvmMirrorWindow";
-constexpr int kResizeBorder = 7;
 constexpr int kMinWidth  = 64;
 constexpr int kMinHeight = 48;
 constexpr int kScreenMargin = 24;
-constexpr int kSnapPx = 14;   // Grab range around 100%.
 
 enum MenuId : UINT {
     kIdReselectRegion = 100,
@@ -64,64 +62,13 @@ Mirror::~Mirror() {
 }
 
 // Resizing scales the same slice of the source; it never reveals more of it.
-// The drag is held to the crop's aspect ratio and sticks at 1:1.
 void Mirror::ConstrainSizing(WPARAM edge, RECT* rect) {
     const SIZE native = renderer_.EffectiveCropSize();
     if (native.cx <= 0 || native.cy <= 0) return;
-
-    int w = RectW(*rect);
-    int h = RectH(*rect);
-
-    const bool horizontal = (edge == WMSZ_LEFT || edge == WMSZ_RIGHT);
-    const bool vertical   = (edge == WMSZ_TOP  || edge == WMSZ_BOTTOM);
-    const double aspect   = static_cast<double>(native.cx) / static_cast<double>(native.cy);
-
-    if (state_.aspectLocked) {
-        if (horizontal) {
-            h = static_cast<int>(std::lround(w / aspect));
-        } else if (vertical) {
-            w = static_cast<int>(std::lround(h * aspect));
-        } else {
-            // Corner drag: project onto the aspect line.
-            const double projected =
-                (w + h / aspect) * (aspect * aspect) / (aspect * aspect + 1.0);
-            w = static_cast<int>(std::lround(projected));
-            h = static_cast<int>(std::lround(projected / aspect));
-        }
-    }
-
-    // Ctrl slides straight past 100%.
-    if (!(GetKeyState(VK_CONTROL) & 0x8000)) {
-        if (state_.aspectLocked) {
-            if (std::abs(w - native.cx) <= kSnapPx) {
-                w = native.cx;
-                h = native.cy;
-            }
-        } else {
-            if (std::abs(w - native.cx) <= kSnapPx) w = native.cx;
-            if (std::abs(h - native.cy) <= kSnapPx) h = native.cy;
-        }
-    }
-
-    w = ClampExtent(w, kMinWidth);
-    h = ClampExtent(h, kMinHeight);
-
-    const bool nowSnapped = (w == native.cx && h == native.cy);
+    const bool nowSnapped = ConstrainToNative(edge, rect, native, state_.aspectLocked, { kMinWidth, kMinHeight });
     if (nowSnapped != snapped_) {
         snapped_ = nowSnapped;
         UpdateBorder();   // The WM_SIZE that follows repaints.
-    }
-
-    // Keep whichever edges the user is not dragging pinned.
-    if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT) {
-        rect->left = rect->right - w;
-    } else {
-        rect->right = rect->left + w;
-    }
-    if (edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT) {
-        rect->top = rect->bottom - h;
-    } else {
-        rect->bottom = rect->top + h;
     }
 }
 
@@ -577,34 +524,12 @@ LRESULT Mirror::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         if (wp) return 0;   // Client area fills the whole window.
         break;
 
-    case WM_NCHITTEST: {
-        // Edges resize; the interior is client, and WM_LBUTTONDOWN drags.
-        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        RECT r{};
-        GetWindowRect(hwnd_, &r);
-        const int border = MulDiv(kResizeBorder, static_cast<int>(GetDpiForWindow(hwnd_)), 96);
-        const bool left   = pt.x < r.left + border;
-        const bool right  = pt.x >= r.right - border;
-        const bool top    = pt.y < r.top + border;
-        const bool bottom = pt.y >= r.bottom - border;
-        if (top && left)     return HTTOPLEFT;
-        if (top && right)    return HTTOPRIGHT;
-        if (bottom && left)  return HTBOTTOMLEFT;
-        if (bottom && right) return HTBOTTOMRIGHT;
-        if (left)   return HTLEFT;
-        if (right)  return HTRIGHT;
-        if (top)    return HTTOP;
-        if (bottom) return HTBOTTOM;
-        return HTCLIENT;
-    }
+    case WM_NCHITTEST:
+        return ResizeBorderHitTest(hwnd_, lp);
 
-    case WM_LBUTTONDOWN: {
-        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ClientToScreen(hwnd_, &pt);
-        ReleaseCapture();
-        SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(pt.x, pt.y));
+    case WM_LBUTTONDOWN:
+        BeginWindowDrag(hwnd_, lp);
         return 0;
-    }
 
     case WM_MOUSEMOVE:
         if (!hovered_) {

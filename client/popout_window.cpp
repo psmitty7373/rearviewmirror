@@ -6,11 +6,9 @@ namespace rvm {
 namespace {
 
 constexpr wchar_t kPopoutClass[] = L"RvmPopoutWindow";
-constexpr int kResizeBorder = 7;
 constexpr int kMinWidth  = 64;
 constexpr int kMinHeight = 48;
 constexpr int kScreenMargin = 24;
-constexpr int kSnapPx = 14;
 
 enum MenuId : UINT {
     kIdReturn = 100,
@@ -102,56 +100,9 @@ void PopoutWindow::Notify(PopoutEvent event) {
     if (notify_) PostMessageW(notify_, WM_RVM_POPOUT_EVENT, static_cast<WPARAM>(event), token_);
 }
 
-// Same rules as the app's mirror window: the drag is held to the stream's
-// aspect ratio and sticks at 1:1 unless Ctrl is down.
 void PopoutWindow::ConstrainSizing(WPARAM edge, RECT* rect) {
-    const int nativeW = static_cast<int>(nativeW_), nativeH = static_cast<int>(nativeH_);
-    if (nativeW <= 0 || nativeH <= 0) return;
-
-    int w = RectW(*rect);
-    int h = RectH(*rect);
-    const bool horizontal = (edge == WMSZ_LEFT || edge == WMSZ_RIGHT);
-    const bool vertical   = (edge == WMSZ_TOP  || edge == WMSZ_BOTTOM);
-    const double aspect   = static_cast<double>(nativeW) / static_cast<double>(nativeH);
-
-    if (aspectLocked_) {
-        if (horizontal) {
-            h = static_cast<int>(std::lround(w / aspect));
-        } else if (vertical) {
-            w = static_cast<int>(std::lround(h * aspect));
-        } else {
-            const double projected = (w + h / aspect) * (aspect * aspect) / (aspect * aspect + 1.0);
-            w = static_cast<int>(std::lround(projected));
-            h = static_cast<int>(std::lround(projected / aspect));
-        }
-    }
-
-    if (!(GetKeyState(VK_CONTROL) & 0x8000)) {
-        if (aspectLocked_) {
-            if (std::abs(w - nativeW) <= kSnapPx) {
-                w = nativeW;
-                h = nativeH;
-            }
-        } else {
-            if (std::abs(w - nativeW) <= kSnapPx) w = nativeW;
-            if (std::abs(h - nativeH) <= kSnapPx) h = nativeH;
-        }
-    }
-
-    w = ClampExtent(w, kMinWidth);
-    h = ClampExtent(h, kMinHeight);
-    snapped_ = (w == nativeW && h == nativeH);
-
-    if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT) {
-        rect->left = rect->right - w;
-    } else {
-        rect->right = rect->left + w;
-    }
-    if (edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT) {
-        rect->top = rect->bottom - h;
-    } else {
-        rect->bottom = rect->top + h;
-    }
+    snapped_ = ConstrainToNative(edge, rect, { static_cast<LONG>(nativeW_), static_cast<LONG>(nativeH_) },
+                                 aspectLocked_, { kMinWidth, kMinHeight });
 }
 
 void PopoutWindow::SetZoom(float factor) {
@@ -188,33 +139,12 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         if (wp) return 0;
         break;
 
-    case WM_NCHITTEST: {
-        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        RECT r{};
-        GetWindowRect(hwnd_, &r);
-        const int border = MulDiv(kResizeBorder, static_cast<int>(GetDpiForWindow(hwnd_)), 96);
-        const bool left   = pt.x < r.left + border;
-        const bool right  = pt.x >= r.right - border;
-        const bool top    = pt.y < r.top + border;
-        const bool bottom = pt.y >= r.bottom - border;
-        if (top && left)     return HTTOPLEFT;
-        if (top && right)    return HTTOPRIGHT;
-        if (bottom && left)  return HTBOTTOMLEFT;
-        if (bottom && right) return HTBOTTOMRIGHT;
-        if (left)   return HTLEFT;
-        if (right)  return HTRIGHT;
-        if (top)    return HTTOP;
-        if (bottom) return HTBOTTOM;
-        return HTCLIENT;
-    }
+    case WM_NCHITTEST:
+        return ResizeBorderHitTest(hwnd_, lp);
 
-    case WM_LBUTTONDOWN: {
-        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ClientToScreen(hwnd_, &pt);
-        ReleaseCapture();
-        SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(pt.x, pt.y));
+    case WM_LBUTTONDOWN:
+        BeginWindowDrag(hwnd_, lp);
         return 0;
-    }
 
     case WM_LBUTTONDBLCLK:
         SetZoom(1.0f);
@@ -262,11 +192,20 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_EXITSIZEMOVE:
-        snapped_ = false;
-        Render();
-        Notify(PopoutEvent::Changed);
+    case WM_ENTERSIZEMOVE:
+        GetWindowRect(hwnd_, &sizeMoveStart_);
         return 0;
+
+    case WM_EXITSIZEMOVE: {
+        if (snapped_) {
+            snapped_ = false;
+            Render();
+        }
+        RECT r{};
+        GetWindowRect(hwnd_, &r);
+        if (!EqualRect(&r, &sizeMoveStart_)) Notify(PopoutEvent::Changed);   // Not for a plain click.
+        return 0;
+    }
 
     case WM_RBUTTONUP: {
         POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };

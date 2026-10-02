@@ -117,6 +117,85 @@ RECT WorkAreaFor(HWND hwnd) {
     return WorkAreaFor(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY));
 }
 
+LRESULT ResizeBorderHitTest(HWND hwnd, LPARAM lp) {
+    constexpr int kResizeBorder = 7;
+    const POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    RECT r{};
+    GetWindowRect(hwnd, &r);
+    const int border = MulDiv(kResizeBorder, static_cast<int>(GetDpiForWindow(hwnd)), 96);
+    const bool left   = pt.x < r.left + border;
+    const bool right  = pt.x >= r.right - border;
+    const bool top    = pt.y < r.top + border;
+    const bool bottom = pt.y >= r.bottom - border;
+    if (top && left)     return HTTOPLEFT;
+    if (top && right)    return HTTOPRIGHT;
+    if (bottom && left)  return HTBOTTOMLEFT;
+    if (bottom && right) return HTBOTTOMRIGHT;
+    if (left)   return HTLEFT;
+    if (right)  return HTRIGHT;
+    if (top)    return HTTOP;
+    if (bottom) return HTBOTTOM;
+    return HTCLIENT;
+}
+
+void BeginWindowDrag(HWND hwnd, LPARAM lp) {
+    POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+    ClientToScreen(hwnd, &pt);
+    ReleaseCapture();
+    SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(pt.x, pt.y));
+}
+
+bool ConstrainToNative(WPARAM edge, RECT* rect, SIZE native, bool aspectLocked, SIZE minimum) {
+    constexpr int kSnapPx = 14;   // Grab range around 100%.
+    int w = RectW(*rect);
+    int h = RectH(*rect);
+    const bool horizontal = (edge == WMSZ_LEFT || edge == WMSZ_RIGHT);
+    const bool vertical   = (edge == WMSZ_TOP  || edge == WMSZ_BOTTOM);
+    const double aspect   = static_cast<double>(native.cx) / static_cast<double>(native.cy);
+
+    if (aspectLocked) {
+        if (horizontal) {
+            h = static_cast<int>(std::lround(w / aspect));
+        } else if (vertical) {
+            w = static_cast<int>(std::lround(h * aspect));
+        } else {
+            // Corner drag: project onto the aspect line.
+            const double projected = (w + h / aspect) * (aspect * aspect) / (aspect * aspect + 1.0);
+            w = static_cast<int>(std::lround(projected));
+            h = static_cast<int>(std::lround(projected / aspect));
+        }
+    }
+
+    // Ctrl slides straight past 100%.
+    if (!(GetKeyState(VK_CONTROL) & 0x8000)) {
+        if (aspectLocked) {
+            if (std::abs(w - native.cx) <= kSnapPx) {
+                w = native.cx;
+                h = native.cy;
+            }
+        } else {
+            if (std::abs(w - native.cx) <= kSnapPx) w = native.cx;
+            if (std::abs(h - native.cy) <= kSnapPx) h = native.cy;
+        }
+    }
+
+    w = ClampI(w, minimum.cx, kMaxExtent);
+    h = ClampI(h, minimum.cy, kMaxExtent);
+
+    // Keep whichever edges the user is not dragging pinned.
+    if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT) {
+        rect->left = rect->right - w;
+    } else {
+        rect->right = rect->left + w;
+    }
+    if (edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT) {
+        rect->top = rect->bottom - h;
+    } else {
+        rect->bottom = rect->top + h;
+    }
+    return w == native.cx && h == native.cy;
+}
+
 HICON LoadAppIcon(int size) {
     static std::mutex lock;
     static std::vector<std::pair<int, HICON>> cache;

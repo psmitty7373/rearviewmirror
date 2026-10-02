@@ -63,6 +63,7 @@ private:
 
     bool hovered_ = false;
     bool snapped_ = false;
+    RECT sizeMoveStart_{};
 };
 
 }  // namespace rvm
