@@ -14,9 +14,8 @@
 
 namespace rvm {
 
-// Posted to the window given to Connect(). wParam carries the event in its
-// low byte and the tag given to Connect() above it, so one window can tell
-// several clients apart.
+// Posted to Connect()'s window: wParam is the event in its low byte and
+// Connect()'s tag above it.
 constexpr UINT WM_RVM_CLIENT_EVENT = WM_APP + 20;
 enum class ClientEvent : WPARAM { StatusChanged = 1, ListUpdated, FrameReady };
 
@@ -34,21 +33,18 @@ struct RemoteMirror {
     bool         controllable = false;
 };
 
-// What the window draws for one subscribed stream: a BGRA texture that the
-// decode thread keeps current.
+// One subscribed stream: a BGRA texture the decode thread keeps current.
 struct StreamView {
     uint32_t id = 0;
     winrt::com_ptr<ID3D11Texture2D> texture;
     UINT     width = 0;
     UINT     height = 0;
     uint64_t frames = 0;
-    // What the server last said about the stream (net::StreamState): why no
-    // frames are coming, if they are not.
-    uint8_t  state = 0;
+    uint8_t  state = 0;   // net::StreamState, as the server last reported it.
 };
 
-// What to show in place of a stream the server says it cannot send, or null
-// when nothing is wrong beyond frames not having arrived yet.
+// Shown in place of a stream the server cannot send; null if it is only
+// waiting for frames.
 inline const wchar_t* StreamStateText(uint8_t state) {
     switch (static_cast<net::StreamState>(state)) {
     case net::StreamState::EncoderFull:  return L"The server's encoder is busy with other streams";
@@ -57,10 +53,9 @@ inline const wchar_t* StreamStateText(uint8_t state) {
     }
 }
 
-// Connects to one server, keeps a list of its mirrors, and decodes the
-// subscribed ones. A network thread reassembles and requests resends; a decode
-// thread turns access units into textures. A lost or refused connection is
-// retried until Disconnect(), and subscriptions are restored when it returns.
+// One server: its mirror list and the subscribed streams. The net thread
+// speaks the protocol; the decode thread makes textures. Reconnects until
+// Disconnect(), restoring subscriptions.
 class StreamClient {
 public:
     ~StreamClient();
@@ -71,8 +66,7 @@ public:
 
     bool Connected() const { return connected_.load(); }
     std::wstring Status() const;
-    // Network round trip in microseconds, smoothed over recent pings; -1
-    // until the first answer.
+    // Smoothed round trip in microseconds; -1 until the first answer.
     int64_t RttUs() const { return rttUs_.load(); }
 
     std::vector<RemoteMirror> Mirrors() const;
@@ -80,8 +74,7 @@ public:
     void SetSubscribed(uint32_t id, bool on);
     std::vector<StreamView> Views() const;
 #if RVM_REMOTE_CONTROL
-    // The UI's hold on desktop control. Each call wakes the network thread,
-    // which otherwise sleeps while control is idle.
+    // The UI's access to desktop control; each call wakes the net thread.
     class ControlLink {
     public:
         explicit ControlLink(StreamClient& client) : c_(client) {}
@@ -97,16 +90,14 @@ public:
     bool Controllable(uint32_t id) const;
 #endif
 
-    // The window calls this when it handles FrameReady, so the next decoded
-    // frame posts a fresh one; bursts collapse into one repaint.
+    // Called on handling FrameReady; no other is posted until then.
     void AckFrameReady() { framePosted_.store(false); }
 
 private:
 #if RVM_REMOTE_CONTROL
     net::ControlClient control_;
     void PokeControl();
-    // Sends what the control link has due; the milliseconds until it next
-    // has something, or UINT64_MAX while idle.
+    // Sends what is due; returns ms until the next send, or UINT64_MAX if idle.
     uint64_t ServiceControl();
     std::atomic<bool> controlPoked_{ false };
     // Net thread, in net::ControlNowMs() time.
@@ -131,7 +122,7 @@ private:
     // NACKs and keyframe requests; returns when the streams next need it.
     uint64_t PollStreams(uint64_t nowMs);
     void SetStatus(std::wstring status);
-    void Notify(ClientEvent event, LPARAM lp = 0);
+    void Notify(ClientEvent event);
     std::shared_ptr<Stream> FindStream(uint32_t id) const;
 
     std::wstring host_;

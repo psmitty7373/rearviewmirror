@@ -437,8 +437,7 @@ static void TestCodec() {
     Check(colourOk, "no stage of the GPU pipeline reported failure");
 }
 
-// Which frame sizes will the hardware encoder actually accept? Mirrors are
-// arbitrary crops, so odd sizes are the normal case, not the exception.
+// Odd sizes the hardware encoder must accept: mirrors are arbitrary crops.
 static void TestEncoderSizes() {
     printf("encoder sizes\n");
     if (HardwareEncoderName().empty()) {
@@ -479,10 +478,8 @@ static void TestEncoderSizes() {
     Check(allInit, "every size at or above the 256 px floor can be encoded");
 }
 
-// A stream can close while its encoder still holds a frame: NVENC keeps one
-// back until more input arrives. The encoder's own Media Foundation work for
-// that frame must not outlive it; it once ran on the freed encoder and crashed
-// the process a second or two later.
+// An encoder closed while it still holds a frame (NVENC keeps one back) must
+// not leave Media Foundation work that runs after it is freed.
 static void TestEncoderTeardown() {
     printf("encoder teardown\n");
     if (HardwareEncoderName().empty()) {
@@ -570,13 +567,11 @@ static void TestEncoderPresets() {
     }
 }
 
-// The whole desktop, each monitor's frames placed in the virtual screen.
-// Capture sends every monitor's current picture as soon as it starts, so
-// frames come without anything on screen changing. Only frames are counted;
-// no pixel is ever read back.
 template <class Pred>
 static bool WaitFor(Pred pred, int timeoutMs);
 
+// Whole-desktop capture: each monitor's frames lie within the virtual screen.
+// Capture sends every monitor's picture on start, so nothing need change.
 static void TestDesktopCapture() {
     printf("desktop capture\n");
     if (!CaptureSupported()) {
@@ -614,11 +609,9 @@ static void TestDesktopCapture() {
     Check(frames.load() == stopped, "no frames after Stop");
 }
 
-// What the encoder spends. A mirror sends a frame whenever anything changes,
-// so a pointer moving over a still desktop is the common case and must cost
-// little; a whole screen scrolling must stay within the bitrate; and full
-// pictures come only on request, never on a timer. The picture is text-like
-// detail at 1080p, the kind a real desktop is made of.
+// What the encoder spends on text-like 1080p content: a pointer over a still
+// page costs little, scrolling stays within the bitrate, and keyframes come
+// only on request.
 static void TestRateControl() {
     printf("rate control\n");
     if (HardwareEncoderName().empty()) {
@@ -675,7 +668,7 @@ static void TestRateControl() {
 
     int keyframes = 0;
     size_t keyBytes = 0;
-    // Draws frame `i`: the page scrolled by `scroll` pixels, a pointer at `px`.
+    // Encodes the page scrolled by `scroll` pixels with a pointer at `px`.
     auto encode = [&](UINT scroll, UINT px, size_t& bytes, ID3D11Texture2D* source = nullptr) {
         ID3D11Texture2D* src = source ? source : background.get();
         {
@@ -701,8 +694,7 @@ static void TestRateControl() {
         }
     };
 
-    // The pointer wandering over a still page, for longer than the old
-    // four-second keyframe interval.
+    // The pointer wandering over a still page for 5 s.
     constexpr int kPointerFrames = kFps * 5;
     size_t first = 0, pointerBytes = 0;
     encode(0, 0, first);   // The opening keyframe.
@@ -725,10 +717,8 @@ static void TestRateControl() {
     printf("  one second of scrolling: %.2f Mbps (limit %.0f)\n", scrollMbps, kBitrate / 1e6);
     Check(scrollMbps <= kBitrate / 1e6 * 1.25, "a whole screen scrolling stays within the bitrate");
 
-    // The worst case, reported rather than checked: every frame unrelated to
-    // the one before. No rate-control mode holds this to the limit: the
-    // encoder will not drop quality further, so each frame stays large.
-    // Only sending fewer frames could, which the frame-rate cap does.
+    // Reported, not checked: every frame unrelated to the last. No rate
+    // control holds this to the limit; only the frame-rate cap can.
     size_t worstBytes = 0;
     for (int i = 1; i <= static_cast<int>(kFps); ++i) {
         encode(static_cast<UINT>(i * 37), 0, worstBytes, (i & 1) ? background2.get() : background.get());
@@ -1268,8 +1258,6 @@ static void TestLoopback() {
 
     Check(WaitFor([&] { return client.RttUs() >= 0; }, 3000), "ping/pong yields a round-trip time");
     printf("  loopback RTT %.3f ms\n", client.RttUs() / 1000.0);
-    // Loopback is a fraction of a millisecond: a real measurement is neither
-    // zero (the old tick-count timing) nor anywhere near a second.
     Check(client.RttUs() > 0 && client.RttUs() < 100'000,
           "the round trip is measured below a millisecond, not rounded to zero");
 
@@ -1283,14 +1271,12 @@ static void TestLoopback() {
     });
     client.SetSubscribed(1, false);
     Sleep(150);
-    const uint64_t before = FramesOf(client);
     client.SetSubscribed(1, true);
     Check(WaitFor([&] { return requests > 0; }, 2000), "subscribing asks the mirror for a frame");
     Check(WaitFor([&] {
               auto v = client.Views();
               return !v.empty() && v[0].frames > 0;
           }, 3000), "a subscriber of a still source gets its first frame anyway");
-    (void)before;
 
     // A single isolated frame must also arrive, not wait for a successor.
     const uint64_t single = FramesOf(client);
@@ -1629,10 +1615,8 @@ static void SendId(RawPeer& peer, Msg msg, uint32_t id) {
     peer.Send(w);
 }
 
-// The server encoding on the CPU, as it does wherever no hardware encoder can
-// be fed: frames from a mirror's cache reach a subscriber and decode to what
-// was captured. A raw peer receives them, since the real client decodes on
-// the GPU and some machines that need this have nothing to decode with.
+// The server encoding on the CPU: frames reach a subscriber and decode to the
+// captured colours. A raw peer decodes on the CPU, so no GPU decoder is needed.
 static void TestSoftwareLoopback() {
     printf("CPU stream\n");
     if (!SoftwareEncoder()) {
@@ -1887,8 +1871,7 @@ static void TestServerNetLoop() {
     Check(GetTickCount64() - stopping < 500, "stopping does not wait out the network thread's sleep");
 }
 
-// Everything the audit found a client could abuse, tried against a live
-// server: each must stay bounded.
+// Abuse a client could try against a live server: each must stay bounded.
 static void TestHostileClients() {
     printf("hostile clients\n");
     if (HardwareEncoderName().empty()) {
@@ -2050,13 +2033,9 @@ static void TestHostileClients() {
     server.Stop();
 }
 
-// A 60 fps source against a 10 fps cap: about 10 frames a second get through,
-// evenly, and when the source stops, its last picture is still delivered.
-// GeForce cards run only a few encoder sessions at once (twelve on an RTX
-// 4080's current driver, three on a GT 730's). With more mirrors watched than that, every
-// stream must either deliver frames or tell the viewer the encoder is full,
-// never leave it waiting in silence; and when a working stream closes, a
-// waiting one takes its session.
+// GeForce cards run only a few encoder sessions at once. With more streams
+// than that, each must deliver frames or report the encoder full, and a
+// closed stream's session goes to a waiting one.
 static void TestEncoderSessionLimit() {
     printf("encoder session limit\n");
     if (HardwareEncoderName().empty()) {
@@ -2140,6 +2119,8 @@ static void TestEncoderSessionLimit() {
     server.Stop();
 }
 
+// A 60 fps source against a 10 fps cap: about 10 frames a second get through,
+// and when the source stops, its last picture is still delivered.
 static void TestFrameRateCap() {
     printf("frame-rate cap\n");
     if (HardwareEncoderName().empty()) {
@@ -2363,11 +2344,7 @@ static int Bench() {
     return 0;
 }
 
-// `--live`: connect a headless client to the app's own running server, using
-// the key from its settings file, and report what arrives. Splits a "no
-// frames" report into a server-side or client-side problem.
-// Luma PSNR between two NV12 pictures of the same size, read back through
-// staging copies. Only the Y plane: text sharpness lives there.
+// Luma PSNR between two same-size NV12 pictures; text sharpness lives in Y.
 static double LumaPsnr(ID3D11Texture2D* a, UINT aSlice, ID3D11Texture2D* b, UINT w, UINT h) {
     auto& g = Gfx::Get();
     D3D11_TEXTURE2D_DESC sd{};
@@ -2497,6 +2474,8 @@ static int PresetBench() {
     return 0;
 }
 
+// `--live`: a headless client against the app's own running server, using
+// the key from its settings file, reporting what arrives.
 static int LiveProbe() {
     const std::wstring path = ConfigDir() + L"\\stream.ini";
     const int port = static_cast<int>(GetPrivateProfileIntW(L"Stream", L"Port", 5901, path.c_str()));
@@ -2572,15 +2551,11 @@ int main(int argc, char** argv) {
         return LiveProbe();
     }
 
-    // STA, exactly like both real applications' main threads: worker threads
-    // must then set up their own apartments, which a multi-threaded init here
-    // would have silently papered over.
+    // STA like the apps' main threads, so workers must set up their own.
     winrt::init_apartment(winrt::apartment_type::single_threaded);
 
-    // Encoder and server diagnostics land in %APPDATA%\RearViewMirror\test.log,
-    // so a run on another machine records exactly what its GPU did. A crash
-    // adds its stack there and a dump beside it; unbuffered output keeps the
-    // progress printed before it, even when piped.
+    // Diagnostics and crash reports go to %APPDATA%\RearViewMirror\test.log;
+    // unbuffered output keeps progress printed before a crash.
     setvbuf(stdout, nullptr, _IONBF, 0);
     SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
     LogOpen(L"test");

@@ -27,8 +27,7 @@ uint64_t NowMs() {
     return GetTickCount64();
 }
 
-// Round trips on a LAN take well under a millisecond, far below the tick
-// count's 15.6 ms steps: pings are timed with the performance counter.
+// For pings: LAN round trips are far below the tick count's 15.6 ms steps.
 int64_t NowUs() {
     static const int64_t frequency = [] {
         LARGE_INTEGER f{};
@@ -98,8 +97,7 @@ void StreamClient::Disconnect() {
 #if RVM_REMOTE_CONTROL
     control_.Reset();
 #endif
-    // The net thread can stop by itself (no usable key), so the threads are
-    // joined whenever they exist, not only when this call stops them.
+    // The net thread may have stopped itself (no usable key): join regardless.
     if (running_.exchange(false) && connected_) {
         Writer w;
         w.U8(static_cast<uint8_t>(Msg::Bye));
@@ -132,16 +130,16 @@ void StreamClient::Disconnect() {
     SecureZeroMemory(masterKey_.data(), masterKey_.size());
 }
 
-// Fresh handshake randoms, and a new session number: every stream's
-// "subscribed in" is then out of date, so the next list re-subscribes it.
+// A new session_ makes every stream's subscribedIn stale, so the next list
+// re-subscribes it.
 void StreamClient::BeginSession() {
     RandomBytes(clientRandom_, kRandomBytes);
     do { RandomBytes(&clientSession_, sizeof(clientSession_)); } while (clientSession_ == 0);
     ++session_;
 }
 
-// The link is gone but the wish list stays: the next session re-subscribes.
-// Net thread. Textures are kept so tiles show the last frame meanwhile.
+// Net thread. The wish list and textures (the last frame) are kept for the
+// next session.
 void StreamClient::DropSession(std::wstring status) {
 #if RVM_REMOTE_CONTROL
     control_.Reset();
@@ -183,11 +181,11 @@ void StreamClient::SetStatus(std::wstring status) {
     Notify(ClientEvent::StatusChanged);
 }
 
-void StreamClient::Notify(ClientEvent event, LPARAM lp) {
+void StreamClient::Notify(ClientEvent event) {
     if (!notify_) return;
-    if (!PostMessageW(notify_, WM_RVM_CLIENT_EVENT, MakeClientEvent(event, tag_), lp) &&
+    if (!PostMessageW(notify_, WM_RVM_CLIENT_EVENT, MakeClientEvent(event, tag_), 0) &&
         event == ClientEvent::FrameReady) {
-        framePosted_ = false;   // Never posted, so never acknowledged: let the next one try.
+        framePosted_ = false;   // Never posted, so never acknowledged.
     }
 }
 
@@ -216,8 +214,7 @@ bool StreamClient::IsSubscribed(uint32_t id) const {
     return wanted_.count(id) != 0;
 }
 
-// The network thread sends the change; off-line, the wish is kept and acted
-// on when the list next arrives.
+// The net thread sends the change; while offline, when the list next arrives.
 void StreamClient::SetSubscribed(uint32_t id, bool on) {
     {
         std::lock_guard lock(stateMutex_);
@@ -285,8 +282,7 @@ void StreamClient::RequestList(uint64_t nowMs) {
 // Network thread
 
 void StreamClient::NetLoop() {
-    // Stretching the passphrase takes a noticeable fraction of a second: here,
-    // off the UI thread. One master-key channel serves the whole connection.
+    // Key stretching is slow: done here, off the UI thread.
     masterKey_ = DeriveMasterKey(key_);
     if (!master_.SetKey(masterKey_)) {
         SetStatus(L"Could not set up encryption.");
@@ -299,8 +295,7 @@ void StreamClient::NetLoop() {
     uint64_t lastHello = 0, lastPing = 0, lastFromServer = 0;
     int helloAttempts = 0;
 
-    // Sleeps until a datagram, a wake from the UI, or the earliest deadline:
-    // an idle connection costs a ping every couple of seconds.
+    // Sleeps until a datagram, a Wake() or the earliest deadline.
     while (running_) {
         const uint64_t now = NowMs();
         uint64_t due = UINT64_MAX;
@@ -311,10 +306,8 @@ void StreamClient::NetLoop() {
                 std::lock_guard lock(stateMutex_);
                 unsubscribe_.clear();   // The next session starts with none.
             }
-            // Quick attempts first, then a slower retry that never gives up:
-            // the server may simply not be running yet. Each slow retry is a
-            // fresh handshake, so the server's replay filter never mistakes a
-            // long wait for a replay.
+            // Quick attempts, then slow retries forever. Each slow retry is a
+            // fresh handshake, so the server's replay filter never rejects it.
             const bool slow = helloAttempts >= kHelloAttempts;
             const uint64_t interval = slow ? kHelloRetryMs : kHelloIntervalMs;
             if (now - lastHello >= interval) {
@@ -342,8 +335,6 @@ void StreamClient::NetLoop() {
                 lastHello = 0;
                 continue;
             }
-            // The list request is plain UDP: repeat it until answered, and
-            // refresh the list now and then in case a change notice was lost.
             const uint64_t listEvery = listPending_ ? kListRetryMs : kListRefreshMs;
             if (now - lastListReqMs_ >= listEvery) RequestList(now);
             if (subscriptionsChanged_.exchange(false)) SyncSubscriptions(now);
@@ -372,8 +363,7 @@ void StreamClient::NetLoop() {
             if (!(from == server_)) continue;
             const uint64_t at = NowMs();
             const bool wasConnected = connected_;
-            // Only a datagram that authenticated counts as a sign of life:
-            // anyone can send from a forged address.
+            // Only an authenticated datagram counts: addresses can be forged.
             if (HandleDatagram(buffer.data(), static_cast<size_t>(n), at) && connected_) {
                 lastFromServer = at;
             }
@@ -397,8 +387,7 @@ void StreamClient::NetLoop() {
 // True if the datagram authenticated.
 bool StreamClient::HandleDatagram(const uint8_t* data, size_t len, uint64_t nowMs) {
     if (!connected_) {
-        // Expecting the WELCOME that answers this session's own HELLO: it must
-        // echo our random, so a WELCOME recorded earlier is worthless.
+        // A WELCOME must echo this session's random, so a recorded one fails.
         std::vector<uint8_t>& plain = plain_;
         uint32_t serverSession = 0;
         if (!master_.Open(data, len, plain, serverSession) || plain.size() < 1 + 2 * kRandomBytes) {
@@ -476,8 +465,7 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
 
         std::lock_guard lock(queueMutex_);
         for (auto& f : done) {
-            // A decoder that cannot keep up must not build a latency backlog:
-            // drop what is queued and restart from the next keyframe.
+            // A decoder that falls behind drops its backlog and waits for a keyframe.
             if (s->queued >= kMaxQueuedPerStream) {
                 for (auto it = queue_.begin(); it != queue_.end();) {
                     it = (it->first == s) ? queue_.erase(it) : it + 1;
@@ -544,12 +532,10 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
     case Msg::Pong: {
         uint64_t sent = 0;
         if (!r.U64(sent)) break;
-        // Timed now, on arrival: the loop's own timestamp was taken before it
-        // waited for this datagram, and would make a quick answer look instant.
+        // Timed on arrival: the loop's timestamp predates its wait.
         const int64_t sample = NowUs() - static_cast<int64_t>(sent);
         if (sample < 0 || sample > 60'000'000) break;   // Not one of ours.
         const int64_t previous = rttUs_.load();
-        // Smoothed, so the figure does not flicker with every ping.
         rttUs_ = previous < 0 ? sample : (previous * 3 + sample) / 4;
         Notify(ClientEvent::StatusChanged);
         break;
@@ -579,8 +565,6 @@ void StreamClient::HandleMessage(Reader& r, uint64_t nowMs) {
     }
 }
 
-// Wanted but not yet subscribed in this session: just chosen, chosen while
-// the link was down, or carried over a reconnect.
 void StreamClient::SyncSubscriptions(uint64_t nowMs) {
     std::vector<uint32_t> drop;
     {
@@ -605,8 +589,7 @@ void StreamClient::SyncSubscriptions(uint64_t nowMs) {
         w.U32(s->id);
         Send(w.Data());
         s->subscribedIn = session_;
-        // The server answers a Subscribe with a keyframe: asking again would
-        // cost it a second one.
+        // The server answers a Subscribe with a keyframe.
         s->assembler.MarkKeyframeRequested(nowMs);
         streamsDueMs_ = (std::min)(streamsDueMs_, s->assembler.NextDueMs());
         Log(L"client: subscribed to mirror %u", s->id);
@@ -626,8 +609,7 @@ uint64_t StreamClient::PollStreams(uint64_t nowMs) {
         nacks.clear();
         s->assembler.Poll(nowMs, nacks);
         for (const auto& m : nacks) {
-            // A frame with very many losses is asked for in several messages,
-            // each small enough for one datagram.
+            // Split so each NACK fits one datagram.
             for (size_t first = 0; first < m.indices.size(); first += kMaxNackIndices) {
                 const size_t n = (std::min)(kMaxNackIndices, m.indices.size() - first);
                 Writer w;
@@ -669,8 +651,8 @@ uint64_t StreamClient::ServiceControl() {
         controlDueMs_ = now + kControlInputMs;   // Unacknowledged input is resent.
         return kControlInputMs;
     }
-    // Nothing waiting: a held or ending lease still goes out at the slower
-    // pace, and once that stops too the link is idle until the UI acts.
+    // Nothing waiting: a held or ending lease goes out at the idle pace; once
+    // that stops, nothing until the UI acts.
     controlDueMs_ = now - controlSentMs_ < kControlIdleMs ? controlSentMs_ + kControlIdleMs : UINT64_MAX;
     return controlDueMs_ == UINT64_MAX ? UINT64_MAX : controlDueMs_ - now;
 }
@@ -680,8 +662,7 @@ uint64_t StreamClient::ServiceControl() {
 // Decode thread
 
 void StreamClient::DecodeLoop() {
-    // The decoders are Media Foundation objects, which live in the
-    // multithreaded apartment; this thread joins it explicitly.
+    // Media Foundation decoders need the multithreaded apartment.
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     while (running_) {
         std::pair<std::shared_ptr<Stream>, FrameAssembler::Frame> item;
@@ -722,7 +703,6 @@ void StreamClient::DecodeOne(Stream& s, FrameAssembler::Frame& frame) {
                     ok ? 1 : 0, decoded.size());
     if (!ok || decoded.empty()) return;
 
-    // Only the newest decoded frame matters for display.
     const DecodedFrame& d = decoded.back();
     const UINT picW = static_cast<UINT>(RectW(d.display));
     const UINT picH = static_cast<UINT>(RectH(d.display));
@@ -758,7 +738,7 @@ void StreamClient::DecodeOne(Stream& s, FrameAssembler::Frame& frame) {
         std::lock_guard lock(stateMutex_);
         ++s.frames;
     }
-    if (!framePosted_.exchange(true)) Notify(ClientEvent::FrameReady, s.id);
+    if (!framePosted_.exchange(true)) Notify(ClientEvent::FrameReady);
 }
 
 }  // namespace rvm

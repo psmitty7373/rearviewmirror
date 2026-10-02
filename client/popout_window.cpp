@@ -276,7 +276,7 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_CLOSE:
-        Notify(PopoutEvent::ReturnToGrid);
+        Notify(PopoutEvent::ReturnToCanvas);
         return 0;
 
     default:
@@ -307,7 +307,7 @@ void PopoutWindow::ShowContextMenu(POINT screenPt) {
     AppendMenuW(menu, MF_STRING | (clickThrough_ ? MF_CHECKED : 0), kIdClickThrough,
                 L"Click-through");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kIdReturn, L"Return to grid");
+    AppendMenuW(menu, MF_STRING, kIdReturn, L"Return to canvas");
 
     SetForegroundWindow(hwnd_);
     const UINT cmd = static_cast<UINT>(TrackPopupMenu(
@@ -318,7 +318,7 @@ void PopoutWindow::ShowContextMenu(POINT screenPt) {
     if (!hwnd_) return;
 
     switch (cmd) {
-    case kIdReturn:       Notify(PopoutEvent::ReturnToGrid); break;
+    case kIdReturn:       Notify(PopoutEvent::ReturnToCanvas); break;
     case kIdAspectLock:   aspectLocked_ = !aspectLocked_; Render(); Notify(PopoutEvent::Changed); break;
     case kIdClickThrough: SetClickThrough(!clickThrough_); break;
     case kIdZoom50:  SetZoom(0.5f); break;

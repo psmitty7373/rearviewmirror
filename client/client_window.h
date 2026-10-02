@@ -11,10 +11,8 @@ namespace rvm {
 
 constexpr wchar_t kClientClass[] = L"RvmClientWindow";
 
-// The client's one window: a sidebar listing each connected server and its
-// mirrors, and a canvas where the chosen mirrors sit as free-form boxes,
-// each one movable and resizable, or popped out into its own window. The
-// sidebar collapses to a thin handle. Custom-drawn in Direct2D.
+// The client's window: a collapsible sidebar of servers and their mirrors, and
+// a canvas of movable, resizable boxes, each of which can pop out.
 class ClientWindow : public D2DOverlay {
 public:
     // relaunched: this process replaced one whose graphics device was lost.
@@ -59,8 +57,7 @@ private:
         std::wstring    label;
         std::unique_ptr<StreamClient> client;
     };
-    // Snapshot of one server for OnDraw, built in PrepareDraw, with the
-    // sidebar's text ready to draw.
+    // One server in the draw snapshot (views_).
     struct ServerView {
         uint32_t     tag = 0;
         std::wstring label;
@@ -79,9 +76,7 @@ private:
         D2D1_RECT_F rect;
         size_t      item = 0;   // Index into the server's mirrors, for a MirrorItem.
     };
-    // A box on the canvas, in device-independent pixels from the canvas's
-    // top-left, so a layout keeps its size across DPI changes. tiles_ is in
-    // back-to-front order.
+    // A box on the canvas, in DIPs from its top-left. tiles_ is back to front.
     struct Tile {
         TileKey key;
         float x = 0, y = 0, w = 320, h = 180;
@@ -125,14 +120,12 @@ private:
     void  PopOut(Tile& tile);
     void  Dock(Tile& tile);
     void  Retire(std::unique_ptr<PopoutWindow> popout);
-    // Hands each of the server's pop-outs a new frame or state of its own
-    // stream. True if a box on the canvas has one too; `views` is then the
-    // server's current set.
+    // Updates the server's pop-outs whose stream changed. True if a canvas
+    // box's stream changed too; `views` is then the server's current set.
     bool  FeedStreams(Server& server, std::vector<StreamView>& views);
     void  FitToStream(Tile& tile);
-    // The size to present a stream at: the decoded picture, reshaped to the
-    // mirror's true proportions where the encoder had to pad or squeeze it.
-    // Falls back to the listed crop before the first frame. False if neither.
+    // The decoded size, reshaped to the mirror's proportions where the encoder
+    // padded or squeezed it; the listed crop before the first frame, else false.
     bool  ShownSize(TileKey key, UINT& w, UINT& h) const;
     static bool ShownSizeOf(const StreamView* view, const RemoteMirror* mirror, UINT& w, UINT& h);
     void  ShowTileMenu(TileKey key, POINT screenPt);
@@ -154,7 +147,6 @@ private:
     D2D1_RECT_F PictureRect(const Tile& tile, UINT shownW, UINT shownH) const;
     const StreamView*   ViewFor(TileKey key) const;
     const RemoteMirror* MirrorFor(TileKey key) const;
-    // A box's key travels in an LPARAM: both halves need a 64-bit build.
     static_assert(sizeof(LPARAM) == 8, "TokenOf packs two 32-bit ids into an LPARAM");
     static LPARAM TokenOf(TileKey key) {
         return static_cast<LPARAM>((static_cast<uint64_t>(key.server) << 32) | key.id);
@@ -173,9 +165,8 @@ private:
     // The canvas's size in device-independent pixels.
     float CanvasW() const;
     float CanvasH() const;
-    // Where a box is drawn: its saved place, pulled in (and shrunk only if it
-    // must) when the canvas is too small for it. The saved place itself is
-    // never changed by a window resize, so growing the window puts it back.
+    // Where a box is drawn: its saved place, pulled in (and shrunk if it must)
+    // to fit the canvas. Resizing the window never changes the saved place.
     struct Box { float x, y, w, h; };
     Box Shown(const Tile& tile) const;
     // The nearest canvas or box edge within snapping range of `edge`, or
@@ -194,8 +185,8 @@ private:
                     bool hot);
     void DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1_RECT_F& cell);
 
-    // Name chips show while their box is hovered or dragged, and for a few
-    // seconds after, then fade. A timer keeps the fade going on a still stream.
+    // Name chips show while their box is hovered or dragged, then linger and
+    // fade; a timer drives the fade on a still stream.
     void  SetHot(const Hit& hit);
     float ChipAlpha(const Tile& tile) const;
     void  ScheduleChipTimer();
@@ -214,10 +205,8 @@ private:
     TileKey focused_{};                      // Double-clicked box shown alone, or server 0.
     Drag    drag_;
 
-    // Snapshot for OnDraw and hit testing. Render() builds it afresh, so
-    // every change to a server or the list draws with Render(). Repaint()
-    // draws once the queue is empty and keeps it: for frames patched into it,
-    // hover, drags, scrolling and chip fades.
+    // Snapshot for OnDraw and hit testing. Render() rebuilds it; Repaint()
+    // redraws at the next WM_PAINT and keeps it (patched frames, hover, drags).
     void Repaint();
     std::vector<ServerView> views_;
     std::vector<Row>        rows_;

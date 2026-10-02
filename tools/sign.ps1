@@ -1,14 +1,8 @@
-# Signs a built executable with a self-signed code-signing certificate.
-#
-# The certificate lives in the current user's personal store under the subject
-# below. It is created on first use and reused afterwards, so every build is
-# signed by the same identity. Nothing is written to the repository.
+# Signs a built executable with a self-signed code-signing certificate, kept
+# in CurrentUser\My and created on first use.
 #
 #   sign.ps1 -Path build\RearViewMirror.exe        sign one file
-#   sign.ps1 -Trust                                 also trust the certificate
-#                                                   on this machine (optional;
-#                                                   makes Windows show it as a
-#                                                   verified publisher)
+#   sign.ps1 -Trust                                 also trust it on this machine
 #   sign.ps1 -Remove                                delete the certificate
 
 [CmdletBinding()]
@@ -87,9 +81,8 @@ if ($Remove) {
 $cert = Get-SigningCert
 
 if ($Trust) {
-    # Trusting a self-signed certificate is a per-user decision, never done by
-    # the build itself. Root makes the chain valid; TrustedPublisher removes
-    # the publisher prompt for this identity.
+    # Never done by the build. Root makes the chain valid; TrustedPublisher
+    # removes the publisher prompt.
     $cerPath = Join-Path $env:TEMP 'rvm-signing.cer'
     Export-Certificate -Cert $cert -FilePath $cerPath -Force | Out-Null
     try {

@@ -96,14 +96,12 @@ bool ClientWindow::Create(bool relaunched) {
     for (const auto& s : config.servers) AddServer(s);
 
     if (RectW(config.window) > 0 && RectH(config.window) > 0) {
-        // Where it was last time. SetWindowPlacement moves a rect that is no
-        // longer on any monitor back onto one.
+        // SetWindowPlacement pulls a rect that is off every monitor back onto one.
         WINDOWPLACEMENT wp{ sizeof(wp) };
         wp.rcNormalPosition = config.window;
         wp.showCmd = config.windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
-        // Landing on a monitor of another DPI sends WM_DPICHANGED, whose
-        // suggested rect would rescale the saved size. The saved rect is
-        // already in that monitor's pixels, so it is applied as is.
+        // The saved rect is already in its monitor's pixels: WM_DPICHANGED
+        // must not rescale it.
         restoringPlacement_ = true;
         SetWindowPlacement(Hwnd(), &wp);
         SetWindowPlacement(Hwnd(), &wp);
@@ -118,10 +116,8 @@ bool ClientWindow::Create(bool relaunched) {
     return true;
 }
 
-// The graphics device is gone, and every swapchain, decoder and texture with
-// it. Save, and let a fresh process reconnect on a new device. A device that
-// fails again straight after a relaunch is reported rather than relaunched,
-// so a broken GPU cannot cause a restart loop.
+// Saves and relaunches onto a new device. A failure right after a relaunch is
+// reported instead, so a broken GPU cannot cause a restart loop.
 void ClientWindow::OnDeviceLost() {
     if (deviceLostHandled_) return;
     deviceLostHandled_ = true;
@@ -419,10 +415,8 @@ bool ClientWindow::ShownSizeOf(const StreamView* v, const RemoteMirror* m, UINT&
     h = v->height;
     if (!listed) return true;
 
-    // Only when the listed crop explains this stream's size: a list from
-    // before a resize must not bend the new picture.
-    // Every size the server might have chosen for this crop: each floor it
-    // steps through for fussy encoders, with and without alignment.
+    // Reshape only if some size the server could encode this crop at matches:
+    // a list from before a resize must not bend the new picture.
     const auto explains = [&] {
         for (const UINT floor : net::kEncodeFloors) {
             for (const bool align16 : { false, true }) {
@@ -490,9 +484,8 @@ void ClientWindow::Dock(Tile& tile) {
     SaveConfig();
 }
 
-// Straight from the connection, not the canvas's snapshot: that is only
-// refreshed when the canvas redraws, which a frame shown only in pop-outs,
-// or a minimised window, does not cause.
+// Reads the client, not views_: the snapshot is stale while only pop-outs
+// redraw or the window is minimised.
 bool ClientWindow::FeedStreams(Server& server, std::vector<StreamView>& views) {
     bool canvas = false, fetched = false;
     for (auto& t : tiles_) {
@@ -525,8 +518,6 @@ void ClientWindow::FitToStream(Tile& tile) {
     UINT w = 0, h = 0;
     if (!ShownSize(tile.key, w, h)) return;
 
-    // One stream pixel per screen pixel, scaled down evenly if the canvas is
-    // smaller than that.
     const float cw = CanvasW(), ch = CanvasH();
     const Box seen = Shown(tile);
     tile.x = seen.x;   // Grow from where the box is seen, not a place off-canvas.
@@ -558,7 +549,7 @@ void ClientWindow::ShowTileMenu(TileKey key, POINT screenPt) {
     }
 #endif
     if (popped) {
-        AppendMenuW(menu, MF_STRING, kMenuReturn, L"Return to grid");
+        AppendMenuW(menu, MF_STRING, kMenuReturn, L"Return to canvas");
         AppendMenuW(menu, MF_STRING | (tile->popout->ClickThrough() ? MF_CHECKED : 0),
                     kMenuClickThrough, L"Click-through");
     } else {
@@ -935,9 +926,8 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
 #if RVM_REMOTE_CONTROL
         if (controlKey_.server == server->tag) PollControl();
 #endif
-        // Only what changed is drawn again: a pop-out when its own stream has
-        // a new frame or state, the canvas when one of its boxes has. Frames
-        // change only pictures, so the rest of the snapshot stands.
+        // Redraw only what changed. A frame changes only pictures, so the
+        // snapshot is patched rather than rebuilt.
         std::vector<StreamView> views;
         const bool canvas = FeedStreams(*server, views);
         if (event != ClientEvent::FrameReady) {
@@ -968,8 +958,8 @@ LRESULT ClientWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RVM_POPOUT_EVENT: {
         Tile* tile = FindTile(KeyOf(lp));
         if (!tile || !tile->popout) return 0;
-        if (static_cast<PopoutEvent>(wp) == PopoutEvent::ReturnToGrid) Dock(*tile);
-        else                                                          SaveConfig();
+        if (static_cast<PopoutEvent>(wp) == PopoutEvent::ReturnToCanvas) Dock(*tile);
+        else                                                            SaveConfig();
         Render();
         return 0;
     }
@@ -1324,7 +1314,7 @@ void ClientWindow::DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1
             // Letterbox to the mirror's true aspect.
             UINT sw = view->width, sh = view->height;
             ShownSizeOf(view, mirror, sw, sh);
-            const auto picture = PictureRect(tile, sw, sh);   // Also used for remote pointer mapping.
+            const auto picture = PictureRect(tile, sw, sh);
             const float scale = (picture.right - picture.left) / sw;
             if (ID2D1Bitmap1* bitmap = BitmapFor(dc, view->texture.get())) {
                 dc->DrawBitmap(bitmap, picture, 1.0f,
@@ -1478,7 +1468,6 @@ void ClientWindow::OnDraw(ID2D1DeviceContext* dc) {
         dc->PopAxisAlignedClip();
     }
 
-    // Canvas.
     const D2D1_RECT_F canvas = CanvasRect();
     if (tiles_.empty()) {
         std::wstring_view hint;
