@@ -4,11 +4,23 @@
 
 namespace rvm {
 
+namespace {
+
+bool SameList(const std::vector<MirrorInfo>& a, const std::vector<MirrorInfo>& b) {
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const MirrorInfo& x, const MirrorInfo& y) {
+        return x.id == y.id && x.width == y.width && x.height == y.height &&
+               x.controllable == y.controllable && x.name == y.name;
+    });
+}
+
+}  // namespace
+
 struct Streaming::Impl {
     Hooks          hooks;
     StreamServer   server;
     StreamSettings settings;
     bool           paused = false;
+    std::vector<MirrorInfo> published;
 
     void Changed() {
         if (hooks.changed) hooks.changed();
@@ -17,7 +29,8 @@ struct Streaming::Impl {
         if (hooks.notify) hooks.notify(text);
     }
 
-    void PushMirrorList() {
+    // `always` after a restart: the server's clients are new.
+    void PushMirrorList(bool always) {
         if (!hooks.mirrors) return;
         std::vector<MirrorInfo> list;
         for (const auto& m : *hooks.mirrors) {
@@ -31,6 +44,8 @@ struct Streaming::Impl {
 #endif
             list.push_back(std::move(info));
         }
+        if (!always && SameList(list, published)) return;
+        published = list;
         server.SetMirrorList(std::move(list));
     }
 
@@ -45,7 +60,7 @@ struct Streaming::Impl {
             PostMessageW(hwnd, WM_RVM_STREAM_WANT_FRAME, mirrorId, 0);
         });
         if (!server.Start(settings)) return false;
-        PushMirrorList();
+        PushMirrorList(/*always=*/true);
         Changed();
         return true;
     }
@@ -91,15 +106,18 @@ void Streaming::Shutdown() {
 // with the app, after all of them.
 void Streaming::Attach(Mirror& mirror) {
     const uint32_t id = mirror.Id();
-    Log(L"app: stream tee attached to mirror %u", id);
     StreamServer* server = &impl_->server;
-    mirror.SetFrameSink([server, id](ID3D11Texture2D* cache, const RECT& crop) {
-        server->SubmitFrame(id, cache, crop);
-    });
+    mirror.SetFrameSink(
+        [server, id](ID3D11Texture2D* cache, const RECT& crop) { server->SubmitFrame(id, cache, crop); },
+        [server, id] { return server->Watched(id); });
 }
 
 void Streaming::MirrorsChanged() {
-    impl_->PushMirrorList();
+    impl_->PushMirrorList(/*always=*/false);
+}
+
+bool Streaming::Watched(uint32_t mirrorId) const {
+    return impl_->server.Watched(mirrorId);
 }
 
 bool Streaming::Running() const {

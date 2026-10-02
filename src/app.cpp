@@ -14,6 +14,10 @@ namespace {
 constexpr UINT_PTR kTimerRestore = 1;
 constexpr UINT_PTR kTimerSave    = 2;
 constexpr UINT_PTR kTimerHandoff = 3;
+constexpr UINT_PTR kTimerIdle    = 4;
+// Hidden mirrors nobody watches sleep this long after saying so, so a viewer
+// who leaves and comes straight back does not cost a restart.
+constexpr UINT kIdleGraceMs = 3000;
 // Away from the console, look again now and then: the console can be between
 // sessions at the moment of a notification, and the service can start or stop.
 constexpr UINT kHandoffRecheckMs = 5000;
@@ -51,13 +55,15 @@ bool StartsOrStopsCapture(UINT msg, WPARAM wp) {
     case WM_RVM_NEW_MIRROR:
     case WM_RVM_MIRROR_CLOSED:
     case WM_RVM_MIRROR_ORPHANED:
+    case WM_RVM_MIRROR_RESTART:
+    case WM_RVM_STREAM_WANT_FRAME:
     case WM_RVM_FOREGROUND_CHANGED:
     case WM_RVM_TRAY:
     case WM_HOTKEY:
     case WM_CLOSE:
         return true;
     case WM_TIMER:
-        return wp == kTimerRestore;
+        return wp == kTimerRestore || wp == kTimerIdle;
     default:
         return false;
     }
@@ -342,6 +348,7 @@ void App::CloseAll() {
     pending_.clear();
     KillTimer(hwnd_, kTimerRestore);
     restoreTimerActive_ = false;
+    UpdateForegroundHook();
     MarkDirty();
     manager_.Refresh();
 }
@@ -409,7 +416,7 @@ bool App::SetMirrorEnabled(Mirror& mirror, bool on) {
                              TargetOfGroup(mirror.Group(), &mirror));
 }
 
-int App::TryRebindOrphans() {
+int App::TryRebindOrphans(ExeNameCache& exes) {
     Transition transition(*this);
     // By id: a nested message can retire a mirror meanwhile.
     std::vector<uint32_t> ids;
@@ -419,11 +426,23 @@ int App::TryRebindOrphans() {
     int rebound = 0;
     for (const uint32_t id : ids) {
         Mirror* m = FindMirror(id);
-        if (m && m->TryRebind(TargetsOfOtherGroups(m->Group()), TargetOfGroup(m->Group(), m))) {
+        if (m && m->TryRebind(TargetsOfOtherGroups(m->Group()), TargetOfGroup(m->Group(), m), &exes)) {
             ++rebound;
         }
     }
     return rebound;
+}
+
+// Hidden mirrors that had frames nobody wanted, and still nobody watches.
+void App::SleepIdleMirrors() {
+    Transition transition(*this);
+    std::vector<uint32_t> ids;
+    for (const auto& m : mirrors_) {
+        if (m->TakeIdleReport()) ids.push_back(m->Id());
+    }
+    for (const uint32_t id : ids) {
+        if (Mirror* m = FindMirror(id); m && !streaming_.Watched(id)) m->Sleep();
+    }
 }
 
 bool App::AnythingWaiting() const {
@@ -435,10 +454,23 @@ bool App::AnythingWaiting() const {
 }
 
 void App::EnsureRestoreTimer() {
+    UpdateForegroundHook();
     if (restoreTimerActive_ || !AnythingWaiting()) return;
     restorePeriodMs_ = kRestoreMinPeriodMs;
     restoreTimerActive_ = true;
     SetTimer(hwnd_, kTimerRestore, restorePeriodMs_, nullptr);
+}
+
+// Every foreground change system-wide wakes this thread, so only while it helps.
+void App::UpdateForegroundHook() {
+    const bool want = AnythingWaiting();
+    if (want && !foregroundHook_) {
+        foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+                                          &ForegroundChanged, 0, 0,
+                                          WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    } else if (!want && foregroundHook_) {
+        UnhookWinEvent(std::exchange(foregroundHook_, nullptr));
+    }
 }
 
 // Monitors came, went or changed resolution: desktop mirrors start over on the
@@ -498,15 +530,17 @@ int App::RunRestorePass() {
     if (now - lastRestorePassTick_ < kRestorePassMinGapMs) return 0;
     lastRestorePassTick_ = now;
 
-    const int restored = TryRestorePending() + TryRebindOrphans();
+    ExeNameCache exes;   // Shared by every search in the pass.
+    const int restored = TryRestorePending(exes) + TryRebindOrphans(exes);
     if (restored > 0) {
         MarkDirty();
         manager_.Refresh();
+        UpdateForegroundHook();
     }
     return restored;
 }
 
-int App::TryRestorePending() {
+int App::TryRestorePending(ExeNameCache& exes) {
     Transition transition(*this);
     // By id, found again after each Create, which can pump messages.
     std::vector<uint32_t> ids;
@@ -524,7 +558,7 @@ int App::TryRestorePending() {
             // A group member already showing the window takes it straight
             // away; otherwise search, never among other groups' windows.
             target = TargetOfGroup(it->state.group, nullptr);
-            if (!target) target = FindMatchingWindow(it->state, TargetsOfOtherGroups(it->state.group));
+            if (!target) target = FindMatchingWindow(it->state, TargetsOfOtherGroups(it->state.group), &exes);
             if (!target) continue;   // Kept for the next attempt.
         }
         // A mirror saved disabled needs no source yet: it takes its place in
@@ -557,7 +591,8 @@ void App::RestoreSaved() {
         return;
     }
 
-    const int restored = TryRestorePending();
+    ExeNameCache exes;
+    const int restored = TryRestorePending(exes);
     if (restored > 0) ShowBalloon(L"Restored " + Plural(restored, L"mirror", L"mirrors") + L".");
 
     EnsureRestoreTimer();
@@ -620,13 +655,26 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         OnDeviceLost();
         return 0;
 
-    case WM_RVM_STREAM_WANT_FRAME: {
-        Mirror* m = FindMirror(static_cast<uint32_t>(wp));
-        RVM_LOG_SAMPLED(100, L"app: frame wanted for mirror %u -> %s", static_cast<uint32_t>(wp),
-                        m ? (m->Orphaned() ? L"orphaned" : L"found") : L"NOT FOUND");
-        if (m) m->RepushFrame();
+    case WM_RVM_MIRROR_IDLE:
+        SetTimer(hwnd_, kTimerIdle, kIdleGraceMs, nullptr);
         return 0;
-    }
+
+    case WM_RVM_MIRROR_RESTART:
+        if (Mirror* m = FindMirror(static_cast<uint32_t>(wp))) {
+            Transition transition(*this);
+            m->RestartCapture();
+        }
+        return 0;
+
+    case WM_RVM_STREAM_WANT_FRAME:
+        if (Mirror* m = FindMirror(static_cast<uint32_t>(wp)); m && !m->Sleeping()) {
+            m->RepushFrame();
+        } else if (m && streaming_.Watched(m->Id())) {
+            Transition transition(*this);
+            m->RestartCapture();
+            m->RepushFrame();   // A minimized window's capture sends nothing at first.
+        }
+        return 0;
 
 #if RVM_LOGIN_SERVICE
     case WM_WTSSESSION_CHANGE:
@@ -643,6 +691,9 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
 #endif
         if (wp == kTimerSave) {
             SaveNow();
+        } else if (wp == kTimerIdle) {
+            KillTimer(hwnd_, kTimerIdle);
+            SleepIdleMirrors();
         } else if (wp == kTimerRestore) {
             KillTimer(hwnd_, kTimerRestore);
             restoreTimerActive_ = false;
@@ -653,6 +704,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
                 restoreTimerActive_ = true;
                 SetTimer(hwnd_, kTimerRestore, restorePeriodMs_, nullptr);
             }
+            UpdateForegroundHook();
         }
         return 0;
 
@@ -680,6 +732,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         SaveNow();   // Placements, before anything is torn down.
         streaming_.Shutdown();   // Before the mirrors its frame tees point at.
         KillTimer(hwnd_, kTimerRestore);
+        KillTimer(hwnd_, kTimerIdle);
 #if RVM_LOGIN_SERVICE
         KillTimer(hwnd_, kTimerHandoff);
         WatchSessionChanges(hwnd_, false);
@@ -729,10 +782,6 @@ int App::Run(bool relaunched) {
         }
     }
 
-    foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
-                                      &ForegroundChanged, 0, 0,
-                                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-
     RestoreSaved();
 
     Streaming::Hooks hooks;
@@ -760,7 +809,7 @@ int App::Run(bool relaunched) {
     }
     retired_.clear();
 
-    if (foregroundHook_) UnhookWinEvent(foregroundHook_);
+    if (foregroundHook_) UnhookWinEvent(std::exchange(foregroundHook_, nullptr));
     g_appWindow = nullptr;
     UnregisterHotKey(hwnd_, kHotkeyNewMirror);
     UnregisterHotKey(hwnd_, kHotkeyCloseAll);
