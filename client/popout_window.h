@@ -6,12 +6,10 @@ namespace rvm {
 // Posted to the window given to Create() when the user acts on a pop-out.
 // wParam is a PopoutEvent, lParam the token given to Create().
 constexpr UINT WM_RVM_POPOUT_EVENT = WM_APP + 21;
-enum class PopoutEvent : WPARAM { ReturnToGrid = 1, Changed };
+enum class PopoutEvent : WPARAM { ReturnToCanvas = 1, Changed };
 
-// A stream in its own borderless always-on-top window, behaving like the
-// app's local mirror: drag to move, edge-resize with locked proportions and a
-// detent at 100%, double-click for 100%, right-click for zoom, opacity and
-// click-through. It owns nothing: the client window feeds it frames.
+// A stream in its own borderless always-on-top window, handled like the app's
+// local mirror window. The client window feeds it frames.
 class PopoutWindow : public D2DOverlay {
 public:
     struct Settings {
@@ -25,8 +23,7 @@ public:
                 HWND placeNear);
     Settings CurrentSettings() const;
 
-    // The latest decoded frame; call Invalidate() afterwards. The native size
-    // follows the stream, so the 100% detent is always the real size.
+    // Call Invalidate() afterwards. The 100% size follows the stream.
     void SetFrame(const winrt::com_ptr<ID3D11Texture2D>& texture, UINT width, UINT height,
                   uint64_t frames);
     // Shown until the first frame arrives.
