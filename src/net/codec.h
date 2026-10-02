@@ -176,7 +176,13 @@ public:
     UINT Width()  const { return width_; }
     UINT Height() const { return height_; }
 
-    bool Decode(const uint8_t* data, size_t len, std::vector<DecodedFrame>& out);
+    // Decoding in two steps: Stage copies an access unit in, which needs no
+    // device lock; Decode feeds it to the decoder, which does.
+    bool Stage(const uint8_t* data, size_t len);
+    bool Decode(std::vector<DecodedFrame>& out);
+    bool Decode(const uint8_t* data, size_t len, std::vector<DecodedFrame>& out) {
+        return Stage(data, len) && Decode(out);
+    }
 
 private:
     bool NegotiateOutput();
@@ -185,6 +191,7 @@ private:
     winrt::com_ptr<IMFTransform> mft_;
     winrt::com_ptr<IMFSample>      inSample_;   // Reused while the decoder has let go of it.
     winrt::com_ptr<IMFMediaBuffer> inBuffer_;
+    bool  staged_ = false;
     DWORD inputId_ = 0, outputId_ = 0;
     bool  providesSamples_ = false;
     UINT  width_ = 0, height_ = 0;   // Display size, after cropping.

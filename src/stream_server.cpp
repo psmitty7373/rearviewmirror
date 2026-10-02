@@ -1,5 +1,7 @@
 #include "stream_server.h"
 
+#include <bitset>
+
 namespace rvm {
 
 using namespace net;
@@ -80,6 +82,15 @@ int64_t NowUs() {
     return c.QuadPart / frequency * 1'000'000 + (c.QuadPart % frequency) * 1'000'000 / frequency;
 }
 
+// The network thread's clock. It sleeps until exact deadlines, which the tick
+// count, in 15.6 ms steps, could read as not yet due.
+uint64_t NetMs() {
+    return static_cast<uint64_t>(NowUs() / 1000);
+}
+
+// Datagrams handled per wake, between deadline checks.
+constexpr int kMaxDrain = 64;
+
 uint32_t RandomSession() {
     uint32_t id = 0;
     do { RandomBytes(&id, sizeof(id)); } while (id == 0);
@@ -104,9 +115,12 @@ std::string TruncateUtf8(std::string s, size_t max) {
 }  // namespace
 
 struct StreamServer::Client {
+    Client() { sealed.reserve(kMaxDatagram); }
+
     Endpoint endpoint;
     std::mutex sendMutex;   // Seal + send are one unit: the counter must not interleave.
     SecureChannel channel;
+    std::vector<uint8_t> sealed;   // Under sendMutex: the datagram being sent, reused.
 
     // Net thread only.
     std::set<uint32_t> subscriptions;
@@ -188,7 +202,9 @@ struct StreamServer::Stream : std::enable_shared_from_this<StreamServer::Stream>
     H264Encoder encoder;        // Encode thread only.
     uint32_t seq = 0;
 
-    std::mutex senderMutex;     // Packetize (encode thread) vs NACK (net thread).
+    // Only around Add (encode thread) and Find (net thread): the frames they
+    // return are sealed and sent without it.
+    std::mutex senderMutex;
     FrameSender sender;
 
     std::mutex subsMutex;
@@ -219,7 +235,12 @@ bool StreamServer::Start(const StreamSettings& settings) {
     const EncoderChoice encoder = ChooseEncoder();
     software_ = forceSoftware_ || encoder.kind == EncoderKind::Software;
     admitTokens_ = kAdmitBurst;
-    admitRefillMs_ = NowMs();
+    admitRefillMs_ = NetMs();
+    expireDueMs_ = keyframeDueMs_ = UINT64_MAX;
+#if RVM_REMOTE_CONTROL
+    leaseDueMs_ = UINT64_MAX;
+#endif
+    listChanged_ = false;
     ResetEvent(frameEvent_);
     running_ = true;
     netThread_ = std::thread([this] { NetLoop(); });
@@ -236,6 +257,7 @@ void StreamServer::Stop() {
         return;
     }
     if (frameEvent_) SetEvent(frameEvent_);
+    socket_.Wake();
     if (netThread_.joinable()) netThread_.join();
 #if RVM_REMOTE_CONTROL
     control_.Reset();
@@ -303,6 +325,7 @@ void StreamServer::RequestFrame(uint32_t mirrorId) {
 void StreamServer::ForceKeyframe(Stream& s, uint64_t nowMs) {
     if (nowMs < s.nextKeyframeMs) {
         s.keyframeDeferred = true;
+        keyframeDueMs_ = (std::min)(keyframeDueMs_, s.nextKeyframeMs);
         return;
     }
     s.keyframeDeferred = false;
@@ -311,15 +334,19 @@ void StreamServer::ForceKeyframe(Stream& s, uint64_t nowMs) {
     RequestFrame(s.mirrorId);   // The source may be still; a keyframe needs a frame.
 }
 
-void StreamServer::ServiceDeferredKeyframes(uint64_t nowMs) {
+uint64_t StreamServer::ServiceDeferredKeyframes(uint64_t nowMs) {
     std::vector<std::shared_ptr<Stream>> due;
+    uint64_t next = UINT64_MAX;
     {
         std::lock_guard lock(streamsMutex_);
         for (auto& [id, s] : streams_) {
-            if (s->keyframeDeferred && nowMs >= s->nextKeyframeMs) due.push_back(s);
+            if (!s->keyframeDeferred) continue;
+            if (nowMs >= s->nextKeyframeMs) due.push_back(s);
+            else next = (std::min)(next, s->nextKeyframeMs);
         }
     }
     for (auto& s : due) ForceKeyframe(*s, nowMs);
+    return next;
 }
 
 void StreamServer::SetMirrorList(std::vector<MirrorInfo> list) {
@@ -330,6 +357,8 @@ void StreamServer::SetMirrorList(std::vector<MirrorInfo> list) {
         mirrorList_ = std::move(list);
     }
     if (!running_) return;
+    listChanged_ = true;   // Subscriptions and control to what left the list end.
+    socket_.Wake();
 
     std::vector<std::shared_ptr<Client>> clients;
     {
@@ -373,11 +402,10 @@ std::shared_ptr<StreamServer::Stream> StreamServer::AcquireStream(uint32_t mirro
     return slot;
 }
 
-void StreamServer::SendTo(Client& client, const std::vector<uint8_t>& plain) {
+void StreamServer::SendTo(Client& client, const uint8_t* plain, size_t len) {
     std::lock_guard lock(client.sendMutex);
-    std::vector<uint8_t> datagram;
-    if (client.channel.Seal(plain.data(), plain.size(), datagram)) {
-        socket_.SendTo(client.endpoint, datagram.data(), datagram.size());
+    if (client.channel.Seal(plain, len, client.sealed)) {
+        socket_.SendTo(client.endpoint, client.sealed.data(), client.sealed.size());
     }
 }
 
@@ -845,16 +873,16 @@ void StreamServer::SendFrames(Stream& s, const std::vector<EncodedFrame>& frames
 
     for (const auto& f : frames) {
         const uint32_t seq = ++s.seq;
-        std::lock_guard sender(s.senderMutex);
-        const auto& packets = s.sender.Packetize(seq, f.keyframe, f.data.data(), f.data.size());
+        std::shared_ptr<const PacketizedFrame> packets;
+        {
+            std::lock_guard sender(s.senderMutex);
+            packets = s.sender.Add(seq, f.keyframe, f.data.data(), f.data.size());
+        }
+        if (!packets) continue;
+        // Packet by packet, so the network thread's replies to this client
+        // need not wait for a whole keyframe.
         for (auto& c : targets) {
-            std::lock_guard send(c->sendMutex);
-            std::vector<uint8_t> datagram;
-            for (const auto& p : packets) {
-                if (c->channel.Seal(p.data(), p.size(), datagram)) {
-                    socket_.SendTo(c->endpoint, datagram.data(), datagram.size());
-                }
-            }
+            for (const auto p : *packets) SendTo(*c, p.data(), p.size());
         }
     }
 }
@@ -905,25 +933,43 @@ void StreamServer::NetLoop() {
     }
 
     std::vector<uint8_t> buffer(kMaxDatagram + 64);
-    uint64_t lastSweep = NowMs();
-    uint64_t lastKeyframeService = lastSweep;
 
+    // Sleeps until a datagram, a wake from another thread, or the earliest
+    // deadline: with no clients and nothing deferred, indefinitely.
     while (running_) {
-        Endpoint from;
-        const int n = socket_.Receive(buffer.data(), buffer.size(), from, 5);
-        const uint64_t now = NowMs();
-        if (n > 0) HandleDatagram(from, buffer.data(), static_cast<size_t>(n), now);
-        if (now - lastKeyframeService >= 25) {
+        const uint64_t now = NetMs();
+        const bool listChanged = listChanged_.exchange(false);
+        if (listChanged) DropUnlistedSubscriptions();
+        if (now >= keyframeDueMs_) keyframeDueMs_ = ServiceDeferredKeyframes(now);
+        if (now >= expireDueMs_) expireDueMs_ = Expire(now);
+        uint64_t due = (std::min)(keyframeDueMs_, expireDueMs_);
 #if RVM_REMOTE_CONTROL
+        // A lease ends, keys and buttons released, once its holder falls
+        // silent or its mirror stops being controllable.
+        if (listChanged || now >= leaseDueMs_) {
             control_.Poll(now, [this](uintptr_t peer, uint32_t id) { return ControlAllowed(peer, id); });
-#endif
-            ServiceDeferredKeyframes(now);
-            lastKeyframeService = now;
+            if (now >= leaseDueMs_) leaseDueMs_ = UINT64_MAX;
         }
-        if (now - lastSweep > 1000) {
-            ExpireClients(now);
-            DropUnlistedSubscriptions();
-            lastSweep = now;
+        due = (std::min)(due, leaseDueMs_);
+#endif
+
+        const uint64_t after = NetMs();
+        const DWORD wait = due == UINT64_MAX ? INFINITE
+                         : static_cast<DWORD>((std::min)(due > after ? due - after : 0, uint64_t{ 60'000 }));
+        const auto ready = socket_.Wait(wait);
+        netWakeups_.fetch_add(1, std::memory_order_relaxed);
+        if (ready == UdpSocket::WaitResult::Error) {
+            // A broken socket must not make this a busy loop.
+            Sleep(50);
+            continue;
+        }
+        if (ready != UdpSocket::WaitResult::Readable) continue;
+
+        for (int i = 0; i < kMaxDrain && running_; ++i) {
+            Endpoint from;
+            const int n = socket_.Receive(buffer.data(), buffer.size(), from, 0);
+            if (n <= 0) break;
+            HandleDatagram(from, buffer.data(), static_cast<size_t>(n), NetMs());
         }
     }
 }
@@ -953,6 +999,7 @@ void StreamServer::HandleDatagram(const Endpoint& from, const uint8_t* data, siz
         pending_.erase(it);
         if (!Promote(client)) return;
         client->lastSeenMs = nowMs;
+        expireDueMs_ = (std::min)(expireDueMs_, nowMs + kClientTimeoutMs + 1);
         Reader r(plain.data(), plain.size());
         HandleMessage(client, r, nowMs);
         return;
@@ -1052,6 +1099,7 @@ void StreamServer::Handshake(const Endpoint& from, const uint8_t* data, size_t l
     Pending p{ client, clientSession, {}, datagram, nowMs };
     memcpy(p.clientRandom, clientRandom, kRandomBytes);
     pending_.push_back(std::move(p));
+    expireDueMs_ = (std::min)(expireDueMs_, nowMs + kPendingTimeoutMs + 1);
 
     recentHellos_.insert(id);
     recentHelloOrder_.push_back({ id, nowMs });
@@ -1166,6 +1214,7 @@ void StreamServer::HandleMessage(const std::shared_ptr<Client>& client, Reader& 
         const uintptr_t peer = reinterpret_cast<uintptr_t>(client.get());
         const auto reply = control_.Handle(peer, r, nowMs, ControlAllowed(peer, id));
         if (!reply.empty()) SendTo(*client, reply);
+        leaseDueMs_ = nowMs + kControlLeaseMs;   // No lease outlives this unrenewed.
         break;
     }
 #endif
@@ -1224,8 +1273,8 @@ void StreamServer::HandleMessage(const std::shared_ptr<Client>& client, Reader& 
 }
 
 // Resends only for a stream the client watches, each packet at most once per
-// NACK, within the client's retransmit budget. The packets are copied out so
-// the encoder is never held up while they are sealed and sent.
+// NACK, within the client's retransmit budget. The frame is shared, so the
+// encoder is never held up while its packets are sealed and sent.
 void StreamServer::HandleNack(Client& client, Reader& r, uint64_t nowMs) {
     uint32_t id = 0, seq = 0;
     uint16_t count = 0;
@@ -1238,28 +1287,28 @@ void StreamServer::HandleNack(Client& client, Reader& r, uint64_t nowMs) {
                                      (nowMs - client.resendRefillMs) * kResendPerSec / 1000.0);
     client.resendRefillMs = nowMs;
 
-    std::vector<std::vector<uint8_t>> resend;
+    std::shared_ptr<const PacketizedFrame> packets;
     {
         std::lock_guard sender(s->senderMutex);
-        const auto* packets = s->sender.Packets(seq);
-        if (!packets) return;
-        std::vector<bool> seen(packets->size(), false);
-        for (uint16_t i = 0; i < count && client.resendTokens >= 1.0; ++i) {
-            uint16_t idx = 0;
-            if (!r.U16(idx)) break;
-            if (idx >= packets->size() || seen[idx]) continue;
-            seen[idx] = true;
-            resend.push_back((*packets)[idx]);
-            client.resendTokens -= 1.0;
-        }
+        packets = s->sender.Find(seq);
     }
-    for (const auto& p : resend) SendTo(client, p);
+    if (!packets) return;
+    std::bitset<kMaxFramePackets> seen;
+    for (uint16_t i = 0; i < count && client.resendTokens >= 1.0; ++i) {
+        uint16_t idx = 0;
+        if (!r.U16(idx)) break;
+        if (idx >= packets->size() || seen[idx]) continue;
+        seen[idx] = true;
+        const auto p = (*packets)[idx];
+        SendTo(client, p.data(), p.size());
+        client.resendTokens -= 1.0;
+    }
 }
 
 void StreamServer::DropSubscription(const std::shared_ptr<Client>& client, uint32_t mirrorId) {
     if (!client->subscriptions.erase(mirrorId)) return;
 #if RVM_REMOTE_CONTROL
-    control_.Poll(NowMs(), [this](uintptr_t peer, uint32_t id) { return ControlAllowed(peer, id); });
+    control_.Poll(NetMs(), [this](uintptr_t peer, uint32_t id) { return ControlAllowed(peer, id); });
 #endif
     if (auto s = FindStream(mirrorId)) {
         {
@@ -1323,12 +1372,14 @@ bool StreamServer::ControlAllowed(uintptr_t peer, uint32_t mirrorId) {
 }
 #endif
 
-void StreamServer::ExpireClients(uint64_t nowMs) {
+uint64_t StreamServer::Expire(uint64_t nowMs) {
+    uint64_t next = UINT64_MAX;
     std::vector<std::shared_ptr<Client>> stale;
     {
         std::lock_guard lock(clientsMutex_);
         for (auto& c : clients_) {
             if (nowMs - c->lastSeenMs > kClientTimeoutMs) stale.push_back(c);
+            else next = (std::min)(next, c->lastSeenMs + kClientTimeoutMs + 1);
         }
     }
     for (auto& c : stale) RemoveClient(c);
@@ -1337,6 +1388,9 @@ void StreamServer::ExpireClients(uint64_t nowMs) {
                        return nowMs - p.createdMs > kPendingTimeoutMs;
                    }),
                    pending_.end());
+    for (const auto& p : pending_) next = (std::min)(next, p.createdMs + kPendingTimeoutMs + 1);
+    ExpireRecentHellos(nowMs);
+    return next;
 }
 
 }  // namespace rvm

@@ -945,6 +945,7 @@ void H264Decoder::Shutdown() {
     mft_ = nullptr;
     inSample_ = nullptr;
     inBuffer_ = nullptr;
+    staged_ = false;
     width_ = height_ = 0;
     frameIndex_ = 0;
 }
@@ -1080,7 +1081,10 @@ bool H264Decoder::Drain(std::vector<DecodedFrame>& out) {
     }
 }
 
-bool H264Decoder::Decode(const uint8_t* data, size_t len, std::vector<DecodedFrame>& out) {
+// The input sample is system memory, and only this thread hands it to the
+// decoder, so staging touches nothing the device lock guards.
+bool H264Decoder::Stage(const uint8_t* data, size_t len) {
+    staged_ = false;
     if (!mft_ || !data || len == 0 || len > (1u << 30)) return false;
     const DWORD size = static_cast<DWORD>(len);
 
@@ -1100,7 +1104,12 @@ bool H264Decoder::Decode(const uint8_t* data, size_t len, std::vector<DecodedFra
     inSample_->SetSampleTime(frameIndex_ * duration);
     inSample_->SetSampleDuration(duration);
     ++frameIndex_;
+    staged_ = true;
+    return true;
+}
 
+bool H264Decoder::Decode(std::vector<DecodedFrame>& out) {
+    if (!mft_ || !std::exchange(staged_, false)) return false;
     HRESULT hr = mft_->ProcessInput(inputId_, inSample_.get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
         if (!Drain(out)) return false;

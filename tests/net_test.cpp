@@ -1775,6 +1775,114 @@ static void TestEncodeWakeups() {
     server.Stop();
 }
 
+// The server's network thread sleeps until it has work: idle, it never wakes.
+// On the CPU path, so it runs on any machine: a keyframe request inside the
+// gap is still served when the gap ends, a NACK is answered, and a mirror
+// leaving the list is dropped at once.
+static void TestServerNetLoop() {
+    printf("server network thread\n");
+    auto& g = Gfx::Get();
+    const std::wstring key = L"net-loop-test-key";
+    const uint8_t a[3]{ 40, 170, 230 }, b[3]{ 200, 80, 50 };
+    const auto source = SplitSource(320, 240, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, a, b);
+    const RECT crop{ 0, 0, 320, 240 };
+
+    StreamSettings settings;
+    settings.enabled = true;
+    settings.port = 0;
+    settings.key = key;
+    settings.bitrateKbps = 1000;
+    settings.fps = 30;
+
+    StreamServer server;
+    server.ForceSoftwareEncoding(true);
+    std::mutex requestsMutex;
+    std::vector<ULONGLONG> requests;
+    server.SetFrameRequester([&](uint32_t id) {
+        {
+            std::lock_guard lock(requestsMutex);
+            requests.push_back(GetTickCount64());
+        }
+        std::lock_guard<std::mutex> lock(g.deviceMutex);
+        server.SubmitFrame(id, source.get(), crop);
+    });
+    const auto requestsBetween = [&](ULONGLONG from, ULONGLONG to) {
+        std::lock_guard lock(requestsMutex);
+        return std::count_if(requests.begin(), requests.end(),
+                             [&](ULONGLONG t) { return t >= from && t <= to; });
+    };
+    Check(server.Start(settings), "server starts");
+    // Kept for the thread: it wakes once to act on it, after deriving the key.
+    server.SetMirrorList({ { 1, L"Net", 320, 240 } });
+    Check(WaitFor([&] { return server.NetWakeups() >= 1; }, 5000), "the list change wakes the network thread");
+    const uint64_t idle = server.NetWakeups();
+    Sleep(1000);
+    printf("  idle for 1 s: %llu wakeups\n", static_cast<unsigned long long>(server.NetWakeups() - idle));
+    Check(server.NetWakeups() == idle, "with no clients, the network thread does not wake");
+
+    if (!SoftwareEncoder()) {
+        printf("  SKIP  no software H.264 encoder on this machine\n");
+        server.Stop();
+        return;
+    }
+    RawPeer peer;
+    Check(peer.Open(server.Port(), key) && peer.Handshake() && peer.PingPong(), "raw peer admitted");
+    SendId(peer, Msg::Subscribe, 1);
+    uint32_t seq = 0;
+    for (const auto& m : peer.Collect(1500)) {
+        Reader r(m.data(), m.size());
+        uint8_t type = 0;
+        FrameHeader h;
+        if (r.U8(type) && type == static_cast<uint8_t>(Msg::Frame) && ReadFrameHeader(r, h)) seq = h.frameSeq;
+    }
+    Check(seq != 0, "the subscriber's first frame arrives");
+
+    // One request is served at once; the rest, inside the gap, at its end.
+    const ULONGLONG flood = GetTickCount64();
+    for (int i = 0; i < 20; ++i) SendId(peer, Msg::KeyframeReq, 1);
+    peer.Collect(600);
+    const auto atOnce = requestsBetween(flood, flood + 100);
+    const auto deferred = requestsBetween(flood + 150, flood + 450);
+    printf("  20 keyframe requests -> %lld at once, %lld at the gap's end\n",
+           static_cast<long long>(atOnce), static_cast<long long>(deferred));
+    Check(atOnce >= 1 && deferred >= 1 && atOnce + deferred <= 4,
+          "keyframe requests inside the gap are deferred to its end, not dropped");
+
+    const auto nack = [&](uint32_t mirror) {
+        Writer w;
+        w.U8(static_cast<uint8_t>(Msg::Nack));
+        w.U32(mirror);
+        w.U32(seq);
+        w.U16(500);
+        for (int i = 0; i < 500; ++i) w.U16(0);
+        peer.Send(w);
+        int resent = 0;
+        for (const auto& m : peer.Collect(300)) {
+            Reader r(m.data(), m.size());
+            uint8_t type = 0;
+            FrameHeader h;
+            if (r.U8(type) && type == static_cast<uint8_t>(Msg::Frame) && ReadFrameHeader(r, h) &&
+                h.frameSeq == seq && h.pktIdx == 0) {
+                ++resent;
+            }
+        }
+        return resent;
+    };
+    Check(nack(1) == 1, "a NACK repeating one index resends it once");
+    Check(nack(5) == 0, "a NACK for an unwatched mirror resends nothing");
+
+    const uint64_t quiet = server.NetWakeups();
+    Sleep(1000);
+    Check(server.NetWakeups() - quiet <= 1, "a silent client and a still stream do not wake it either");
+
+    server.SetMirrorList({});
+    Check(WaitFor([&] { return server.StreamCount() == 0; }, 500), "a mirror leaving the list is dropped at once");
+
+    const ULONGLONG stopping = GetTickCount64();
+    server.Stop();
+    Check(GetTickCount64() - stopping < 500, "stopping does not wait out the network thread's sleep");
+}
+
 // Everything the audit found a client could abuse, tried against a live
 // server: each must stay bounded.
 static void TestHostileClients() {
@@ -2510,6 +2618,7 @@ int main(int argc, char** argv) {
         TestClientWakes();
         TestSoftwareLoopback();
         TestEncodeWakeups();
+        TestServerNetLoop();
         TestHostileClients();
         TestEncoderSessionLimit();
         TestFrameRateCap();

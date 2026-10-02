@@ -68,6 +68,8 @@ public:
     // For tests: encode on the CPU even where a hardware encoder exists.
     // Takes effect at the next Start().
     void ForceSoftwareEncoding(bool on) { forceSoftware_ = on; }
+    // For tests: how often the network thread has woken.
+    uint64_t NetWakeups() const { return netWakeups_.load(); }
 
 private:
     struct Client;
@@ -105,7 +107,7 @@ private:
     void SendStreamState(Client& client, const Stream& s);
     int  OtherOpenEncoders(const Stream& self);
     void ForceKeyframe(Stream& s, uint64_t nowMs);
-    void ServiceDeferredKeyframes(uint64_t nowMs);
+    uint64_t ServiceDeferredKeyframes(uint64_t nowMs);   // When the next one falls due.
 
     void HandleDatagram(const net::Endpoint& from, const uint8_t* data, size_t len, uint64_t nowMs);
     void Handshake(const net::Endpoint& from, const uint8_t* data, size_t len, uint64_t nowMs);
@@ -113,7 +115,8 @@ private:
     bool AdmissionAllowed(uint64_t nowMs);
     void HandleMessage(const std::shared_ptr<Client>& client, net::Reader& r, uint64_t nowMs);
     void HandleNack(Client& client, net::Reader& r, uint64_t nowMs);
-    void SendTo(Client& client, const std::vector<uint8_t>& plain);
+    void SendTo(Client& client, const uint8_t* plain, size_t len);
+    void SendTo(Client& client, const std::vector<uint8_t>& plain) { SendTo(client, plain.data(), plain.size()); }
     void SendListTo(Client& client);
     bool MirrorListed(uint32_t mirrorId);
 #if RVM_REMOTE_CONTROL
@@ -123,7 +126,9 @@ private:
     void DropSubscription(const std::shared_ptr<Client>& client, uint32_t mirrorId);
     void DropUnlistedSubscriptions();
     void RemoveClient(const std::shared_ptr<Client>& client);
-    void ExpireClients(uint64_t nowMs);
+    // Drops silent clients and stale handshakes; returns when the next would
+    // expire. Old HELLOs go too, but never need a wake of their own.
+    uint64_t Expire(uint64_t nowMs);
 
     std::shared_ptr<Client> FindClient(const net::Endpoint& endpoint);
     std::shared_ptr<Stream> FindStream(uint32_t mirrorId);
@@ -155,6 +160,16 @@ private:
     std::deque<HelloSeen> recentHelloOrder_;
     double   admitTokens_ = 0.0;     // Net thread only.
     uint64_t admitRefillMs_ = 0;
+
+    // Net thread: when it next has work of its own, UINT64_MAX for none. The
+    // expiry deadline may be early (clients refresh it), never late.
+    uint64_t expireDueMs_ = UINT64_MAX;
+    uint64_t keyframeDueMs_ = UINT64_MAX;
+#if RVM_REMOTE_CONTROL
+    uint64_t leaseDueMs_ = UINT64_MAX;
+#endif
+    std::atomic<bool> listChanged_{ false };
+    std::atomic<uint64_t> netWakeups_{ 0 };
 
     mutable std::mutex streamsMutex_;
     std::map<uint32_t, std::shared_ptr<Stream>> streams_;

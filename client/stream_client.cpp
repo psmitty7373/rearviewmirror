@@ -712,10 +712,10 @@ void StreamClient::DecodeOne(Stream& s, FrameAssembler::Frame& frame) {
 
     auto& g = Gfx::Get();
     std::vector<DecodedFrame> decoded;
-    bool ok = false;
-    {
+    bool ok = s.decoder.Stage(frame.data.data(), frame.data.size());
+    if (ok) {
         std::lock_guard device(g.deviceMutex);
-        ok = s.decoder.Decode(frame.data.data(), frame.data.size(), decoded);
+        ok = s.decoder.Decode(decoded);
     }
     RVM_LOG_SAMPLED(300, L"client: decode mirror %u seq %u %zu bytes%s -> ok=%d out=%zu", s.id,
                     frame.frameSeq, frame.data.size(), frame.keyframe ? L" (keyframe)" : L"",
