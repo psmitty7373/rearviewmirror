@@ -225,13 +225,13 @@ LRESULT PopoutWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd_, 0 };
             TrackMouseEvent(&tme);
             hovered_ = true;
-            Render();
+            Invalidate();
         }
         return 0;
 
     case WM_MOUSELEAVE:
         hovered_ = false;
-        Render();
+        Invalidate();
         return 0;
 
     case WM_DPICHANGED:

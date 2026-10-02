@@ -39,22 +39,27 @@ public:
 
     LRESULT OnMessage(UINT msg, WPARAM wp, LPARAM lp) override {
         switch (msg) {
-        case WM_SETCURSOR:
-            SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+        case WM_SETCURSOR: {
+            static const HCURSOR cross = LoadCursorW(nullptr, IDC_CROSS);
+            SetCursor(cross);
             return TRUE;
+        }
 
         case WM_LBUTTONDOWN:
             if (GetTickCount64() - shownAt < kArmDelayMs) return 0;
             SetCapture(Hwnd());
             dragging = true;
             anchor = cursor = POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            Render();
+            Invalidate();
             return 0;
 
         case WM_MOUSEMOVE:
             if (dragging) {
-                cursor = POINT{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-                Render();
+                const POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                if (pt.x != cursor.x || pt.y != cursor.y) {
+                    cursor = pt;
+                    Invalidate();
+                }
             }
             return 0;
 
@@ -97,21 +102,18 @@ protected:
         const float w = static_cast<float>(Width());
         const float h = static_cast<float>(Height());
 
-        brush_->SetColor(D2D1::ColorF(0.02f, 0.03f, 0.05f, 0.55f));
+        dc->Clear(D2D1::ColorF(0.02f, 0.03f, 0.05f, 0.55f));
 
         const RECT sel = CurrentRect();
         const bool haveRect = RectW(sel) > 0 && RectH(sel) > 0;
 
-        if (!haveRect) {
-            dc->FillRectangle(D2D1::RectF(0, 0, w, h), brush_.get());
-        } else {
+        if (haveRect) {
             // Dim around the selection so the chosen content stays legible.
             const float l = static_cast<float>(sel.left),  t = static_cast<float>(sel.top);
             const float r = static_cast<float>(sel.right), b = static_cast<float>(sel.bottom);
-            dc->FillRectangle(D2D1::RectF(0, 0, w, t), brush_.get());
-            dc->FillRectangle(D2D1::RectF(0, b, w, h), brush_.get());
-            dc->FillRectangle(D2D1::RectF(0, t, l, b), brush_.get());
-            dc->FillRectangle(D2D1::RectF(r, t, w, b), brush_.get());
+            dc->PushAxisAlignedClip(D2D1::RectF(l, t, r, b), D2D1_ANTIALIAS_MODE_ALIASED);
+            dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+            dc->PopAxisAlignedClip();
 
             brush_->SetColor(D2D1::ColorF(kAccentR, kAccentG, kAccentB, 0.95f));
             dc->DrawRectangle(D2D1::RectF(l + 0.5f, t + 0.5f, r - 0.5f, b - 0.5f), brush_.get(), 1.5f);
@@ -127,9 +129,9 @@ protected:
             };
             for (const auto& tr : ticks) dc->FillRectangle(tr, brush_.get());
 
-            const int cw = static_cast<int>(std::lround(RectW(sel) * scaleX));
-            const int ch = static_cast<int>(std::lround(RectH(sel) * scaleY));
-            const std::wstring label = std::to_wstring(cw) + L" × " + std::to_wstring(ch);
+            wchar_t label[40]{};
+            _snwprintf_s(label, _TRUNCATE, L"%ld × %ld", std::lround(RectW(sel) * scaleX),
+                         std::lround(RectH(sel) * scaleY));
             // Above the frame, else below it, else inside its bottom-left
             // corner when the frame fills the window.
             if (t > 34.0f)          DrawChip(dc, label, l, t - 8.0f, 0, 2);

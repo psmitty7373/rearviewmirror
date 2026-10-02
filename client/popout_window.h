@@ -25,12 +25,14 @@ public:
                 HWND placeNear);
     Settings CurrentSettings() const;
 
-    // The latest decoded frame; call Render() afterwards. The native size
+    // The latest decoded frame; call Invalidate() afterwards. The native size
     // follows the stream, so the 100% detent is always the real size.
     void SetFrame(const winrt::com_ptr<ID3D11Texture2D>& texture, UINT width, UINT height,
                   uint64_t frames);
     // Shown until the first frame arrives.
-    void SetWaitingText(std::wstring text) { waitingText_ = std::move(text); }
+    void SetWaitingText(std::wstring_view text) {
+        if (waitingText_ != text) waitingText_.assign(text);
+    }
     void SetClickThrough(bool on);
     bool ClickThrough() const { return clickThrough_; }
 

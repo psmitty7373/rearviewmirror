@@ -101,6 +101,7 @@ void ManagerWindow::Open(App* app) {
     ApplyTitleBarTheme(Hwnd());
     EnsureFonts();
 
+    Snapshot();
     ShowWindow(Hwnd(), SW_SHOW);
     SetForegroundWindow(Hwnd());
     Render();
@@ -108,7 +109,8 @@ void ManagerWindow::Open(App* app) {
 
 void ManagerWindow::Refresh() {
     if (!IsOpen()) return;
-    Render();
+    Snapshot();
+    Invalidate();
 }
 
 void ManagerWindow::EnsureFonts() {
@@ -129,14 +131,16 @@ void ManagerWindow::EnsureFonts() {
     make(11.5f, DWRITE_FONT_WEIGHT_NORMAL,    smallFont_);
 }
 
-// Snapshot the model on the UI thread before the device lock is taken.
-void ManagerWindow::PrepareDraw() {
+void ManagerWindow::Snapshot() {
     cards_.clear();
     if (!app_) return;
 
     streamingAvailable_ = app_->StreamingAvailable();
-    streamingOn_     = app_->StreamingOn();
-    streamClients_   = app_->StreamClients();
+    streamingOn_ = app_->StreamingOn();
+    streamingLabel_ = L"Streaming";
+    if (const size_t clients = app_->StreamClients(); streamingOn_ && clients > 0) {
+        streamingLabel_ += L" (" + std::to_wstring(clients) + L")";
+    }
     for (size_t i = 0; i < app_->MirrorCount(); ++i) {
         const Mirror* m = app_->MirrorAt(i);
         if (!m) continue;
@@ -162,6 +166,7 @@ void ManagerWindow::PrepareDraw() {
         else if (card.hidden)     card.subtitle += L"  ·  hidden, still capturing";
         cards_.push_back(std::move(card));
     }
+    heading_ = Plural(static_cast<int>(cards_.size()), L"mirror", L"mirrors");
     ClampScroll();
 }
 
@@ -286,7 +291,7 @@ void ManagerWindow::EndSliderDrag() {
         }
     }
     active_ = Hit{};
-    Render();
+    Invalidate();
 }
 
 void ManagerWindow::ApplySliderDrag(POINT pt) {
@@ -306,14 +311,19 @@ void ManagerWindow::ApplySliderDrag(POINT pt) {
     if (span <= 1.0f) return;
 
     const float t = Clampf((static_cast<float>(pt.x) - track.left) / span, 0.0f, 1.0f);
+    if (t == dragT_) return;   // Moved only vertically.
+    dragT_ = t;
+    CardView& card = cards_[static_cast<size_t>(index)];
     if (active_.part == Part::Opacity) {
         m->SetOpacity(0.05f + t * 0.95f, /*persist=*/false);
+        card.opacity = m->Opacity();
     } else {
         float scale = TToScale(t);
         if (std::fabs(scale - 1.0f) < 0.04f) scale = 1.0f;   // Same detent as edge resize.
         m->SetZoom(scale, /*persist=*/false);
+        card.scale = m->CurrentScale();
     }
-    Render();
+    Invalidate();
 }
 
 LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
@@ -322,6 +332,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const UINT w = LOWORD(lp), h = HIWORD(lp);
         if (w > 0 && h > 0) {
             ResizeSurface(w, h);
+            ClampScroll();
             Render();
         }
         return 0;
@@ -348,7 +359,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const RECT* suggested = reinterpret_cast<RECT*>(lp);
         SetWindowPos(Hwnd(), nullptr, suggested->left, suggested->top,
                      RectW(*suggested), RectH(*suggested), SWP_NOZORDER | SWP_NOACTIVATE);
-        Render();
+        Invalidate();
         return 0;
     }
 
@@ -366,7 +377,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         const Hit hit = HitTest(pt);
         if (!(hit == hot_)) {
             hot_ = hit;
-            Render();
+            Invalidate();
         }
         return 0;
     }
@@ -374,7 +385,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE:
         mouseTracked_ = false;
         hot_ = Hit{};
-        Render();
+        Invalidate();
         return 0;
 
     case WM_LBUTTONDOWN: {
@@ -382,10 +393,11 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         active_ = HitTest(pt);
         if (active_.part == Part::Opacity || active_.part == Part::Scale) {
             dragging_ = true;
+            dragT_ = -1.0f;
             SetCapture(Hwnd());
             ApplySliderDrag(pt);
         } else if (active_.part != Part::None) {
-            Render();
+            Invalidate();
         }
         return 0;
     }
@@ -445,9 +457,9 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         if (!Hwnd()) return 0;   // Destroyed during a nested loop above.
-        PrepareDraw();
+        Snapshot();
         hot_ = HitTest(pt);
-        Render();
+        Invalidate();
         return 0;
     }
 
@@ -456,7 +468,7 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         if (overflow > 0.0f) {
             scroll_ -= static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * S(60.0f);
             ClampScroll();
-            Render();
+            Invalidate();
         }
         return 0;
     }
@@ -473,16 +485,6 @@ LRESULT ManagerWindow::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     return D2DOverlay::OnMessage(msg, wp, lp);
-}
-
-void ManagerWindow::DrawLabel(ID2D1DeviceContext* dc, const std::wstring& text,
-                              const D2D1_RECT_F& rect, IDWriteTextFormat* format,
-                              const D2D1_COLOR_F& color, DWRITE_TEXT_ALIGNMENT align) {
-    if (text.empty() || !format) return;
-    format->SetTextAlignment(align);
-    brush_->SetColor(color);
-    dc->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format, rect,
-                  brush_.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 void ManagerWindow::DrawSlider(ID2D1DeviceContext* dc, const D2D1_RECT_F& track,
@@ -514,7 +516,7 @@ void ManagerWindow::DrawSlider(ID2D1DeviceContext* dc, const D2D1_RECT_F& track,
 }
 
 void ManagerWindow::DrawButton(ID2D1DeviceContext* dc, const D2D1_RECT_F& r,
-                               const std::wstring& label, bool hot, bool danger, bool on) {
+                               std::wstring_view label, bool hot, bool danger, bool on) {
     const float radius = S(6.0f);
     const D2D1_COLOR_F accent = danger ? kDanger : kAccent;
 
@@ -591,14 +593,12 @@ void ManagerWindow::DrawCard(ID2D1DeviceContext* dc, const CardView& card, const
 }
 
 void ManagerWindow::OnDraw(ID2D1DeviceContext* dc) {
+    dc->Clear(kBg);
     if (!titleFont_) EnsureFonts();
     if (!titleFont_ || !bodyFont_ || !smallFont_) return;
 
     const float w = static_cast<float>(Width());
     const float h = static_cast<float>(Height());
-
-    brush_->SetColor(kBg);
-    dc->FillRectangle(D2D1::RectF(0, 0, w, h), brush_.get());
 
     dc->PushAxisAlignedClip(D2D1::RectF(0, S(kHeaderH), w, h), D2D1_ANTIALIAS_MODE_ALIASED);
     if (cards_.empty()) {
@@ -622,15 +622,10 @@ void ManagerWindow::OnDraw(ID2D1DeviceContext* dc) {
 
     const float headingRight = (streamingAvailable_ ? StreamingButton() : NewMirrorButton()).left;
     const D2D1_RECT_F heading = D2D1::RectF(S(kPad), 0, headingRight - S(10.0f), S(kHeaderH));
-    DrawLabel(dc, Plural(static_cast<int>(cards_.size()), L"mirror", L"mirrors"), heading,
-              titleFont_.get(), kText, DWRITE_TEXT_ALIGNMENT_LEADING);
+    DrawLabel(dc, heading_, heading, titleFont_.get(), kText, DWRITE_TEXT_ALIGNMENT_LEADING);
 
     if (streamingAvailable_) {   // No button in a build without streaming.
-        std::wstring streaming = L"Streaming";
-        if (streamingOn_ && streamClients_ > 0) {
-            streaming += L" (" + std::to_wstring(streamClients_) + L")";
-        }
-        DrawButton(dc, StreamingButton(), streaming, hot_.part == Part::Streaming, false,
+        DrawButton(dc, StreamingButton(), streamingLabel_, hot_.part == Part::Streaming, false,
                    streamingOn_);
     }
     DrawButton(dc, NewMirrorButton(), L"New mirror", hot_.part == Part::NewMirror, false);

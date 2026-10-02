@@ -32,7 +32,14 @@ struct Gfx {
     void CheckDevice(HRESULT hr);
     void SetDeviceLostHandler(std::function<void()> handler);
 
+    // One DirectComposition device, so one DWM channel, for every window.
+    // Made on first use; hold compositionMutex while using it, since Commit
+    // sends every change pending on it.
+    IDCompositionDevice* Composition();
+    std::mutex compositionMutex;
+
 private:
+    winrt::com_ptr<IDCompositionDevice> dcomp_;
     std::mutex lostMutex_;
     std::function<void()> onLost_;
     std::atomic<bool> lost_{ false };
@@ -42,6 +49,11 @@ private:
 // per-pixel alpha. Shared by the mirror windows and the overlays.
 class CompSurface {
 public:
+    CompSurface() = default;
+    CompSurface(const CompSurface&) = delete;
+    CompSurface& operator=(const CompSurface&) = delete;
+    ~CompSurface();
+
     bool Create(HWND hwnd, UINT width, UINT height);
     bool Resize(UINT width, UINT height);
     void Present(UINT syncInterval);
@@ -52,7 +64,6 @@ public:
     bool Valid()  const { return swap_ != nullptr; }
 
 private:
-    winrt::com_ptr<IDCompositionDevice> dcomp_;
     winrt::com_ptr<IDCompositionTarget> target_;
     winrt::com_ptr<IDCompositionVisual> visual_;
     winrt::com_ptr<IDXGISwapChain1>     swap_;

@@ -59,21 +59,25 @@ private:
         std::wstring    label;
         std::unique_ptr<StreamClient> client;
     };
-    // Snapshot of one server for OnDraw, built in PrepareDraw.
+    // Snapshot of one server for OnDraw, built in PrepareDraw, with the
+    // sidebar's text ready to draw.
     struct ServerView {
         uint32_t     tag = 0;
         std::wstring label;
+        std::wstring title;
         std::wstring status;
         bool         connected = false;
-        int64_t      rttUs = -1;   // Round trip, microseconds; -1 before the first.
         std::vector<RemoteMirror> mirrors;
         std::vector<StreamView>   views;
+        struct ItemText { std::wstring name, size; };
+        std::vector<ItemText> items;   // One per mirror.
     };
     struct Row {
         Part        part;
         uint32_t    server;
         uint32_t    id;
         D2D1_RECT_F rect;
+        size_t      item = 0;   // Index into the server's mirrors, for a MirrorItem.
     };
     // A box on the canvas, in device-independent pixels from the canvas's
     // top-left, so a layout keeps its size across DPI changes. tiles_ is in
@@ -186,10 +190,7 @@ private:
     void  EndDrag(bool commit);
 
     // Drawing.
-    void DrawLabel(ID2D1DeviceContext* dc, const std::wstring& text, const D2D1_RECT_F& rect,
-                   IDWriteTextFormat* font, const D2D1_COLOR_F& color,
-                   DWRITE_TEXT_ALIGNMENT align);
-    void DrawButton(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, const std::wstring& text,
+    void DrawButton(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, std::wstring_view text,
                     bool hot);
     void DrawTile(ID2D1DeviceContext* dc, const Tile& tile, const D2D1_RECT_F& cell);
 
@@ -198,7 +199,8 @@ private:
     void  SetHot(const Hit& hit);
     float ChipAlpha(const Tile& tile) const;
     void  ScheduleChipTimer();
-    uint64_t drawNowMs_ = 0;   // Frozen per frame in PrepareDraw.
+    uint64_t drawNowMs_ = 0;     // Frozen per frame in PrepareDraw.
+    uint64_t chipTimerAt_ = 0;   // When the armed chip timer is due; 0 if none.
     ID2D1Bitmap1* BitmapFor(ID2D1DeviceContext* dc, ID3D11Texture2D* texture);
 
     std::vector<std::unique_ptr<Server>> servers_;
@@ -212,10 +214,14 @@ private:
     TileKey focused_{};                      // Double-clicked box shown alone, or server 0.
     Drag    drag_;
 
-    // Snapshot for OnDraw and hit testing, built in PrepareDraw unless a new
-    // frame has just refreshed the pictures in it.
+    // Snapshot for OnDraw and hit testing. Render() builds it afresh, so
+    // every change to a server or the list draws with Render(). Repaint()
+    // draws once the queue is empty and keeps it: for frames patched into it,
+    // hover, drags, scrolling and chip fades.
+    void Repaint();
     std::vector<ServerView> views_;
     std::vector<Row>        rows_;
+    bool keepSnapshot_ = false;
     bool snapshotFresh_ = false;
 
     std::map<ID3D11Texture2D*, winrt::com_ptr<ID2D1Bitmap1>> bitmaps_;

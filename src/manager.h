@@ -18,7 +18,6 @@ public:
     LRESULT OnMessage(UINT msg, WPARAM wp, LPARAM lp) override;
 
 protected:
-    void PrepareDraw() override;
     void OnDraw(ID2D1DeviceContext* dc) override;
 
 private:
@@ -35,8 +34,9 @@ private:
         bool operator==(const Hit& o) const { return id == o.id && part == o.part; }
     };
 
-    // Everything OnDraw needs, gathered by PrepareDraw before the device lock
-    // is taken so no syscall or mirror lock runs inside it.
+    // Everything OnDraw needs, gathered by Snapshot outside the device lock
+    // so no syscall or mirror lock runs inside it. Only Refresh and clicks
+    // take a new one; a slider drag updates just its own card.
     struct CardView {
         uint32_t     id = 0;
         std::wstring name;
@@ -56,6 +56,7 @@ private:
         D2D1_RECT_F clickThroughButton, hiddenButton;
     };
 
+    void  Snapshot();
     void  EnsureFonts();
     float S(float value) const { return value * dpiScale_; }
     float ContentHeight() const;
@@ -73,17 +74,15 @@ private:
     void DrawSlider(ID2D1DeviceContext* dc, const D2D1_RECT_F& track, float t,
                     bool hot, bool showDetent);
     void DrawButton(ID2D1DeviceContext* dc, const D2D1_RECT_F& r,
-                    const std::wstring& label, bool hot, bool danger, bool on = false);
-    void DrawLabel(ID2D1DeviceContext* dc, const std::wstring& text,
-                   const D2D1_RECT_F& rect, IDWriteTextFormat* format,
-                   const D2D1_COLOR_F& color, DWRITE_TEXT_ALIGNMENT align);
+                    std::wstring_view label, bool hot, bool danger, bool on = false);
 
     App* app_ = nullptr;
 
     std::vector<CardView> cards_;
+    std::wstring heading_;
+    std::wstring streamingLabel_;
     bool   streamingAvailable_ = false;
     bool   streamingOn_ = false;
-    size_t streamClients_ = 0;
 
     winrt::com_ptr<IDWriteTextFormat> titleFont_;
     winrt::com_ptr<IDWriteTextFormat> bodyFont_;
@@ -95,6 +94,7 @@ private:
     Hit  hot_{};
     Hit  active_{};      // Button being pressed or slider being dragged.
     bool dragging_ = false;
+    float dragT_ = -1.0f;   // Slider position last applied.
     void EndSliderDrag();
     bool mouseTracked_ = false;
 };
