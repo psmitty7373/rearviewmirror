@@ -140,9 +140,8 @@ bool Cipher::Seal(const uint8_t nonce[kNonceBytes], const uint8_t* aad, size_t a
 
 bool Cipher::Open(const uint8_t nonce[kNonceBytes], const uint8_t* aad, size_t aadLen,
                   const uint8_t* sealed, size_t len, uint8_t* out) const {
-    // With an empty body BCryptDecrypt gets a null output buffer, treats the
-    // call as a size query and succeeds without checking the tag: a forged
-    // datagram would authenticate. Nothing we send is ever empty.
+    // An empty body makes BCryptDecrypt a size query that succeeds without
+    // checking the tag. Nothing we send is ever empty.
     if (!key_ || !out || len <= kTagBytes) return false;
     const size_t body = len - kTagBytes;
 

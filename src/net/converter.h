@@ -27,10 +27,8 @@ private:
     winrt::com_ptr<ID3D11VideoProcessor>           processor_;
     UINT inW_ = 0, inH_ = 0, outW_ = 0, outH_ = 0;
 
-    // Views of the textures seen lately: the same few (a stream's slots, a
-    // decoder's array) come round every frame. A view holds its texture, so
-    // a recycled address cannot alias a dead one; the lists are short and are
-    // dropped whenever the processor is rebuilt for new sizes.
+    // Views of recent textures, which recur every frame. A view holds its
+    // texture, so a recycled address cannot alias a dead one.
     struct InputEntry {
         ID3D11Texture2D* texture;
         UINT slice;
@@ -51,12 +49,9 @@ private:
     DXGI_FORMAT scratchFormat_ = DXGI_FORMAT_UNKNOWN;
 };
 
-// BGRA -> NV12 with shaders, for the CPU encoder. Needs no video processor, so
-// it works on basic display adapters, WARP and remote sessions too. The frame
-// is drawn into one R8 texture just as NV12 lays it out in memory, the luma
-// rows and then the interleaved chroma rows beneath them, so one copy to a
-// staging texture is all the CPU has to read. BT.709 with studio range, like
-// VideoConverter. Callers hold Gfx::deviceMutex.
+// BGRA -> NV12 with shaders, for the CPU encoder; needs no video processor.
+// Draws one R8 texture laid out as NV12 is in memory, BT.709 studio range.
+// Callers hold Gfx::deviceMutex.
 class Nv12Packer {
 public:
     bool Init();
@@ -74,8 +69,7 @@ private:
     winrt::com_ptr<ID3D11RenderTargetView> rtv_;
     UINT targetW_ = 0, targetRows_ = 0;
 
-    // The source's view. Frames keep coming from the same texture; holding it
-    // means a recycled address cannot alias a dead one.
+    // Held with its view, so a recycled address cannot alias a dead one.
     winrt::com_ptr<ID3D11Texture2D>          srcTex_;
     winrt::com_ptr<ID3D11ShaderResourceView> srcSrv_;
 };

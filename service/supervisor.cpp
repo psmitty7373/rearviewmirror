@@ -84,9 +84,8 @@ bool SignedIn(DWORD session) {
     return signedIn;
 }
 
-// The helper is this executable again, as SYSTEM like the service, but in the
-// console session and on its sign-in desktop, where the screen is. Handles
-// cannot be inherited across sessions, so it duplicates `stopEvent` from here.
+// This executable again, as SYSTEM, on the console session's sign-in desktop.
+// Handles are not inherited across sessions: it duplicates `stopEvent` from here.
 HANDLE LaunchHelper(DWORD session, HANDLE stopEvent) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
@@ -125,9 +124,7 @@ void StopHelper(HANDLE process, HANDLE stopEvent, const wchar_t* why) {
     CloseHandle(process);
 }
 
-// What the console session shows: the app's desktop only when someone is
-// signed in and it is not locked. Otherwise a sign-in or lock screen, which
-// the app cannot capture and lets go of the port for.
+// What the console shows: the app's desktop only when signed in and unlocked.
 enum class Console { None, SignIn, Locked, Desktop };
 
 Console ConsoleShows(DWORD session) {

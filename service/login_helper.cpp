@@ -20,15 +20,8 @@ BOOL WINAPI OnConsoleCtrl(DWORD) {
 
 }  // namespace
 
-// Started by the service as SYSTEM, in the console session, on the sign-in
-// desktop. Every thread starts on that desktop, and it stays the input
-// desktop for as long as this runs (the service stops it the moment someone
-// signs in), so remote input from the stream server's own thread lands on the
-// sign-in screen as it is.
-//
-// Started by hand (--helper-test), it does the same for the current session
-// with the current user's streaming settings, to try the capture and stream
-// without installing anything.
+// From the service, every thread starts on the sign-in desktop, which stays
+// the input desktop while this runs, so remote input lands there.
 int RunLoginHelper(const ServiceLink* service, uint16_t portOverride) {
     const bool byService = service != nullptr;
     if (byService) {

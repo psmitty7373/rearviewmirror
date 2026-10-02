@@ -29,29 +29,20 @@ constexpr size_t kMaxPlain    = kMaxDatagram - kHeaderBytes - kTagBytes;
 
 using Key = std::array<uint8_t, kKeyBytes>;
 
-// Hardware encoders refuse small frames: NVENC accepts 256x128 but not
-// 128x128. A small crop is scaled up uniformly until both dimensions clear
-// this floor on the way into the encoder; the client just shows the larger
-// picture.
+// Hardware encoders refuse small frames, so small crops are scaled up to this.
 constexpr UINT kMinEncodeDim = 256;
 
-// The other way, H.264 hardware encoders stop at 4096 a side, and the GPU at
-// 16384. Larger crops are scaled down to fit.
+// Hardware H.264 encoders stop at 4096 a side; larger crops are scaled down.
 constexpr UINT kMaxEncodeDim = 4096;
 
-// The floors tried in turn when an encoder refuses a size even at 16-pixel
-// alignment. The client tries the same ones to recognise what it receives.
+// Floors tried in turn when an encoder refuses even a 16-aligned size. The
+// client tries the same ones to recognise what it receives.
 constexpr UINT kEncodeFloors[] = { 256, 384, 512, 768, 1024 };
 
-// The size the server encodes a crop at: scaled up uniformly to clear the
-// floor, down uniformly to fit the ceiling, even in both dimensions for NV12,
-// and padded to whole macroblocks for encoders that need it. A strip too thin
-// to satisfy both limits in proportion is held at them, so its stream is out
-// of proportion; the client, which knows the crop from the mirror list, uses
-// this to recognise that and draw it in the true proportions.
-//
-// `minDim` raises the floor for an encoder that refuses a size above the
-// usual one.
+// The size a crop is encoded at: scaled uniformly to clear `minDim` and fit
+// kMaxEncodeDim, even for NV12, optionally 16-aligned. A strip too thin for
+// both limits is held at them, out of proportion; the client, knowing the
+// crop, uses this to draw it true.
 inline void EncodeSize(UINT cropW, UINT cropH, bool align16, UINT& w, UINT& h,
                        UINT minDim = kMinEncodeDim) {
     minDim = (std::min)((std::max)(minDim, kMinEncodeDim), kMaxEncodeDim);
@@ -92,8 +83,7 @@ enum class Msg : uint8_t {
 };
 constexpr uint8_t kMirrorControllable = 1;
 
-// What a StreamStatus message reports. A client that does not know the message
-// ignores it and simply keeps waiting for frames.
+// What a StreamStatus message reports.
 enum class StreamState : uint8_t {
     Ok = 0,             // Frames are coming, or will.
     EncoderFull = 1,    // The GPU has no encoder session free; retried when one frees.
@@ -112,8 +102,7 @@ struct FrameHeader {
 constexpr size_t kFrameHeaderBytes = 1 + 4 + 4 + 2 + 2 + 1;   // Msg byte included.
 constexpr size_t kMaxChunk = kMaxPlain - kFrameHeaderBytes;
 
-// The most packets one frame may take, about 9.5 MB: more than a 4096x4096
-// keyframe at the 100 Mbps ceiling should ever need. A sender drops a larger
+// The most packets one frame may take, about 9.5 MB. A sender drops a larger
 // frame; a receiver refuses one rather than set memory aside for it.
 constexpr uint16_t kMaxFramePackets = 8192;
 

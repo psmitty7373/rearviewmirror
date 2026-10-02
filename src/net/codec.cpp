@@ -149,11 +149,9 @@ private:
     std::function<void()> fn_;
 };
 
-// Receives an asynchronous encoder's events on a Media Foundation thread,
-// queues them, and signals. It is reference counted like any COM object: the
-// encoder holds one reference and a pending BeginGetEvent holds another, so it
-// outlives whichever lets go last. Stop() drops its hold on the encoder, so no
-// cycle survives a shutdown, and every handle it signals is its own.
+// Queues an asynchronous encoder's events from a Media Foundation thread and
+// signals. Held by the encoder and by a pending BeginGetEvent; Stop() breaks
+// the cycle. The handles it signals are its own.
 class EncoderEventRelay final : public IMFAsyncCallback {
 public:
     EncoderEventRelay(IMFMediaEventGenerator* generator, HANDLE wake) {
@@ -308,8 +306,7 @@ std::wstring HardwareEncoderName() {
     return encoders.empty() ? std::wstring() : FriendlyName(encoders.front().get());
 }
 
-// Any synchronous H.264 encoder that takes NV12 would do; Windows' own is the
-// one every desktop install has.
+// Any synchronous NV12 encoder; in practice Windows' own.
 winrt::com_ptr<IMFActivate> SoftwareEncoder() {
     EnsureMf();
     return FindTransform(MFT_CATEGORY_VIDEO_ENCODER,
@@ -365,10 +362,8 @@ void H264Encoder::Shutdown() {
     sequenceHeader_.clear();
 }
 
-// An asynchronous encoder finishes frames with work of its own on Media
-// Foundation threads. Freed with a frame still inside, NVIDIA's ran that work
-// on the freed encoder and crashed the process. Draining first leaves it
-// nothing in flight; the output is discarded.
+// Drains an asynchronous encoder before it is freed: a frame still in flight
+// can run on Media Foundation threads against the freed encoder and crash.
 void H264Encoder::FinishInFlight() {
     constexpr ULONGLONG kDrainTimeoutMs = 500;
     if (!mft_ || !relay_ || failed_ || frameIndex_ == 0) return;
@@ -416,10 +411,7 @@ bool H264Encoder::Init(UINT width, UINT height, UINT fps, UINT bitrateBps, UINT 
     for (const auto& activate : encoders) {
         name_ = FriendlyName(activate.get());
         if (TryInit(activate.get())) {
-            // Hardware encoders ask for their first input a moment after
-            // starting; wait for that so the caller's first frame is taken.
-            // The clock is read once per pass: reading it twice could see the
-            // deadline pass in between and wait a wrapped, near-infinite time.
+            // Wait for the first input request, so the caller's first frame is taken.
             std::vector<EncodedFrame> none;
             const ULONGLONG deadline = GetTickCount64() + 200;
             while (!WantsInput() && Service(none)) {
@@ -466,8 +458,6 @@ bool H264Encoder::TryInit(IMFActivate* activate) {
         if (FAILED(hr)) return fail(L"SET_D3D_MANAGER (encoder on another GPU?)", hr);
     }
 
-    DWORD inCount = 0, outCount = 0;
-    mft_->GetStreamCount(&inCount, &outCount);
     if (FAILED(mft_->GetStreamIDs(1, &inputId_, 1, &outputId_))) {
         inputId_ = 0;
         outputId_ = 0;
@@ -478,21 +468,15 @@ bool H264Encoder::TryInit(IMFActivate* activate) {
         VARIANT v;
         VariantInit(&v);
         v.vt = VT_UI4;
-        // Constant bitrate, measured against the alternatives on NVENC: a
-        // pointer moving over a still desktop costs about 2 KB a frame, far
-        // under the budget, so there is little to save. Peak-constrained VBR
-        // behaved identically, and quality-based modes ignored any peak
-        // limit and ran to hundreds of Mbps on heavy motion.
+        // CBR: quality-based modes ignore any peak limit.
         v.ulVal = eAVEncCommonRateControlMode_CBR;
         codec_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &v);
         v.ulVal = bitrate_;
         codec_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v);
         v.ulVal = 0;
         codec_->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v);
-        // No keyframes on a timer. A full picture costs hundreds of KB at
-        // desktop sizes, and the stream already asks for one whenever it
-        // needs it: a new viewer, or a frame lost for good. The longest
-        // interval the encoder accepts; some cap it.
+        // No periodic keyframes (the stream asks when it needs one): the
+        // longest interval the encoder accepts.
         gopSize_ = 0;
         for (const ULONG gop : { 0xFFFFFFFFul, 65535ul, fps_ * 60ul }) {
             v.ulVal = gop;
@@ -501,8 +485,6 @@ bool H264Encoder::TryInit(IMFActivate* activate) {
                 break;
             }
         }
-        // Quality against speed: NVENC maps this onto its presets. How much
-        // work each frame gets, and so how busy the video engine runs.
         if (qualityVsSpeed_ != kEncoderDefault) {
             v.ulVal = (std::min)(qualityVsSpeed_, 100u);
             const HRESULT q = codec_->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &v);
@@ -559,8 +541,8 @@ bool H264Encoder::TryInit(IMFActivate* activate) {
     return true;
 }
 
-// The encoder changed its output format mid-stream, which Intel's does on its
-// first frame to fill in the sequence headers. Accept whatever it now offers.
+// The encoder changed its output format mid-stream (some do on their first
+// frame): accept whatever it now offers.
 bool H264Encoder::RenegotiateOutput() {
     winrt::com_ptr<IMFMediaType> type;
     HRESULT hr = mft_->GetOutputAvailableType(outputId_, 0, type.put());
@@ -591,7 +573,7 @@ void H264Encoder::ReadOutputStreamInfo() {
     outBuffer_ = nullptr;
 }
 
-// Every error, up to a cap per encoder: sampling hid the pattern once.
+// Every error, up to a cap per encoder.
 void H264Encoder::LogError(const wchar_t* step, HRESULT hr) {
     if (errorsLogged_ >= kMaxErrorLogs) return;
     if (++errorsLogged_ == kMaxErrorLogs) {
@@ -691,9 +673,8 @@ HRESULT H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
     if (db.pEvents) db.pEvents->Release();
     if (FAILED(hr) && providesSamples_ && db.pSample) db.pSample->Release();
 
-    // An asynchronous encoder that changes its output format sends a fresh
-    // METransformHaveOutput once the new type is set; asking again before
-    // that event is refused with E_UNEXPECTED.
+    // Not retried here: until its next METransformHaveOutput, an async
+    // encoder refuses ProcessOutput with E_UNEXPECTED.
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
         return RenegotiateOutput() ? hr : E_FAIL;
     }
@@ -724,8 +705,8 @@ HRESULT H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
     contiguous->Unlock();
     if (frame.data.empty()) return S_FALSE;
 
-    // A decoder cannot start without the sequence headers. An encoder that
-    // moved them into its output format is made to carry them in-band again.
+    // A decoder cannot start without SPS/PPS: put them back in-band if the
+    // encoder moved them into its output format.
     if (frame.keyframe && !sequenceHeader_.empty() && !HasSps(frame.data)) {
         frame.data.insert(frame.data.begin(), sequenceHeader_.begin(), sequenceHeader_.end());
         if (outputsTraced_ < kTraceFrames) {
@@ -735,8 +716,6 @@ HRESULT H264Encoder::CollectOutput(std::vector<EncodedFrame>& out) {
     }
     if (outputsTraced_ < kTraceFrames) {
         ++outputsTraced_;
-        // The first bytes show whether sequence headers (NAL type 7, 8) are
-        // in the bitstream: a decoder cannot start without them.
         wchar_t head[64]{};
         for (size_t i = 0; i < (std::min)(frame.data.size(), static_cast<size_t>(12)); ++i) {
             swprintf_s(head + i * 3, 4, L"%02X ", frame.data[i]);
@@ -812,14 +791,9 @@ bool H264Encoder::Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, 
 
 namespace {
 
-// Copies a packed NV12 staging texture into `dst`, rows back to back. Map and
-// Unmap on the shared immediate context need the device lock; the wait for
-// the GPU to finish writing the texture, and the copy itself, happen outside
-// it, so this thread never holds up every other draw for long.
-//
-// While the GPU is still busy, `gpuDone` is set to fire once everything
-// submitted so far has run, which flushes the queue too. Without that, the
-// wait falls back to the system timer's tick.
+// Copies a packed NV12 staging texture into `dst`, rows back to back. Only
+// Map and Unmap hold the device lock. While the GPU is busy, `gpuDone` fires
+// once it catches up; failing that, the wait polls.
 bool ReadPacked(ID3D11Texture2D* staging, UINT width, UINT rows, BYTE* dst, HANDLE gpuDone) {
     auto& g = Gfx::Get();
     const ULONGLONG deadline = GetTickCount64() + 500;
@@ -946,7 +920,6 @@ void H264Decoder::Shutdown() {
     inSample_ = nullptr;
     inBuffer_ = nullptr;
     staged_ = false;
-    width_ = height_ = 0;
     frameIndex_ = 0;
 }
 
@@ -1026,8 +999,6 @@ bool H264Decoder::NegotiateOutput() {
             display_.right  = display_.left + area.Area.cx;
             display_.bottom = display_.top + area.Area.cy;
         }
-        width_  = static_cast<UINT>(RectW(display_));
-        height_ = static_cast<UINT>(RectH(display_));
 
         MFT_OUTPUT_STREAM_INFO info{};
         mft_->GetOutputStreamInfo(outputId_, &info);
@@ -1042,12 +1013,8 @@ bool H264Decoder::Drain(std::vector<DecodedFrame>& out) {
         MFT_OUTPUT_DATA_BUFFER db{};
         db.dwStreamID = outputId_;
 
-        winrt::com_ptr<IMFSample> own;
-        if (!providesSamples_) {
-            // Without DXVA the decoder wants a buffer from us; keep it simple
-            // and let it allocate by asking for provided samples anyway.
-            return false;
-        }
+        // Without DXVA the decoder would want buffers from us, which this never supplies.
+        if (!providesSamples_) return false;
 
         DWORD status = 0;
         const HRESULT hr = mft_->ProcessOutput(0, 1, &db, &status);

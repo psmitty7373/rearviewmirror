@@ -23,27 +23,14 @@ struct DecodedFrame {
 
 class EncoderEventRelay;
 
-// Where an H264Encoder does its work, and so what it takes as input.
 enum class EncoderKind {
-    // The GPU's encoder. Input is an NV12 texture on the shared device;
-    // nothing is read back to the CPU except the bitstream.
-    Hardware,
-    // Windows' own encoder, on the CPU. Input is an R8 staging texture holding
-    // the frame packed as NV12 lays it out in memory (see Nv12Packer): the
-    // luma rows, then the interleaved chroma rows, `height * 3 / 2` in all.
-    Software,
+    Hardware,   // Input: an NV12 texture on the shared device.
+    Software,   // Windows' CPU encoder. Input: an R8 staging texture packed as NV12 (see Nv12Packer).
 };
 
-// H.264 through Media Foundation, on the GPU's encoder or the CPU.
-//
-// Hardware encoders are asynchronous: they announce "want input" and "have
-// output" as events. Those arrive on a Media Foundation thread, are queued,
-// and wake whoever waits on the event given to SetWakeEvent(). All work on the
-// encoder itself happens in Service() and Encode(), on one thread, and
-// nothing blocks: a frame costs only the encoder's own time.
-//
-// The software encoder is synchronous: it always wants input, and Encode()
-// returns with whatever the frame produced, having encoded it there and then.
+// H.264 through Media Foundation, used from one thread. A hardware encoder is
+// asynchronous: its events wake the SetWakeEvent() handle and are handled in
+// Service(). The software encoder is synchronous: Encode() returns its output.
 class H264Encoder {
 public:
     H264Encoder() = default;
@@ -67,27 +54,18 @@ public:
     UINT Width()  const { return width_; }
     UINT Height() const { return height_; }
 
-    // Handles every event that has arrived: collects finished frames into
-    // `out`, notes requests for input. Never blocks. False if the encoder has
-    // failed and should be recreated.
+    // Handles queued events, collecting finished frames. Never blocks; false
+    // if the encoder failed and should be recreated.
     bool Service(std::vector<EncodedFrame>& out);
-    bool Drain(std::vector<EncodedFrame>& out) { return Service(out); }
 
-    // Whether Encode() will take a frame now.
     bool WantsInput() const { return inputsWanted_ > 0; }
 
-    // Hands one frame to the encoder, if it wants input; the encoded result
-    // arrives later through Service(). Anything already finished is
-    // collected into `out`. False if the frame was not taken.
-    //
-    // `released` runs exactly once per call, whether or not the frame was
-    // taken: at once if it was not, otherwise when the encoder lets go of the
-    // texture, which can be after this returns and on another thread. Until
-    // then the texture must not be written.
-    //
-    // A software encoder copies the texture out before encoding, so
-    // `released` runs before this returns. It maps the texture under
-    // Gfx::deviceMutex, so never call it with that lock held.
+    // Feeds one frame if the encoder wants input; false if not taken. Output
+    // comes through Service(), or at once from the software encoder.
+    // `released` runs exactly once: when the encoder lets go of the texture
+    // (perhaps later, on another thread), or at once if not taken. The
+    // software encoder maps the texture under Gfx::deviceMutex: never call
+    // it with that held.
     using Released = std::function<void()>;
     bool Encode(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released = {});
 
@@ -98,11 +76,8 @@ public:
     // The next encoded frame will be an IDR. Safe from any thread.
     void RequestKeyframe() { forceKeyframe_.store(true, std::memory_order_relaxed); }
 
-    // Some encoders (Intel Quick Sync among them) keep a frame back until the
-    // next one arrives, however low-latency they are asked to be. The tick
-    // (GetTickCount64) from which the last real frame has produced nothing
-    // for too long, or kNoNudge: from then the caller should feed the same
-    // picture again with Repeat() to push it out.
+    // Some encoders hold a frame back until the next arrives. From this tick
+    // (GetTickCount64), unless kNoNudge, Repeat() the last picture to push it out.
     static constexpr uint64_t kNoNudge = ~0ull;
     uint64_t NudgeDueMs() const;
     bool Repeat(ID3D11Texture2D* nv12, std::vector<EncodedFrame>& out, Released released = {});
@@ -173,9 +148,6 @@ public:
     void Shutdown();
     bool Ready() const { return mft_ != nullptr; }
 
-    UINT Width()  const { return width_; }
-    UINT Height() const { return height_; }
-
     // Decoding in two steps: Stage copies an access unit in, which needs no
     // device lock; Decode feeds it to the decoder, which does.
     bool Stage(const uint8_t* data, size_t len);
@@ -194,7 +166,6 @@ private:
     bool  staged_ = false;
     DWORD inputId_ = 0, outputId_ = 0;
     bool  providesSamples_ = false;
-    UINT  width_ = 0, height_ = 0;   // Display size, after cropping.
     RECT  display_{};
     LONGLONG frameIndex_ = 0;
 };
@@ -206,9 +177,8 @@ std::wstring HardwareEncoderName();
 // (N editions without the Media Feature Pack).
 winrt::com_ptr<IMFActivate> SoftwareEncoder();
 
-// What streaming encodes with on this machine. A hardware encoder needs the
-// device's video processor to turn frames into NV12 for it; without either,
-// frames go to the CPU. `name` is empty if there is no encoder at all.
+// What streaming encodes with here: hardware needs the video processor too,
+// else the CPU. `name` is empty if there is no encoder at all.
 struct EncoderChoice {
     std::wstring name;
     EncoderKind  kind = EncoderKind::Hardware;

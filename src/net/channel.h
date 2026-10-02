@@ -17,21 +17,16 @@ public:
     // A session: each direction has its own key.
     bool SetKeys(const Key& sendKey, const Key& recvKey);
 
-    // The handshake runs under the long-lived master key, so it starts its
-    // counter at a random point: session ids are only 32 bits, and a nonce
-    // must never repeat under one key.
+    // Under the long-lived master key, start at a random counter: session ids
+    // are only 32 bits, and a nonce must never repeat under one key.
     void BeginSend(uint32_t sessionId, uint64_t startCounter = 0);
-    uint32_t SendSession() const { return sendSession_; }
-
     void BeginRecv(uint32_t sessionId);
-    uint32_t RecvSession() const { return recvSession_; }
-    bool RecvBound() const { return recvBound_; }
 
     // Wraps `plain` into a complete datagram. False if it would not fit.
     bool Seal(const uint8_t* plain, size_t len, std::vector<uint8_t>& datagram);
 
-    // Verifies and unwraps. The sender's session id is returned so a server
-    // can tell whom a datagram is from before it has bound a receive session.
+    // Verifies and unwraps; the sender's session id is returned for a channel
+    // with no receive session bound yet.
     bool Open(const uint8_t* datagram, size_t len, std::vector<uint8_t>& plain,
               uint32_t& senderSession);
 

@@ -99,9 +99,7 @@ void DuplicationCapture::Repush() {
     }
 }
 
-// Duplication works only for a thread on the input desktop, so the thread
-// moves to it before every attach: the sign-in screen, the desktop of whoever
-// signed in, a UAC prompt.
+// Duplication works only for a thread on the input desktop.
 bool DuplicationCapture::FollowInputDesktop() {
     HDESK input = OpenInputDesktop(0, FALSE, GENERIC_ALL);
     if (!input) {
@@ -189,8 +187,7 @@ bool DuplicationCapture::Attach() {
     FollowInputDesktop();   // Attaching is tried even if this fails; the log says why it then fails.
     auto& g = Gfx::Get();
 
-    // The picture is the whole virtual screen, as the app's desktop mirrors
-    // are: remote input addresses it as such.
+    // The whole virtual screen, which remote input addresses.
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const UINT width = static_cast<UINT>(GetSystemMetrics(SM_CXVIRTUALSCREEN)) & ~1u;
     const UINT height = static_cast<UINT>(GetSystemMetrics(SM_CYVIRTUALSCREEN)) & ~1u;
@@ -384,9 +381,8 @@ void DuplicationCapture::Compose() {
     if (onFrame_) onFrame_(frame_.get());
 }
 
-// Composes the latest picture if someone wants it and the frame rate allows.
-// Returns how long the caller may wait for the next change: if a compose is
-// put off, only until it is due, so the last change is never left out.
+// Composes if wanted and the frame rate allows. Returns how long the caller
+// may wait for a change: a put-off compose only until it is due.
 UINT DuplicationCapture::ComposeIfDue() {
     const bool wanted = wanted_ && wanted_();
     std::lock_guard lock(Gfx::Get().deviceMutex);
