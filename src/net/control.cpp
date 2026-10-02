@@ -80,6 +80,7 @@ struct ControlHost::Impl {
     uint16_t x = 0, y = 0;
     explicit Impl(Sink s) : sink(s ? std::move(s) : Sink(Inject)) {}
     void Release() {
+        if (owner) Log(L"control: released (mirror %u)", mirror);
         for (auto [code, e] : keys) { e.down = false; sink(e); }
         for (auto [code, e] : buttons) { e.value = 0; e.x = x; e.y = y; sink(e); }
         keys.clear(); buttons.clear(); owner = 0; mirror = 0; ack = 0;
@@ -118,7 +119,10 @@ std::vector<uint8_t> ControlHost::Handle(uintptr_t peer, Reader& r, uint64_t now
             if (s.owner) status = ControlState::Busy;
             else {
                 s.owner = peer; s.mirror = mirror; s.token = token; s.ack = 0; s.seen = now;
+                Log(L"control: granted (mirror %u)", mirror);
             }
+        } else if (op == kBegin) {
+            RVM_LOG_SAMPLED(20, L"control: refused: mirror %u is not a controllable desktop", mirror);
         }
     } else if (token == p.token && op == kBegin && eligible && s.owner && s.owner != peer) {
         status = ControlState::Busy;   // A retried Begin whose Busy reply was lost.
@@ -147,7 +151,12 @@ std::vector<uint8_t> ControlHost::Handle(uintptr_t peer, Reader& r, uint64_t now
                 } else if (e.kind == InputKind::Button && !e.value && !s.buttons.count(e.code)) {
                     s.ack = seq; continue;
                 }
-                if (!s.sink(e)) { s.Release(); status = ControlState::Lost; break; }
+                if (!s.sink(e)) {
+                    Log(L"control: Windows rejected the input (%lu); control ends", GetLastError());
+                    s.Release();
+                    status = ControlState::Lost;
+                    break;
+                }
                 if (e.kind == InputKind::Key) {
                     if (e.down) s.keys[e.code] = e; else s.keys.erase(e.code);
                 } else {

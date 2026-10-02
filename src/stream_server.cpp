@@ -331,7 +331,10 @@ uint64_t StreamServer::ServiceDeferredKeyframes(uint64_t nowMs) {
 
 void StreamServer::SetMirrorList(std::vector<MirrorInfo> list) {
     Log(L"server: mirror list has %zu entries", list.size());
-    for (const auto& m : list) Log(L"server:   id=%u %ux%u '%s'", m.id, m.width, m.height, m.name.c_str());
+    for (const auto& m : list) {
+        Log(L"server:   id=%u %ux%u '%s'%s", m.id, m.width, m.height, m.name.c_str(),
+            m.controllable ? L", controllable" : L"");
+    }
     {
         std::lock_guard lock(listMutex_);
         mirrorList_ = std::move(list);

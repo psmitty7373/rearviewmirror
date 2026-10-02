@@ -146,31 +146,51 @@ void StopHelper(HANDLE process, HANDLE stopEvent, const wchar_t* why) {
     CloseHandle(process);
 }
 
-bool AppRunningIn(DWORD session, const std::wstring& exeName) {
+bool AppRunningIn(DWORD session) {
     WTS_PROCESS_INFOW* processes = nullptr;
     DWORD count = 0;
     if (!WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &processes, &count)) return true;   // Unknown: leave it.
     bool running = false;
     for (DWORD i = 0; i < count && !running; ++i) {
         running = processes[i].SessionId == session && processes[i].pProcessName &&
-                  _wcsicmp(processes[i].pProcessName, exeName.c_str()) == 0;
+                  _wcsicmp(processes[i].pProcessName, kAppExeName) == 0;
     }
     WTSFreeMemory(processes);
     return running;
 }
 
+// The session user's token, elevated if it is an administrator's: Windows
+// drops a non-elevated app's input into elevated windows such as Task
+// Manager. Skipping the prompt is safe because the app runs from Program
+// Files, which only administrators can change.
+HANDLE AppToken(DWORD session) {
+    HANDLE token = nullptr;
+    if (!WTSQueryUserToken(session, &token)) return nullptr;
+    TOKEN_ELEVATION_TYPE type{};
+    TOKEN_LINKED_TOKEN linked{};
+    DWORD size = 0;
+    if (GetTokenInformation(token, TokenElevationType, &type, sizeof(type), &size) &&
+        type == TokenElevationTypeLimited &&
+        GetTokenInformation(token, TokenLinkedToken, &linked, sizeof(linked), &size)) {
+        CloseHandle(token);
+        token = linked.LinkedToken;
+    }
+    return token;
+}
+
 // A reconnected session runs no startup items, and an app that was closed or
 // crashed leaves nothing to take over from the helper. Only in the installing
-// account's sessions, as that account, never elevated: the path is its to set.
+// account's sessions.
 void StartAppIfMissing(DWORD session) {
-    const std::wstring path = RecordedAppPath();
+    const std::wstring dir = InstallDir();
+    const std::wstring path = dir + L"\\" + kAppExeName;
     std::vector<uint8_t> owner;
-    if (path.empty() || !AppOwnerSid(owner)) return;
-    const std::wstring exeName = path.substr(path.find_last_of(L'\\') + 1);
-    if (AppRunningIn(session, exeName)) return;
-
-    HANDLE token = nullptr;
-    if (!WTSQueryUserToken(session, &token)) return;   // Nobody signed in there (any more).
+    if (dir.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES || !AppOwnerSid(owner) ||
+        AppRunningIn(session)) {
+        return;
+    }
+    HANDLE token = AppToken(session);
+    if (!token) return;   // Nobody signed in there (any more).
     std::vector<uint8_t> user(SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER));
     DWORD size = 0;
     const bool mine = GetTokenInformation(token, TokenUser, user.data(), static_cast<DWORD>(user.size()), &size) &&
@@ -180,13 +200,15 @@ void StartAppIfMissing(DWORD session) {
         STARTUPINFOW si{ sizeof(si) };
         si.lpDesktop = const_cast<wchar_t*>(L"winsta0\\default");
         std::wstring command = L"\"" + path + L"\" --autostart";
-        const std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
         PROCESS_INFORMATION pi{};
         if (CreateProcessAsUserW(token, path.c_str(), command.data(), nullptr, nullptr, FALSE,
                                  CREATE_UNICODE_ENVIRONMENT, environment, dir.c_str(), &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            Log(L"service: Rear View Mirror was not running in session %lu; started it", session);
+            TOKEN_ELEVATION elevation{};
+            GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
+            Log(L"service: Rear View Mirror was not running in session %lu; started it%s", session,
+                elevation.TokenIsElevated ? L", elevated" : L"");
         } else {
             Log(L"service: could not start Rear View Mirror in session %lu (%lu)", session, GetLastError());
         }

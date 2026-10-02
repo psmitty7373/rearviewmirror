@@ -69,6 +69,16 @@ bool RemoveUntrusted(const std::wstring& path, std::wstring& movedAside) {
 
 }  // namespace
 
+std::wstring InstallDir() {
+    std::wstring dir;
+    PWSTR programFiles = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &programFiles))) {
+        dir = std::wstring(programFiles) + L"\\RearViewMirror";
+    }
+    CoTaskMemFree(programFiles);
+    return dir;
+}
+
 std::wstring MachineDir() {
     std::wstring dir;
     PWSTR data = nullptr;
@@ -205,14 +215,5 @@ bool AppOwnerSid(std::vector<uint8_t>& sid) {
     return false;
 }
 
-std::wstring RecordedAppPath() {
-    wchar_t path[MAX_PATH]{};
-    DWORD size = sizeof(path);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, kAppPathValue, RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
-                     nullptr, path, &size) != ERROR_SUCCESS) {
-        return {};
-    }
-    return path;
-}
 
 }  // namespace rvm::login

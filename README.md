@@ -147,16 +147,18 @@ in through it from the client. Once you're signed in, the app takes over.
 1. In Rear View Mirror, set up streaming (port and key) as usual. The key
    must be at least 20 characters, as *Generate* makes.
 2. From an administrator prompt, run
-   `build\RearViewMirrorService.exe --install`. It copies itself to
-   `Program Files\RearViewMirror`, moves this account's streaming settings to
+   `build\RearViewMirrorService.exe --install`. It copies itself and
+   `RearViewMirror.exe` to `Program Files\RearViewMirror`, moves this account's streaming settings to
    one place the app and the service share, lets the service through Windows
    Firewall (UDP, private and domain networks only; nobody could answer a
    firewall prompt at the sign-in screen), and starts the service. From then on
    change the port or key in the Streaming dialog as usual; the service follows.
 3. Nothing else: whenever you sign in, reconnect to a session or unlock one and
-   Rear View Mirror isn't running in it, the service starts it, as you, from
-   where it last ran. Closing it from the tray keeps it closed until then. Only
-   the account that installed the service gets this.
+   Rear View Mirror isn't running in it, the service starts the copy in Program
+   Files, as you and elevated if you're an administrator. Otherwise Windows
+   drops its input into elevated windows such as Task Manager. Closing it from
+   the tray keeps it closed until then. Only the account that installed the
+   service gets this. Run `--install` again after rebuilding to update the copy.
 
 In the client nothing changes: the same server lists **Sign-in screen** while
 the PC's screen shows a sign-in or lock screen, and your own mirrors otherwise.

@@ -7,6 +7,11 @@ namespace rvm::login {
 // Administrators only.
 std::wstring MachineDir();
 
+// Program Files\RearViewMirror, where only administrators can write: the
+// service, and the copy of the app it starts elevated.
+std::wstring InstallDir();
+constexpr wchar_t kAppExeName[] = L"RearViewMirror.exe";
+
 // Elevated. Creates MachineDir() and (re)applies its access rules. Any user
 // may create folders in ProgramData, so an untrusted one is never taken over:
 // a link is removed, a folder moved aside (to `movedAside`).
@@ -30,7 +35,5 @@ bool LoadLoginSettings(StreamSettings& settings);
 // The account the settings key grants access to: the one that installed it,
 // read from the key's rules, which that account cannot change.
 bool AppOwnerSid(std::vector<uint8_t>& sid);
-// What RecordAppPath last wrote; empty if never.
-std::wstring RecordedAppPath();
 
 }  // namespace rvm::login

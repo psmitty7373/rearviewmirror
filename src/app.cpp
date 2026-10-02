@@ -3,7 +3,6 @@
 #include "login_handoff.h"
 #include "picker.h"
 #include "region.h"
-#include "stream_settings.h"
 
 namespace rvm {
 
@@ -763,7 +762,6 @@ int App::Run(bool relaunched) {
     hooks.changed = [this] { manager_.Refresh(); };
     hooks.notify  = [this](const std::wstring& text) { ShowBalloon(text); };
 #if RVM_LOGIN_SERVICE
-    RecordAppPath();
     // Paused at first: the service's helper may still hold the port, or this
     // session may not be the console's. UpdateHandoff serves when it can.
     streaming_.SetPaused(true);

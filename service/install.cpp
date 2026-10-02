@@ -11,6 +11,7 @@ namespace {
 
 constexpr wchar_t kExeName[] = L"RearViewMirrorService.exe";
 constexpr wchar_t kPdbName[] = L"RearViewMirrorService.pdb";
+constexpr wchar_t kAppPdbName[] = L"RearViewMirror.pdb";
 constexpr wchar_t kFirewallRule[] = L"Rear View Mirror sign-in screen";
 
 struct Bstr {
@@ -70,17 +71,6 @@ bool IsElevated() {
     return ok && elevation.TokenIsElevated;
 }
 
-// Program Files, where only administrators can write: a service running as
-// SYSTEM from a folder its user could change would hand that user SYSTEM.
-std::wstring InstallDir() {
-    std::wstring dir;
-    PWSTR programFiles = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &programFiles))) {
-        dir = std::wstring(programFiles) + L"\\RearViewMirror";
-    }
-    CoTaskMemFree(programFiles);
-    return dir;
-}
 
 std::wstring SelfDir() {
     wchar_t exe[MAX_PATH]{};
@@ -106,6 +96,16 @@ bool StopAndWait(SC_HANDLE service) {
 void DeleteFileOrLater(const std::wstring& path) {
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
     if (!DeleteFileW(path.c_str())) MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
+// A running program cannot be overwritten, but it can be renamed out of the way.
+bool CopyOver(const std::wstring& from, const std::wstring& to) {
+    if (CopyFileW(from.c_str(), to.c_str(), FALSE)) return true;
+    const std::wstring old = to + L".old";
+    DeleteFileW(old.c_str());
+    if (!MoveFileExW(to.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) return false;
+    MoveFileExW(old.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    return CopyFileW(from.c_str(), to.c_str(), FALSE) != FALSE;
 }
 
 int Fail(const wchar_t* what) {
@@ -144,12 +144,22 @@ int RunInstall() {
     if (dir.empty() || (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)) {
         return Fail(L"Cannot create the install folder.");
     }
+    // The app too: the service starts this copy, elevated, so it has to be
+    // somewhere only administrators can change.
+    bool app = false;
     if (_wcsicmp(SelfDir().c_str(), dir.c_str()) != 0) {
         if (!CopyFileW((SelfDir() + L"\\" + kExeName).c_str(), exe.c_str(), FALSE)) {
             return Fail(L"Cannot copy the service into Program Files.");
         }
+        app = GetFileAttributesW((SelfDir() + L"\\" + kAppExeName).c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (app && !CopyOver(SelfDir() + L"\\" + kAppExeName, dir + L"\\" + kAppExeName)) {
+            return Fail(L"Cannot copy Rear View Mirror into Program Files.");
+        }
         // Symbols, so a crash report names functions; optional.
         CopyFileW((SelfDir() + L"\\" + kPdbName).c_str(), (dir + L"\\" + kPdbName).c_str(), FALSE);
+        if (app) CopyOver(SelfDir() + L"\\" + kAppPdbName, dir + L"\\" + kAppPdbName);
+    } else {
+        app = GetFileAttributesW((dir + L"\\" + kAppExeName).c_str()) != INVALID_FILE_ATTRIBUTES;
     }
 
     std::wstring movedAside;
@@ -161,12 +171,7 @@ int RunInstall() {
         return Fail(L"Cannot save the shared streaming settings.");
     }
     DeleteFileOrLater(MachineDir() + L"\\login.ini");   // Where earlier versions kept their own copy.
-    // Until the app first runs and records itself, the one built beside this.
-    const std::wstring app = SelfDir() + L"\\RearViewMirror.exe";
-    if (RecordedAppPath().empty() && GetFileAttributesW(app.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        RegSetKeyValueW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, kAppPathValue, REG_SZ, app.c_str(),
-                        static_cast<DWORD>((app.size() + 1) * sizeof(wchar_t)));
-    }
+    RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kMachineSettingsKey, L"AppPath");   // Earlier versions' pointer to it.
     const bool firewall = SetFirewallRule(&exe);
 
     const std::wstring command = L"\"" + exe + L"\" --service";
@@ -208,8 +213,15 @@ int RunInstall() {
         wprintf(L"- Could not add the Windows Firewall rule: clients will be blocked until UDP is\n"
                 L"  allowed in for %s.\n", exe.c_str());
     }
-    wprintf(L"- Whenever you sign in, reconnect or unlock and Rear View Mirror is not running in\n"
-            L"  that session, the service starts it (as you, from where it last ran).\n");
+    if (app) {
+        wprintf(L"- Whenever you sign in, reconnect or unlock and Rear View Mirror is not running,\n"
+                L"  the service starts %s\\%s as you, elevated if you are an\n"
+                L"  administrator, so it can control elevated windows such as Task Manager.\n",
+                dir.c_str(), kAppExeName);
+    } else {
+        wprintf(L"- %s was not beside this, so the service cannot start Rear View Mirror for you.\n",
+                kAppExeName);
+    }
 #if !RVM_REMOTE_CONTROL
     wprintf(L"- This build has no desktop control: the sign-in screen can be watched, not used.\n"
             L"  Build with --remote-control to sign in through it.\n");
@@ -244,8 +256,10 @@ int RunUninstall() {
 
     const std::wstring dir = InstallDir();
     if (!dir.empty()) {
-        DeleteFileOrLater(dir + L"\\" + kExeName);
-        DeleteFileOrLater(dir + L"\\" + kPdbName);
+        for (const wchar_t* name : { kExeName, kPdbName, kAppExeName, kAppPdbName }) {
+            DeleteFileOrLater(dir + L"\\" + name);
+            DeleteFileOrLater(dir + L"\\" + name + L".old");
+        }
         RemoveDirectoryW(dir.c_str());   // Only if nothing else is in it.
     }
     // The settings, with the key, and the logs, if the folder is ours: one
