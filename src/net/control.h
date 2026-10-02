@@ -37,6 +37,9 @@ public:
     using Sink = std::function<bool(const RemoteInput&)>;
     explicit ControlHost(Sink sink = {});
     ~ControlHost();
+    // Before any input arrives. Empty restores the default, which injects on
+    // the calling thread's desktop.
+    void SetSink(Sink sink);
     std::vector<uint8_t> Handle(uintptr_t peer, Reader& r, uint64_t now, bool eligible);
     void Poll(uint64_t now, const std::function<bool(uintptr_t, uint32_t)>& eligible);
     void Drop(uintptr_t peer);

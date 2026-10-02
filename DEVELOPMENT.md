@@ -499,12 +499,13 @@ starts that way, since right after signing in the helper may still hold it.
 While its session is away from the console it rechecks every 5 s, in case a
 notification came between sessions or the service started or stopped.
 
-**Remote input needs nothing new.** Every thread of the helper starts on the
-Winlogon desktop, and that stays the input desktop for as long as the helper
-runs, since it is stopped the moment the console shows a desktop. So the existing
-`ControlHost` injects from the server's network thread exactly as it does in
-the app, with `MOUSEEVENTF_VIRTUALDESK` addressing the same whole-screen
-picture.
+**Remote input follows the input desktop.** `SendInput` reaches only the
+calling thread's desktop, and the input desktop moves while the helper runs: a
+locked session's clock pane is on that session's own desktop (in the lock
+band), the password box on Winlogon. So the helper gives `StreamServer` a
+control sink (`SetControlSink`) that moves each injecting thread to the current
+input desktop before injecting, with `MOUSEEVENTF_VIRTUALDESK` addressing the
+same whole-screen picture.
 
 **Settings: one copy.** Nobody is signed in when the helper runs, so neither
 `%APPDATA%` nor a key encrypted to a user will do, and a second copy made at

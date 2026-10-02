@@ -87,6 +87,7 @@ struct ControlHost::Impl {
 };
 ControlHost::ControlHost(Sink sink) : impl_(std::make_unique<Impl>(std::move(sink))) {}
 ControlHost::~ControlHost() { Reset(); }
+void ControlHost::SetSink(Sink sink) { impl_->sink = sink ? std::move(sink) : Sink(Inject); }
 void ControlHost::Reset() { impl_->Release(); impl_->peers.clear(); }
 void ControlHost::Drop(uintptr_t peer) {
     if (impl_->owner == peer) impl_->Release();

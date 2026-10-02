@@ -55,6 +55,11 @@ public:
     // Any thread; an atomic load while nobody watches anything.
     bool Watched(uint32_t mirrorId) const;
 
+#if RVM_REMOTE_CONTROL
+    // Where remote input goes; before Start().
+    void SetControlSink(net::ControlHost::Sink sink) { control_.SetSink(std::move(sink)); }
+#endif
+
     // For tests: encode on the CPU from the next Start().
     void ForceSoftwareEncoding(bool on) { forceSoftware_ = on; }
     // For tests: how often the network thread has woken.

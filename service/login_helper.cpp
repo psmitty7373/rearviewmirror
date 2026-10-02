@@ -18,10 +18,36 @@ BOOL WINAPI OnConsoleCtrl(DWORD) {
     return TRUE;
 }
 
+#if RVM_REMOTE_CONTROL
+// SendInput reaches only the calling thread's desktop, and the input desktop
+// moves: a locked session's clock pane is on its own desktop, the password box
+// on the sign-in desktop. So each injecting thread follows it.
+bool InjectOnInputDesktop(const net::RemoteInput& e) {
+    thread_local HDESK attached = nullptr;
+    thread_local std::wstring attachedName;
+    if (HDESK input = OpenInputDesktop(0, FALSE, GENERIC_ALL)) {
+        wchar_t name[64]{};
+        DWORD needed = 0;
+        GetUserObjectInformationW(input, UOI_NAME, name, sizeof(name), &needed);
+        if (attachedName == name) {
+            CloseDesktop(input);
+        } else if (SetThreadDesktop(input)) {
+            if (attached) CloseDesktop(attached);   // No longer this thread's.
+            attached = input;
+            attachedName = name;
+            Log(L"login: input goes to the '%s' desktop", name);
+        } else {
+            RVM_LOG_SAMPLED(50, L"login: cannot move input to the '%s' desktop (%lu)", name, GetLastError());
+            CloseDesktop(input);
+        }
+    }
+    INPUT i = net::InputFor(e);
+    return SendInput(1, &i, sizeof(i)) == 1;
+}
+#endif
+
 }  // namespace
 
-// From the service, every thread starts on the sign-in desktop, which stays
-// the input desktop while this runs, so remote input lands there.
 int RunLoginHelper(const ServiceLink* service, uint16_t portOverride) {
     const bool byService = service != nullptr;
     if (byService) {
@@ -92,6 +118,9 @@ int RunLoginHelper(const ServiceLink* service, uint16_t portOverride) {
     });
 
     StreamServer server;
+#if RVM_REMOTE_CONTROL
+    server.SetControlSink(&InjectOnInputDesktop);
+#endif
     DuplicationCapture capture;
     server.SetFrameRequester([&capture](uint32_t id) {
         if (id == kLoginScreenMirrorId) capture.Repush();
